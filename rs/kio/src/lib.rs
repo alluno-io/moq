@@ -21,6 +21,8 @@ mod weak;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
+pub mod shared;
+
 #[cfg(test)]
 mod tests;
 
@@ -28,7 +30,7 @@ pub use consumer::Consumer;
 pub use future::{Future, Pending};
 pub use producer::{Mut, Producer, Ref};
 pub use waiter::{Waiter, WaiterList, wait};
-pub use weak::Weak;
+pub use weak::ProducerWeak;
 
 /// Waiters split by what they're waiting on, so an event only wakes the
 /// waiters that care about it. The big win is per-modification writes (the hot

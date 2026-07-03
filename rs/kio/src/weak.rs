@@ -7,21 +7,20 @@ use crate::{
 	Counts, State,
 	consumer::Consumer,
 	lock::*,
-	producer::{Mut, Producer, Ref},
+	producer::{Producer, Ref},
 	waiter::*,
 };
 
-/// A weak reference to a Producer/Consumer state.
+/// A weak handle from the producing side ([`Producer::weak`](crate::Producer::weak)).
 ///
-/// Does not affect ref counts, so it won't prevent auto-close when all Producers are dropped.
-/// Can be upgraded to a full Producer or Consumer.
-#[derive(Debug)]
-pub struct Weak<T> {
+/// Holds no ref count, so it never keeps the channel open. Upgrade it back to a [`Producer`]
+/// (write access) or a [`Consumer`] (read access) while the channel is still live.
+pub struct ProducerWeak<T> {
 	pub(crate) state: Lock<State<T>>,
 	pub(crate) counts: Arc<Counts>,
 }
 
-impl<T> Weak<T> {
+impl<T> ProducerWeak<T> {
 	/// Upgrade to a [`Producer`], returning `None` if the channel is already closed.
 	pub fn produce(&self) -> Option<Producer<T>> {
 		// Increment first to prevent the last Producer::drop from
@@ -55,19 +54,6 @@ impl<T> Weak<T> {
 		Consumer {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
-		}
-	}
-
-	/// Acquire mutable access to the shared state without upgrading to a full [`Producer`].
-	///
-	/// Returns `Ok(Mut)` if the channel is open, or `Err(Ref)` with
-	/// read-only access if closed. Only locks once.
-	pub fn write(&self) -> Result<Mut<'_, T>, Ref<'_, T>> {
-		let state = self.state.lock();
-		if state.closed {
-			Err(Ref { state })
-		} else {
-			Ok(Mut::new(state))
 		}
 	}
 
@@ -159,13 +145,13 @@ impl<T> Weak<T> {
 		Poll::Pending
 	}
 
-	/// Returns `true` if both weak references share the same underlying state.
+	/// Returns `true` if both handles share the same underlying state.
 	pub fn same_channel(&self, other: &Self) -> bool {
 		self.state.is_clone(&other.state)
 	}
 }
 
-impl<T> Clone for Weak<T> {
+impl<T> Clone for ProducerWeak<T> {
 	fn clone(&self) -> Self {
 		Self {
 			state: self.state.clone(),

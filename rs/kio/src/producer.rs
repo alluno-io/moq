@@ -4,7 +4,7 @@ use std::{
 	task::Poll,
 };
 
-use crate::{Counts, State, consumer::Consumer, lock::*, waiter::*, weak::Weak};
+use crate::{Counts, State, consumer::Consumer, lock::*, waiter::*, weak::ProducerWeak};
 
 /// The producing side of a shared state channel.
 ///
@@ -234,16 +234,16 @@ impl<T> Producer<T> {
 	/// Returns `true` if this is the only remaining producer.
 	///
 	/// Inherently racy if other handles may clone this producer or upgrade a
-	/// [`Weak`] / [`Consumer`] concurrently. Intended for a producer's own
+	/// [`ProducerWeak`] / [`Consumer`] concurrently. Intended for a producer's own
 	/// `Drop`, where this handle has not yet been counted out, to gate
 	/// last-producer cleanup.
 	pub fn is_last(&self) -> bool {
 		self.counts.producers.load(Ordering::Acquire) == 1
 	}
 
-	/// Create a [`Weak`] reference that doesn't affect the producer/consumer ref counts.
-	pub fn weak(&self) -> Weak<T> {
-		Weak {
+	/// Create a [`ProducerWeak`] that doesn't affect the producer/consumer ref counts.
+	pub fn weak(&self) -> ProducerWeak<T> {
+		ProducerWeak {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
 		}

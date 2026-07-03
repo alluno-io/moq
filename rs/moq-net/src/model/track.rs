@@ -19,7 +19,7 @@ use crate::{broadcast, group};
 use super::{Datagram, MAX_DATAGRAM_PAYLOAD};
 
 use std::{
-	collections::{HashMap, HashSet, VecDeque},
+	collections::{HashSet, VecDeque},
 	sync::Arc,
 	task::{Poll, ready},
 	time::Duration,
@@ -183,24 +183,19 @@ struct TrackState {
 	// The error that caused the track to be aborted, if any.
 	abort: Option<Error>,
 
-	// Active subscriptions.
+	// Active subscriptions, owned and pruned by the producer.
 	subscriptions: Vec<kio::Consumer<Subscription>>,
 
-	// Specific groups requested via `fetch` that aren't cached yet, FIFO for a
-	// `Dynamic` to serve (see `Dynamic::requested_group`).
-	fetches: VecDeque<GroupRequested>,
+	// Enqueue side for a consumer to register a new subscription without writing back into the
+	// track: `Consumer::subscribe` pushes here and the producer drains it into
+	// `subscriptions`. Kept in the state (like `fetch`) so any holder reaches it read-only.
+	pending_subs: kio::shared::Sender<PendingSubs>,
 
-	// Monotonic IDs for fetches that reached a dynamic handler.
-	next_fetch: u64,
-
-	// Per-request failures for popped fetches. Keyed by request ID so rejecting one
-	// transient attempt doesn't poison future retries for the same sequence.
-	fetch_rejections: HashMap<u64, Error>,
-
-	// Number of live `Dynamic` handles. While zero, the track serves no
-	// uncached groups, so a cache-miss `fetch` on an accepted track fails fast
-	// instead of blocking forever (mirrors `BroadcastState::dynamic`).
-	dynamic: usize,
+	// Enqueue side of the fetch queue: cache-miss `fetch_group` calls push a `PendingFetch`
+	// that a `Dynamic` (the `Receiver`) drains. Its `Receiver` count is the live-handler
+	// count, so a miss fails fast with `NotFound` when nobody can serve it. Kept here (rather
+	// than threaded through every handle) so any holder of the state reaches it read-only.
+	fetch: kio::shared::Sender<FetchQueue>,
 }
 
 impl TrackState {
@@ -404,11 +399,10 @@ impl TrackState {
 	/// be served. Unlike [`Self::poll_get_group`] there's no `Ok(None)`, since a
 	/// missing group is a failure ([`Error::NotFound`]), not an end-of-stream.
 	///
-	/// A miss is unservable when the group is past the final sequence, or when no
-	/// [`Dynamic`] exists to fetch old content (`dynamic == 0`). On-demand tracks
-	/// (from a [`Request`]) are dynamic from creation, so a relay's fetch waits to
-	/// be served rather than racing the handler into existence.
-	fn poll_fetch(&self, sequence: u64, request_id: Option<u64>) -> Poll<Result<group::Consumer>> {
+	/// A miss is unservable when the group is past the final sequence. The uncached-but-open
+	/// case stays `Pending`; [`Fetch`] resolves `NotFound` (no handler) or a rejection through
+	/// the fetch's own result channel.
+	fn poll_fetch(&self, sequence: u64) -> Poll<Result<group::Consumer>> {
 		if let Some(group) = self.cached_group(sequence) {
 			return Poll::Ready(Ok(group));
 		}
@@ -417,18 +411,13 @@ impl TrackState {
 			return Poll::Ready(Err(err.clone()));
 		}
 
-		if let Some(id) = request_id
-			&& let Some(err) = self.fetch_rejections.get(&id)
-		{
-			return Poll::Ready(Err(err.clone()));
-		}
-
-		// Past the final sequence, or no handler to serve old content: unservable.
-		let past_final = self.final_sequence.is_some_and(|fin| sequence >= fin);
-		if past_final || self.dynamic == 0 {
+		// Past the final sequence: the group can never be produced.
+		if self.final_sequence.is_some_and(|fin| sequence >= fin) {
 			return Poll::Ready(Err(Error::NotFound));
 		}
 
+		// Otherwise it's uncached but potentially servable; `Fetch` decides `NotFound`
+		// (no handler) versus rejection via the fetch's own result channel.
 		Poll::Pending
 	}
 
@@ -520,14 +509,6 @@ impl TrackState {
 		self.evict_expired(now, cache);
 		Ok(group)
 	}
-
-	fn reject_group_request(&mut self, id: u64, err: Error) {
-		self.fetch_rejections.entry(id).or_insert(err);
-	}
-
-	fn clear_group_request_rejection(&mut self, id: u64) {
-		self.fetch_rejections.remove(&id);
-	}
 }
 
 /// A producer for a track, used to create new groups.
@@ -538,6 +519,9 @@ pub struct Producer {
 	// Top link of the ownership chain; carried for identity and future inheritance.
 	broadcast: Arc<broadcast::Info>,
 	state: kio::Producer<TrackState>,
+	// Drain side of consumer subscription registrations, folded into `subscriptions` while
+	// aggregating demand.
+	pending_subs: kio::shared::Receiver<PendingSubs>,
 	prev_subscription: Option<Subscription>,
 }
 
@@ -554,13 +538,16 @@ impl Producer {
 		info: impl Into<Option<Info>>,
 	) -> Self {
 		let info = info.into().unwrap_or_default();
+		let state = kio::Producer::new(TrackState {
+			info: Some(info),
+			..Default::default()
+		});
+		let pending_subs = state.read().pending_subs.receiver();
 		Self {
 			name: name.into(),
 			broadcast,
-			state: kio::Producer::new(TrackState {
-				info: Some(info),
-				..Default::default()
-			}),
+			state,
+			pending_subs,
 			prev_subscription: None,
 		}
 	}
@@ -868,6 +855,9 @@ impl Producer {
 	/// when there are no live subscribers. Unlike [`Self::subscription`], this
 	/// doesn't wait for a change or advance the change cursor.
 	pub fn subscription(&self) -> Option<Subscription> {
+		// Fold in any pending registrations so the snapshot includes them.
+		drain_pending_subs(&self.pending_subs, &self.state, &kio::Waiter::noop());
+
 		let state = self.state.read();
 		let mut combined: Option<Subscription> = None;
 		for sub in &state.subscriptions {
@@ -879,6 +869,10 @@ impl Producer {
 	}
 
 	pub fn poll_subscription_changed(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Subscription>>> {
+		// Fold in newly-registered consumer subscriptions (and arm the waiter for future ones)
+		// before aggregating, so a new subscriber counts toward the demand.
+		drain_pending_subs(&self.pending_subs, &self.state, waiter);
+
 		let prev = &self.prev_subscription;
 		let mut combined = None;
 		let mut state = match self.state.poll(waiter, |state| {
@@ -910,41 +904,16 @@ impl Producer {
 	/// (old) groups. Most producers never need this; a relay creates one to fetch
 	/// past groups from upstream.
 	pub fn dynamic(&self) -> Dynamic {
-		Dynamic::new(self.name.clone(), self.state.clone())
+		Dynamic::new(
+			self.name.clone(),
+			self.state.clone(),
+			self.state.read().fetch.receiver(),
+		)
 	}
 
 	fn modify(&self) -> Result<kio::Mut<'_, TrackState>> {
 		TrackState::modify(&self.state)
 	}
-}
-
-/// Pop the next queued group fetch off the shared state and wrap it in a
-/// [`GroupRequest`] bound to a fresh producer handle. Shared by every
-/// [`Dynamic`] handle on the track.
-fn poll_requested_group(state: &kio::Producer<TrackState>, waiter: &kio::Waiter) -> Poll<Result<GroupRequest>> {
-	// Read-only predicate: ready once there's a request to pop, or the track aborted.
-	let mut guard = ready!(state.poll(waiter, |state| {
-		if state.fetches.is_empty() && state.abort.is_none() {
-			Poll::Pending
-		} else {
-			Poll::Ready(())
-		}
-	}))
-	.map_err(|state| state.abort.clone().unwrap_or(Error::Dropped))?;
-
-	let req = match guard.fetches.pop_front() {
-		Some(req) => req,
-		// Woke because the track aborted while the fetch queue was empty.
-		None => return Poll::Ready(Err(guard.abort.clone().unwrap_or(Error::Dropped))),
-	};
-
-	Poll::Ready(Ok(GroupRequest {
-		state: state.clone(),
-		id: req.id,
-		sequence: req.sequence,
-		priority: req.priority,
-		done: false,
-	}))
 }
 
 /// Serves on-demand fetches of uncached (old) groups for a track, the group-level
@@ -956,17 +925,20 @@ fn poll_requested_group(state: &kio::Producer<TrackState>, waiter: &kio::Waiter)
 /// from upstream. While at least one is alive the track will block a cache-miss
 /// [`Consumer::fetch_group`] waiting to be served; with none, an accepted track's
 /// miss fails fast with [`Error::NotFound`].
+#[derive(Clone)]
 pub struct Dynamic {
 	name: Arc<str>,
+	// Kept to insert served groups into the cache and observe track abort.
 	state: kio::Producer<TrackState>,
+	// Drain side of the fetch queue. The `Receiver` count is the live-handler count that
+	// `fetch_group` gates on; dropping the last handle stops fetch serving without any
+	// manual bookkeeping.
+	fetch: kio::shared::Receiver<FetchQueue>,
 }
 
 impl Dynamic {
-	fn new(name: Arc<str>, state: kio::Producer<TrackState>) -> Self {
-		if let Ok(mut state) = state.write() {
-			state.dynamic += 1;
-		}
-		Self { name, state }
+	fn new(name: Arc<str>, state: kio::Producer<TrackState>, fetch: kio::shared::Receiver<FetchQueue>) -> Self {
+		Self { name, state, fetch }
 	}
 
 	pub fn name(&self) -> &str {
@@ -983,36 +955,40 @@ impl Dynamic {
 	}
 
 	pub fn poll_requested_group(&self, waiter: &kio::Waiter) -> Poll<Result<GroupRequest>> {
-		poll_requested_group(&self.state, waiter)
+		// Prefer serving a queued fetch, even if the track has since aborted.
+		match self.fetch.poll_lock_when(waiter, |queue| !queue.is_empty()) {
+			Poll::Ready(Some(mut queue)) => {
+				let pending = queue.pop_front().expect("predicate guaranteed a request");
+				return Poll::Ready(Ok(GroupRequest {
+					state: self.state.clone(),
+					sequence: pending.sequence,
+					priority: pending.priority,
+					result: pending.result,
+					done: false,
+				}));
+			}
+			// Every sender (the track itself) is gone.
+			Poll::Ready(None) => return Poll::Ready(Err(Error::Dropped)),
+			Poll::Pending => {}
+		}
+
+		// No fetch queued: surface a track abort so the handler loop can exit.
+		match self.state.poll(waiter, |state| {
+			if state.abort.is_some() {
+				Poll::Ready(())
+			} else {
+				Poll::Pending
+			}
+		}) {
+			Poll::Ready(Ok(state)) => Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
+			Poll::Ready(Err(closed)) => Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped))),
+			Poll::Pending => Poll::Pending,
+		}
 	}
 
 	/// Poll for the track becoming unused (every consumer dropped).
 	pub fn poll_unused(&self, waiter: &kio::Waiter) -> Poll<()> {
 		self.state.poll_unused(waiter).map(|_| ())
-	}
-}
-
-impl Clone for Dynamic {
-	fn clone(&self) -> Self {
-		// Bump `dynamic` so each live handle is counted (mirrors `broadcast::Dynamic`).
-		if let Ok(mut state) = self.state.write() {
-			state.dynamic += 1;
-		}
-		Self {
-			name: self.name.clone(),
-			state: self.state.clone(),
-		}
-	}
-}
-
-impl Drop for Dynamic {
-	fn drop(&mut self) {
-		// Unlike `broadcast::Dynamic`, dropping the last handle doesn't abort the track:
-		// a live `Producer` may still be serving the subscription. It just stops
-		// fetch serving, after which an accepted track's cache miss fails fast.
-		if let Ok(mut state) = self.state.write() {
-			state.dynamic = state.dynamic.saturating_sub(1);
-		}
 	}
 }
 
@@ -1042,6 +1018,27 @@ impl Drop for Producer {
 	}
 }
 
+/// Reverse queue of subscriptions a consumer has registered but the producer hasn't yet
+/// folded into its persistent `subscriptions` list.
+type PendingSubs = VecDeque<kio::Consumer<Subscription>>;
+
+/// Fold any consumer-registered subscriptions into the persistent list, arming `waiter` so a
+/// future registration wakes the producer. The move is committed even when the aggregate is
+/// unchanged, so a drained subscription is never lost.
+fn drain_pending_subs(
+	pending: &kio::shared::Receiver<PendingSubs>,
+	state: &kio::Producer<TrackState>,
+	waiter: &kio::Waiter,
+) {
+	let drained: Vec<_> = match pending.poll_lock_when(waiter, |queue| !queue.is_empty()) {
+		Poll::Ready(Some(mut queue)) => queue.drain(..).collect(),
+		_ => return,
+	};
+	if let Ok(mut state) = state.write() {
+		state.subscriptions.extend(drained);
+	}
+}
+
 /// Aggregate every live subscriber's preferences into the most demanding request.
 ///
 /// Read-only: iterates `subscriptions` immutably and registers `waiter` on each, so it
@@ -1063,7 +1060,7 @@ fn combined_subscription(state: &TrackState, waiter: &kio::Waiter) -> Option<Sub
 #[derive(Clone)]
 pub(crate) struct TrackWeak {
 	name: Arc<str>,
-	state: kio::Weak<TrackState>,
+	state: kio::ProducerWeak<TrackState>,
 }
 
 impl TrackWeak {
@@ -1096,7 +1093,7 @@ impl TrackWeak {
 #[derive(Clone)]
 pub struct Demand {
 	name: Arc<str>,
-	state: kio::Weak<TrackState>,
+	state: kio::ProducerWeak<TrackState>,
 }
 
 impl Demand {
@@ -1154,11 +1151,12 @@ impl Consumer {
 	pub fn subscribe(&self, subscription: impl Into<Option<Subscription>>) -> kio::Pending<Subscribe> {
 		let subscription = kio::Producer::new(subscription.into().unwrap_or_default());
 
-		// Register the subscription if the track is live. If it is already closed, the returned
-		// future resolves to the abort error via `Subscribe::poll_ok`.
-		if let Ok(mut state) = self.state.write() {
-			state.subscriptions.push(subscription.consume());
-		}
+		// Register through the reverse channel; the producer folds it into its aggregate. Clone the
+		// sender out first so the forward read lock is released before locking the queue (no
+		// write-back into the track). A closed track never drains it; `Subscribe::poll_ok`
+		// still resolves the abort error from the forward state.
+		let pending = self.state.read().pending_subs.clone();
+		pending.lock().push_back(subscription.consume());
 
 		kio::Pending::new(Subscribe {
 			name: self.name.clone(),
@@ -1186,28 +1184,31 @@ impl Consumer {
 	/// if it's already closed.
 	pub fn fetch_group(&self, sequence: u64, options: impl Into<Option<group::Fetch>>) -> kio::Pending<Fetch> {
 		let options = options.into().unwrap_or_default();
-		let mut request_id = None;
 
 		// Queue a request only when a handler can serve it but the group isn't cached yet. A cached
 		// group, an unservable sequence (NotFound), or a closed track all resolve through
-		// `Fetch::poll` without a queue entry.
-		if let Ok(mut state) = self.state.write() {
-			if state.poll_fetch(sequence, None).is_pending() {
-				let id = state.next_fetch;
-				state.next_fetch = state.next_fetch.wrapping_add(1);
-				state.fetches.push_back(GroupRequested {
-					id,
-					sequence,
-					priority: options.priority,
-				});
-				request_id = Some(id);
-			}
-		}
+		// `Fetch::poll` without a queue entry. Read the forward state to decide, then enqueue
+		// onto the separate fetch channel (so no write-back into the track).
+		let fetch = {
+			let state = self.state.read();
+			(state.poll_fetch(sequence).is_pending() && state.fetch.has_receivers()).then(|| state.fetch.clone())
+		};
+
+		let result = fetch.map(|fetch| {
+			let producer = kio::Producer::<FetchOutcome>::default();
+			let consumer = producer.consume();
+			fetch.lock().push_back(PendingFetch {
+				sequence,
+				priority: options.priority,
+				result: producer,
+			});
+			consumer
+		});
 
 		kio::Pending::new(Fetch {
 			state: self.state.clone(),
 			sequence,
-			request_id,
+			result,
 		})
 	}
 
@@ -1286,16 +1287,30 @@ impl kio::Future for InfoQuery {
 	}
 }
 
-/// A specific group requested via [`Consumer::fetch_group`], queued on the
-/// track for a [`Dynamic`] to serve.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GroupRequested {
-	/// The request ID matching the waiting [`Fetch`].
-	id: u64,
+/// FIFO of fetches awaiting a [`Dynamic`].
+type FetchQueue = VecDeque<PendingFetch>;
+
+/// A specific group requested via [`Consumer::fetch_group`], queued for a
+/// [`Dynamic`] to serve. Carries its own result channel so a rejection routes back to
+/// exactly the waiting [`Fetch`]; success routes through the track cache instead.
+struct PendingFetch {
 	/// The group sequence the consumer wants.
 	sequence: u64,
 	/// The requested delivery priority.
 	priority: u8,
+	/// Result channel back to the waiting fetch. Written only on rejection.
+	result: kio::Producer<FetchOutcome>,
+}
+
+/// The result of a single [`Consumer::fetch_group`].
+///
+/// Stays empty on success (the served group lands in the track cache, where the fetch reads
+/// it); the handler writes `rejected` to fail the fetch. Dropping the producer without
+/// writing (e.g. the last handler going away) closes the channel, which the fetch reads as
+/// [`Error::NotFound`].
+#[derive(Default)]
+struct FetchOutcome {
+	rejected: Option<Error>,
 }
 
 /// A consumer's request for a single past group, handed to a handler via
@@ -1308,9 +1323,11 @@ struct GroupRequested {
 /// the same whether or not the track has been accepted yet.
 pub struct GroupRequest {
 	state: kio::Producer<TrackState>,
-	id: u64,
 	sequence: u64,
 	priority: u8,
+	// Result channel back to the waiting `Consumer::fetch_group`. Written only on
+	// rejection; a successful `accept` resolves the fetch through the track cache.
+	result: kio::Producer<FetchOutcome>,
 	done: bool,
 }
 
@@ -1334,14 +1351,15 @@ impl GroupRequest {
 	/// already present, or the track's abort error if it closed while pending.
 	pub fn accept(mut self, info: impl Into<Option<Info>>) -> Result<group::Producer> {
 		self.done = true;
+		// Success routes through the cache; the result channel just closes when `self` drops.
 		TrackState::modify(&self.state)?.insert_group_request(self.sequence, info.into())
 	}
 
 	/// Reject the fetch, resolving the waiting [`Consumer::fetch_group`] with `err`.
 	pub fn reject(mut self, err: Error) {
 		self.done = true;
-		if let Ok(mut state) = self.state.write() {
-			state.reject_group_request(self.id, err);
+		if let Ok(mut result) = self.result.write() {
+			result.rejected = Some(err);
 		}
 	}
 }
@@ -1351,8 +1369,9 @@ impl Drop for GroupRequest {
 		if self.done {
 			return;
 		}
-		if let Ok(mut state) = self.state.write() {
-			state.reject_group_request(self.id, Error::Dropped);
+		// Dropped without accept/reject: fail the waiting fetch.
+		if let Ok(mut result) = self.result.write() {
+			result.rejected = Some(Error::Dropped);
 		}
 	}
 }
@@ -1365,30 +1384,39 @@ impl Drop for GroupRequest {
 pub struct Fetch {
 	state: kio::Consumer<TrackState>,
 	sequence: u64,
-	request_id: Option<u64>,
+	// Result channel for a queued fetch, or `None` when the fetch was resolvable at creation
+	// (cached / unservable) or had no handler to serve it.
+	result: Option<kio::Consumer<FetchOutcome>>,
 }
 
 impl kio::Future for Fetch {
 	type Output = Result<group::Consumer>;
 
 	fn poll(&self, waiter: &kio::Waiter) -> Poll<Self::Output> {
-		// `poll_fetch` already yields a `Result<group::Consumer>` (group, or NotFound /
-		// abort); the outer error is the channel closing without one.
-		let res = match ready!(
-			self.state
-				.poll(waiter, |state| state.poll_fetch(self.sequence, self.request_id))
-		) {
-			Ok(res) => res,
-			Err(closed) => return Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped))),
-		};
-
-		if let Some(id) = self.request_id
-			&& let Ok(mut state) = self.state.write()
-		{
-			state.clear_group_request_rejection(id);
+		// Forward state: a cached group (success), the abort error, or a past-final `NotFound`.
+		// `poll_fetch` yields a `Result<group::Consumer>`; the outer error is the channel closing.
+		match self.state.poll(waiter, |state| state.poll_fetch(self.sequence)) {
+			Poll::Ready(Ok(res)) => return Poll::Ready(res),
+			Poll::Ready(Err(closed)) => return Poll::Ready(Err(closed.abort.clone().unwrap_or(Error::Dropped))),
+			Poll::Pending => {}
 		}
 
-		Poll::Ready(res)
+		// Uncached and open: resolve through the fetch's own result channel.
+		let Some(result) = &self.result else {
+			// No handler was available to serve it (mirrors the old `dynamic == 0`).
+			return Poll::Ready(Err(Error::NotFound));
+		};
+
+		match result.poll(waiter, |outcome| match &outcome.rejected {
+			Some(err) => Poll::Ready(err.clone()),
+			None => Poll::Pending,
+		}) {
+			// The handler rejected this fetch.
+			Poll::Ready(Ok(err)) => Poll::Ready(Err(err)),
+			// The producer dropped without serving: the last handler went away.
+			Poll::Ready(Err(_closed)) => Poll::Ready(Err(Error::NotFound)),
+			Poll::Pending => Poll::Pending,
+		}
 	}
 }
 
@@ -1644,6 +1672,9 @@ pub struct Request {
 	broadcast: Arc<broadcast::Info>,
 	state: kio::Producer<TrackState>,
 
+	// Drain side of consumer subscription registrations (see `Producer`).
+	pending_subs: kio::shared::Receiver<PendingSubs>,
+
 	// The previous subscription that was combined, used to detect changes.
 	prev_subscription: Option<Subscription>,
 
@@ -1658,11 +1689,13 @@ impl Request {
 	pub(crate) fn new(broadcast: Arc<broadcast::Info>, name: impl Into<Arc<str>>) -> Self {
 		let name = name.into();
 		let state = kio::Producer::<TrackState>::default();
-		let dynamic = Dynamic::new(name.clone(), state.clone());
+		let dynamic = Dynamic::new(name.clone(), state.clone(), state.read().fetch.receiver());
+		let pending_subs = state.read().pending_subs.receiver();
 		Self {
 			name,
 			broadcast,
 			state,
+			pending_subs,
 			prev_subscription: None,
 			_dynamic: dynamic,
 		}
@@ -1684,7 +1717,11 @@ impl Request {
 	/// groups, before [`Self::accept`] is even called. A relay creates one to fetch
 	/// past groups from upstream while (or instead of) serving a live subscription.
 	pub fn dynamic(&self) -> Dynamic {
-		Dynamic::new(self.name.clone(), self.state.clone())
+		Dynamic::new(
+			self.name.clone(),
+			self.state.clone(),
+			self.state.read().fetch.receiver(),
+		)
 	}
 
 	/// Poll for the request becoming unused (every consumer dropped), so a relay can
@@ -1702,6 +1739,7 @@ impl Request {
 		Producer {
 			name: self.name,
 			broadcast: self.broadcast,
+			pending_subs: self.pending_subs,
 			state: self.state,
 			prev_subscription: None,
 		}
@@ -1715,6 +1753,8 @@ impl Request {
 	}
 
 	pub fn subscription(&self) -> Option<Subscription> {
+		drain_pending_subs(&self.pending_subs, &self.state, &kio::Waiter::noop());
+
 		let state = self.state.read();
 		let mut combined: Option<Subscription> = None;
 		for sub in &state.subscriptions {
@@ -1730,6 +1770,8 @@ impl Request {
 	}
 
 	pub fn poll_subscription_changed(&mut self, waiter: &kio::Waiter) -> Poll<Option<Subscription>> {
+		drain_pending_subs(&self.pending_subs, &self.state, waiter);
+
 		let prev = &self.prev_subscription;
 		let mut combined = None;
 		// The request owns the only producer, so the channel can't be closed here.
@@ -2872,7 +2914,6 @@ mod test {
 
 		req.reject(Error::Cancel);
 		assert!(matches!(pending.await, Err(Error::Cancel)));
-		assert!(producer.state.read().fetch_rejections.is_empty());
 	}
 
 	#[tokio::test]
