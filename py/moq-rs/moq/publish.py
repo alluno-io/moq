@@ -15,7 +15,7 @@ from moq_ffi import (
     MoqTrackRequest,
 )
 
-from .types import AudioEncoderInput, AudioEncoderOutput, AudioFrame, Subscription, TrackInfo
+from .types import AudioEncoderInput, AudioEncoderOutput, AudioFrame, AudioHint, Init, Subscription, TrackInfo, VideoHint
 
 if TYPE_CHECKING:
     from .subscribe import BroadcastConsumer, GroupConsumer, TrackConsumer
@@ -218,16 +218,40 @@ class BroadcastProducer:
         """Accept subscriptions to tracks that are not published yet."""
         return BroadcastDynamic(self._inner.dynamic())
 
-    def publish_media(self, format: str, init: bytes) -> MediaProducer:
-        return MediaProducer(self._inner.publish_media(format, init))
+    def publish_media(
+        self,
+        format: str,
+        init: bytes = b"",
+        *,
+        audio: AudioHint | None = None,
+        video: VideoHint | None = None,
+    ) -> MediaProducer:
+        media_init = Init(format=format, data=init, audio=audio, video=video)
+        return MediaProducer(self._inner.publish_media(media_init))
 
-    def publish_media_on_track(self, request: TrackRequest, format: str, init: bytes) -> MediaProducer:
-        return MediaProducer(self._inner.publish_media_on_track(request._inner, format, init))
+    def publish_media_on_track(
+        self,
+        request: TrackRequest,
+        format: str,
+        init: bytes = b"",
+        *,
+        audio: AudioHint | None = None,
+        video: VideoHint | None = None,
+    ) -> MediaProducer:
+        media_init = Init(format=format, data=init, audio=audio, video=video)
+        return MediaProducer(self._inner.publish_media_on_track(request._inner, media_init))
 
-    def publish_media_stream(self, format: str) -> MediaStreamProducer:
+    def publish_media_stream(
+        self,
+        format: str,
+        init: bytes = b"",
+        *,
+        video: VideoHint | None = None,
+    ) -> MediaStreamProducer:
         """Publish a media track fed by a raw byte stream (unknown frame
         boundaries). `format` is a stream format (avc3, hev1, av01, fmp4, mkv)."""
-        return MediaStreamProducer(self._inner.publish_media_stream(format))
+        media_init = Init(format=format, data=init, video=video)
+        return MediaStreamProducer(self._inner.publish_media_stream(media_init))
 
     def publish_audio(
         self,

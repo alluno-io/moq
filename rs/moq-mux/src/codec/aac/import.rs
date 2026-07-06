@@ -30,11 +30,21 @@ impl<E: CatalogExt> Import<E> {
 			config.channel_count,
 		);
 		audio_config.container = hang::catalog::Container::Legacy;
+		audio_config.description = Some(config.encode());
 
+		Self::new_with_config(track, reserved, audio_config)
+	}
+
+	/// Publish on an existing track producer with a ready catalog config.
+	pub fn new_with_config(
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		audio_config: hang::catalog::AudioConfig,
+	) -> crate::Result<Self> {
 		tracing::debug!(name = ?track.name(), config = ?audio_config, "starting track");
 
 		let mut rendition = reserved.audio(track.name());
-		rendition.set(audio_config);
+		rendition.set(audio_config)?;
 
 		Ok(Self {
 			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),

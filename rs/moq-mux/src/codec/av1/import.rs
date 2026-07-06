@@ -38,14 +38,28 @@ pub struct Import<E: CatalogExt = ()> {
 impl<E: CatalogExt> Import<E> {
 	/// Publish on an existing track producer, reserving the rendition from `reserved`.
 	pub fn new(track: moq_net::track::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
-		let rendition = reserved.video(track.name());
-		Self {
+		Self::new_with_hint(track, reserved, Default::default()).expect("empty AV1 hint")
+	}
+
+	/// Publish on an existing track producer with caller-provided catalog fields.
+	pub fn new_with_hint(
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		hint: crate::catalog::VideoHint,
+	) -> Result<Self> {
+		let rendition = reserved.video_with_hint(track.name(), hint.clone());
+		let mut out = Self {
 			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
 			rendition,
 			config: None,
 			last_seq: None,
 			jitter: Jitter::new(),
+		};
+		if let Some(config) = hint.to_config()? {
+			out.rendition.set(config.clone())?;
+			out.config = Some(config);
 		}
+		Ok(out)
 	}
 
 	/// Resolve the codec config from a sequence header / av1C and other metadata.
@@ -98,7 +112,7 @@ impl<E: CatalogExt> Import<E> {
 			full_range: false,
 		});
 		config.container = hang::catalog::Container::Legacy;
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -133,7 +147,7 @@ impl<E: CatalogExt> Import<E> {
 		config.coded_width = Some(seq_header.max_frame_width as u32);
 		config.coded_height = Some(seq_header.max_frame_height as u32);
 		config.container = hang::catalog::Container::Legacy;
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -155,7 +169,7 @@ impl<E: CatalogExt> Import<E> {
 			full_range: false,
 		});
 		config.container = hang::catalog::Container::Legacy;
-		self.apply_config(config);
+		self.apply_config(config)?;
 		Ok(())
 	}
 
@@ -163,13 +177,14 @@ impl<E: CatalogExt> Import<E> {
 	///
 	/// A changed config just re-mirrors the rendition; there are no fixed tracks
 	/// to reject a reconfiguration.
-	fn apply_config(&mut self, config: hang::catalog::VideoConfig) {
+	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> Result<()> {
 		if self.config.as_ref() == Some(&config) {
-			return;
+			return Ok(());
 		}
 		tracing::debug!(name = ?self.track.name(), ?config, "starting track");
-		self.rendition.set(config.clone());
+		self.rendition.set(config.clone())?;
 		self.config = Some(config);
+		Ok(())
 	}
 
 	/// Resolve the config from a sequence-header OBU, falling back to a minimal

@@ -40,14 +40,28 @@ pub struct Import<E: CatalogExt = ()> {
 impl<E: CatalogExt> Import<E> {
 	/// Publish on an existing track producer, reserving the rendition from `reserved`.
 	pub fn new(track: moq_net::track::Producer, reserved: crate::catalog::Reserved<E>) -> Self {
-		let rendition = reserved.video(track.name());
-		Self {
+		Self::new_with_hint(track, reserved, Default::default()).expect("empty H.265 hint")
+	}
+
+	/// Publish on an existing track producer with caller-provided catalog fields.
+	pub fn new_with_hint(
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		hint: crate::catalog::VideoHint,
+	) -> Result<Self> {
+		let rendition = reserved.video_with_hint(track.name(), hint.clone());
+		let mut out = Self {
 			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
 			rendition,
 			config: None,
 			last_sps: None,
 			jitter: Jitter::new(),
+		};
+		if let Some(config) = hint.to_config()? {
+			out.rendition.set(config.clone())?;
+			out.config = Some(config);
 		}
+		Ok(out)
 	}
 
 	/// Resolve the codec config from VPS/SPS/PPS and other non-slice NALs.
@@ -139,7 +153,7 @@ impl<E: CatalogExt> Import<E> {
 		}
 
 		tracing::debug!(name = ?self.track.name(), ?config, "starting track");
-		self.rendition.set(config.clone());
+		self.rendition.set(config.clone())?;
 		// Seed jitter from whatever has accumulated: a dirty start (or a B-frame
 		// reorder observed via observe_reorder) can feed updates before this
 		// rendition exists, so those would otherwise be lost on (re)publish.

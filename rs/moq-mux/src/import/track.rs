@@ -8,22 +8,151 @@
 use crate::Result;
 use crate::catalog::hang::CatalogExt;
 
-/// Build an H.264 avc3 split + import pair, resolving the config from `init`.
-///
-/// The import reads `init` for the codec config; the split then reads it as the
-/// leading bytes of the stream (caching any inline SPS/PPS). Any frames in the
-/// init buffer are published.
-fn build_h264_avc3<E: CatalogExt>(
-	track: moq_net::track::Producer,
-	reserved: crate::catalog::Reserved<E>,
-	init: &[u8],
-) -> Result<(crate::codec::h264::Split, crate::codec::h264::Import<E>)> {
-	let mut import = crate::codec::h264::Import::new(track, reserved);
-	import.initialize(init)?;
-	let mut split = crate::codec::h264::Split::new();
-	let frames = split.decode(init, None)?;
-	import.decode(frames)?;
-	Ok((split, import))
+use super::Init;
+
+fn missing_init(format: &str, field: &'static str) -> crate::Error {
+	crate::Error::MissingInit {
+		format: format.to_string(),
+		field,
+	}
+}
+
+fn audio_hint(init: &Init) -> crate::catalog::AudioHint {
+	let mut hint = init.audio.clone().unwrap_or_default();
+	if hint.codec.is_none() {
+		hint.codec = match init.format.as_str() {
+			"opus" => Some(hang::catalog::AudioCodec::Opus),
+			"flac" => Some(hang::catalog::AudioCodec::Flac),
+			"mp3" => Some(hang::catalog::AudioCodec::Mp3),
+			_ => None,
+		};
+	}
+	hint
+}
+
+fn video_hint(init: &Init) -> crate::catalog::VideoHint {
+	let mut hint = init.video.clone().unwrap_or_default();
+	if hint.codec.is_none() {
+		hint.codec = match init.format.as_str() {
+			"vp8" | "vp08" => Some(hang::catalog::VideoCodec::VP8),
+			_ => None,
+		};
+	}
+	hint
+}
+
+fn config_from_aac(init: &Init) -> Result<hang::catalog::AudioConfig> {
+	let hint = audio_hint(init);
+	let parsed = if !init.data.is_empty() {
+		Some(crate::codec::aac::Config::parse(&mut init.data.as_ref())?)
+	} else if let Some(description) = hint.description.as_ref() {
+		Some(crate::codec::aac::Config::parse(&mut description.as_ref())?)
+	} else {
+		None
+	};
+
+	let mut config = match parsed {
+		Some(config) => {
+			let mut audio = hang::catalog::AudioConfig::new(
+				hang::catalog::AAC {
+					profile: config.profile,
+				},
+				config.sample_rate,
+				config.channel_count,
+			);
+			audio.description = Some(if init.data.is_empty() {
+				hint.description.clone().unwrap_or_else(|| config.encode())
+			} else {
+				init.data.clone()
+			});
+			audio
+		}
+		None => hint.to_config()?.ok_or_else(|| missing_init(&init.format, "audio"))?,
+	};
+	if config.description.is_none()
+		&& let hang::catalog::AudioCodec::AAC(aac) = &config.codec
+	{
+		config.description = Some(
+			crate::codec::aac::Config {
+				profile: aac.profile,
+				sample_rate: config.sample_rate,
+				channel_count: config.channel_count,
+			}
+			.encode(),
+		);
+	}
+	config.container = hang::catalog::Container::Legacy;
+	hint.apply(&mut config)?;
+	Ok(config)
+}
+
+fn config_from_opus(init: &Init) -> Result<hang::catalog::AudioConfig> {
+	let hint = audio_hint(init);
+	let parsed = if !init.data.is_empty() {
+		Some(crate::codec::opus::Config::parse(&mut init.data.as_ref())?)
+	} else if let Some(description) = hint.description.as_ref() {
+		Some(crate::codec::opus::Config::parse(&mut description.as_ref())?)
+	} else {
+		None
+	};
+
+	let mut config = match parsed {
+		Some(config) => hang::catalog::AudioConfig::new(
+			hang::catalog::AudioCodec::Opus,
+			config.sample_rate,
+			config.channel_count,
+		),
+		None => hint.to_config()?.ok_or_else(|| missing_init(&init.format, "audio"))?,
+	};
+	config.container = hang::catalog::Container::Legacy;
+	hint.apply(&mut config)?;
+	Ok(config)
+}
+
+fn config_from_flac(init: &Init) -> Result<hang::catalog::AudioConfig> {
+	let hint = audio_hint(init);
+	let parsed = if !init.data.is_empty() {
+		Some(crate::codec::flac::Config::parse(&mut init.data.as_ref())?)
+	} else if let Some(description) = hint.description.as_ref() {
+		Some(crate::codec::flac::Config::parse(&mut description.as_ref())?)
+	} else {
+		None
+	};
+
+	let mut config = match parsed {
+		Some(config) => {
+			let mut audio = hang::catalog::AudioConfig::new(
+				hang::catalog::AudioCodec::Flac,
+				config.sample_rate,
+				config.channel_count,
+			);
+			audio.description = Some(config.description());
+			audio
+		}
+		None => hint.to_config()?.ok_or_else(|| missing_init(&init.format, "audio"))?,
+	};
+	config.container = hang::catalog::Container::Legacy;
+	hint.apply(&mut config)?;
+	Ok(config)
+}
+
+fn config_from_mp3(init: &Init) -> Result<hang::catalog::AudioConfig> {
+	let hint = audio_hint(init);
+	let parsed = if !init.data.is_empty() {
+		Some(crate::codec::mp3::Config::parse(init.data.as_ref())?)
+	} else {
+		None
+	};
+
+	let mut config = match parsed {
+		Some(config) => {
+			hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Mp3, config.sample_rate, config.channel_count)
+		}
+		None => hint.to_config()?.ok_or_else(|| missing_init(&init.format, "audio"))?,
+	};
+	config.container = hang::catalog::Container::Legacy;
+	hint.apply(&mut config)?;
+	Ok(config)
 }
 
 /// Build an H.264 avc1 import, resolving the config and the NALU length size from
@@ -38,41 +167,6 @@ fn build_h264_avc1<E: CatalogExt>(
 	import.initialize(init)?;
 	let length_size = crate::codec::h264::Avcc::parse(init)?.length_size;
 	Ok((length_size, import))
-}
-
-/// Build an H.265 split + import pair, resolving the config from `init`.
-fn build_h265<E: CatalogExt>(
-	track: moq_net::track::Producer,
-	reserved: crate::catalog::Reserved<E>,
-	init: &[u8],
-) -> Result<(crate::codec::h265::Split, crate::codec::h265::Import<E>)> {
-	let mut import = crate::codec::h265::Import::new(track, reserved);
-	import.initialize(init)?;
-	let mut split = crate::codec::h265::Split::new();
-	let frames = split.decode(init, None)?;
-	import.decode(frames)?;
-	Ok((split, import))
-}
-
-/// Build an AV1 split + import pair, resolving the config from `init`.
-fn build_av1<E: CatalogExt>(
-	track: moq_net::track::Producer,
-	reserved: crate::catalog::Reserved<E>,
-	init: &[u8],
-) -> Result<(crate::codec::av1::Split, crate::codec::av1::Import<E>)> {
-	let mut import = crate::codec::av1::Import::new(track, reserved);
-	import.initialize(init)?;
-	let mut split = crate::codec::av1::Split::new();
-	// av1C (leading 0x81, ISO/IEC 14496-15) is an out-of-band config record, not an
-	// OBU stream, so it's read for config (above) and dropped here. Raw OBUs are the
-	// leading bytes of the stream and feed the splitter.
-	let frames = if init.len() >= 16 && init[0] == 0x81 {
-		Vec::new()
-	} else {
-		split.decode(init, None)?
-	};
-	import.decode(frames)?;
-	Ok((split, import))
 }
 
 enum TrackKind<E: CatalogExt = ()> {
@@ -121,63 +215,105 @@ impl<E: CatalogExt> Track<E> {
 	/// [`BroadcastProducer::reserve_track`](moq_net::broadcast::Producer::reserve_track);
 	/// the importer accepts it here, which is where the track's timescale is set.
 	/// The catalog rendition is registered once the codec config is resolved.
-	pub fn new(
-		request: moq_net::track::Request,
-		reserved: crate::catalog::Reserved<E>,
-		format: &str,
-		init: &[u8],
-	) -> Result<Self> {
+	pub fn new(request: moq_net::track::Request, reserved: crate::catalog::Reserved<E>, init: Init) -> Result<Self> {
 		// Accept at the legacy microsecond timescale, matching the frame timestamps
 		// the container stamps. A codec-specific timescale (e.g. the opus sample
 		// rate) would be chosen here instead.
 		let track = request.accept(moq_net::track::Info::default().with_timescale(hang::container::TIMESCALE));
-		let kind = match format {
+		let kind = match init.format.as_str() {
 			"avc1" | "avcc" => {
-				let (length_size, import) = build_h264_avc1(track, reserved, init)?;
+				if init.data.is_empty() {
+					return Err(missing_init(&init.format, "data"));
+				}
+				let (length_size, import) = build_h264_avc1(track, reserved, &init.data)?;
 				TrackKind::Avc1 { length_size, import }
 			}
 			"avc3" | "h264" => {
-				let (split, import) = build_h264_avc3(track, reserved, init)?;
+				let hint = video_hint(&init);
+				let (split, import) = if init.data.is_empty() {
+					(
+						crate::codec::h264::Split::new(),
+						crate::codec::h264::Import::new_with_hint(track, reserved, hint)?,
+					)
+				} else {
+					let mut import = crate::codec::h264::Import::new_with_hint(track, reserved, hint)?;
+					import.initialize(&init.data)?;
+					let mut split = crate::codec::h264::Split::new();
+					let frames = split.decode(&init.data, None)?;
+					import.decode(frames)?;
+					(split, import)
+				};
 				TrackKind::Avc3 { split, import }
 			}
 			"hev1" => {
-				let (split, import) = build_h265(track, reserved, init)?;
+				let hint = video_hint(&init);
+				let (split, import) = if init.data.is_empty() {
+					(
+						crate::codec::h265::Split::new(),
+						crate::codec::h265::Import::new_with_hint(track, reserved, hint)?,
+					)
+				} else {
+					let mut import = crate::codec::h265::Import::new_with_hint(track, reserved, hint)?;
+					import.initialize(&init.data)?;
+					let mut split = crate::codec::h265::Split::new();
+					let frames = split.decode(&init.data, None)?;
+					import.decode(frames)?;
+					(split, import)
+				};
 				TrackKind::Hev1 { split, import }
 			}
 			"av01" | "av1" | "av1c" | "av1C" => {
-				let (split, import) = build_av1(track, reserved, init)?;
+				let hint = video_hint(&init);
+				let (split, import) = if init.data.is_empty() {
+					(
+						crate::codec::av1::Split::new(),
+						crate::codec::av1::Import::new_with_hint(track, reserved, hint)?,
+					)
+				} else {
+					let mut import = crate::codec::av1::Import::new_with_hint(track, reserved, hint)?;
+					import.initialize(&init.data)?;
+					let mut split = crate::codec::av1::Split::new();
+					let frames = if init.data.len() >= 16 && init.data[0] == 0x81 {
+						Vec::new()
+					} else {
+						split.decode(&init.data, None)?
+					};
+					import.decode(frames)?;
+					(split, import)
+				};
 				TrackKind::Av01 { split, import }
 			}
 			"vp8" | "vp08" => {
-				let mut import = crate::codec::vp8::Import::new(track, reserved);
-				import.initialize(init)?;
+				let mut import = crate::codec::vp8::Import::new_with_hint(track, reserved, video_hint(&init))?;
+				import.initialize(&init.data)?;
 				TrackKind::Vp8(import)
 			}
 			"vp9" | "vp09" => {
-				let mut import = crate::codec::vp9::Import::new(track, reserved);
-				import.initialize(init)?;
+				let mut import = crate::codec::vp9::Import::new_with_hint(track, reserved, video_hint(&init))?;
+				import.initialize(&init.data)?;
 				TrackKind::Vp9(import)
 			}
 			"aac" => {
-				let mut data = init;
-				let config = crate::codec::aac::Config::parse(&mut data)?;
-				let import = crate::codec::aac::Import::new(track, reserved, config)?;
+				let config = config_from_aac(&init)?;
+				let import = crate::codec::aac::Import::new_with_config(track, reserved, config)?;
 				TrackKind::Aac(import)
 			}
 			"opus" => {
-				let mut data = init;
-				let config = crate::codec::opus::Config::parse(&mut data)?;
-				let import = crate::codec::opus::Import::new(track, reserved, config)?;
+				let config = config_from_opus(&init)?;
+				let import = crate::codec::opus::Import::new_with_config(track, reserved, config)?;
 				TrackKind::Opus(import)
 			}
 			"flac" => {
-				// `init` is a FLAC header: the `fLaC` marker plus the STREAMINFO block.
-				let mut data = init;
-				let config = crate::codec::flac::Config::parse(&mut data)?;
-				let import = crate::codec::flac::Import::new(track, reserved, config)?;
+				let config = config_from_flac(&init)?;
+				let import = crate::codec::flac::Import::new_with_config(track, reserved, config)?;
 				TrackKind::Flac(import)
 			}
-			_ => return Err(crate::Error::UnknownFormat(format.to_string())),
+			"mp3" => {
+				let config = config_from_mp3(&init)?;
+				let import = crate::codec::mp3::Import::new_with_config(track, reserved, config)?;
+				TrackKind::Mp3(import)
+			}
+			_ => return Err(crate::Error::UnknownFormat(init.format)),
 		};
 
 		Ok(Self { kind })
@@ -365,26 +501,30 @@ impl<E: CatalogExt> TrackStream<E> {
 	/// [`BroadcastProducer::reserve_track`](moq_net::broadcast::Producer::reserve_track);
 	/// the importer accepts it here at the legacy microsecond timescale (where a
 	/// codec-specific timescale would be chosen).
-	pub fn new(request: moq_net::track::Request, reserved: crate::catalog::Reserved<E>, format: &str) -> Result<Self> {
+	pub fn new(request: moq_net::track::Request, reserved: crate::catalog::Reserved<E>, init: Init) -> Result<Self> {
 		let track = request.accept(moq_net::track::Info::default().with_timescale(hang::container::TIMESCALE));
 		// Only the self-delimiting codecs can be recovered from a raw byte stream.
-		let kind = match format {
+		let kind = match init.format.as_str() {
 			"avc3" | "h264" => TrackStreamKind::Avc3 {
 				split: crate::codec::h264::Split::new(),
-				import: crate::codec::h264::Import::new(track, reserved),
+				import: crate::codec::h264::Import::new_with_hint(track, reserved, video_hint(&init))?,
 			},
 			"hev1" => TrackStreamKind::Hev1 {
 				split: crate::codec::h265::Split::new(),
-				import: crate::codec::h265::Import::new(track, reserved),
+				import: crate::codec::h265::Import::new_with_hint(track, reserved, video_hint(&init))?,
 			},
 			"av01" | "av1" | "av1c" | "av1C" => TrackStreamKind::Av01 {
 				split: crate::codec::av1::Split::new(),
-				import: crate::codec::av1::Import::new(track, reserved),
+				import: crate::codec::av1::Import::new_with_hint(track, reserved, video_hint(&init))?,
 			},
-			_ => return Err(crate::Error::UnknownFormat(format.to_string())),
+			_ => return Err(crate::Error::UnknownFormat(init.format)),
 		};
 
-		Ok(Self { kind })
+		let mut out = Self { kind };
+		if !init.data.is_empty() {
+			out.initialize(&init.data)?;
+		}
+		Ok(out)
 	}
 
 	/// Initialize the importer with the given buffer and populate the broadcast.
@@ -568,7 +708,7 @@ mod tests {
 		let (mut broadcast, catalog) = new_broadcast();
 		// The importer accepts the reserved track, setting its (microsecond) timescale.
 		let request = broadcast.reserve_track("requested-audio").unwrap();
-		let mut import = Track::new(request, catalog.reserve(), "opus", &opus_head()).unwrap();
+		let mut import = Track::new(request, catalog.reserve(), Init::new("opus", opus_head())).unwrap();
 
 		assert_eq!(import.name(), "requested-audio");
 		let snapshot = catalog.snapshot();
@@ -589,7 +729,7 @@ mod tests {
 		// A freshly reserved track attaches its catalog rendition on init.
 		let name = broadcast.unique_name(".opus");
 		let request = broadcast.reserve_track(name).unwrap();
-		let mut import = Track::new(request, catalog.reserve(), "opus", &opus_head()).unwrap();
+		let mut import = Track::new(request, catalog.reserve(), Init::new("opus", opus_head())).unwrap();
 
 		assert_eq!(import.name(), "0.opus");
 		assert!(catalog.snapshot().audio.renditions.contains_key("0.opus"));
@@ -645,7 +785,7 @@ mod tests {
 		let (mut broadcast, catalog) = new_broadcast();
 		let request = broadcast.reserve_track("camera").unwrap();
 
-		let import = Track::new(request, catalog.reserve(), "avc3", &h264_init()).unwrap();
+		let import = Track::new(request, catalog.reserve(), Init::new("avc3", h264_init())).unwrap();
 
 		assert_eq!(import.name(), "camera");
 		let snapshot = catalog.snapshot();
@@ -661,7 +801,7 @@ mod tests {
 	async fn reconfiguration_updates_in_place() {
 		let (mut broadcast, catalog) = new_broadcast();
 		let request = broadcast.reserve_track("video").unwrap();
-		let mut import = Track::new(request, catalog.reserve(), "vp8", &[]).unwrap();
+		let mut import = Track::new(request, catalog.reserve(), Init::new("vp8", Vec::new())).unwrap();
 
 		import
 			.decode(
@@ -676,5 +816,27 @@ mod tests {
 				Some(Timestamp::from_micros(33_000).unwrap()),
 			)
 			.unwrap();
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn audio_hint_initializes_catalog_without_init_bytes() {
+		let (mut broadcast, catalog) = new_broadcast();
+		let request = broadcast.reserve_track("audio").unwrap();
+		let init = Init::new("opus", Vec::new()).with_audio(crate::catalog::AudioHint {
+			sample_rate: Some(48_000),
+			channel_count: Some(2),
+			bitrate: Some(128_000),
+			..Default::default()
+		});
+
+		let import = Track::new(request, catalog.reserve(), init).unwrap();
+
+		assert_eq!(import.name(), "audio");
+		let snapshot = catalog.snapshot();
+		let audio = snapshot.audio.renditions.get("audio").unwrap();
+		assert_eq!(audio.codec, hang::catalog::AudioCodec::Opus);
+		assert_eq!(audio.sample_rate, 48_000);
+		assert_eq!(audio.channel_count, 2);
+		assert_eq!(audio.bitrate, Some(128_000));
 	}
 }

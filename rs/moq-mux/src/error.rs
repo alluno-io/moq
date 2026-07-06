@@ -99,6 +99,26 @@ pub enum Error {
 	#[error("unknown format: {0}")]
 	UnknownFormat(String),
 
+	/// A provided init hint disagreed with the media configuration.
+	#[error("init hint mismatch for {field}: expected {expected}, got {actual}")]
+	InitMismatch {
+		/// The catalog field that did not match.
+		field: &'static str,
+		/// The caller-provided value.
+		expected: String,
+		/// The detected value.
+		actual: String,
+	},
+
+	/// The media importer needs bytes or enough hint fields to initialize.
+	#[error("{format} missing init field: {field}")]
+	MissingInit {
+		/// The media format being imported.
+		format: String,
+		/// The missing field.
+		field: &'static str,
+	},
+
 	/// A non-keyframe frame was received before any keyframe opened a group.
 	/// A track joining mid-stream should skip frames until the first keyframe.
 	#[error("{0}")]
