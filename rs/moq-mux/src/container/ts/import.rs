@@ -636,9 +636,11 @@ fn register_verbatim<E: CatalogExt>(
 	);
 	drop(guard);
 
-	Ok(crate::container::Producer::new(
+	let timeline = catalog.timeline(track.name());
+	Ok(crate::container::Producer::with_config(
 		track,
 		crate::catalog::hang::Container::Legacy,
+		crate::container::ProducerConfig::default().with_timeline(timeline),
 	))
 }
 

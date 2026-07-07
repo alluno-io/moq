@@ -1,6 +1,6 @@
 [package]
 name = "moq-json"
-description = "Snapshot/delta JSON publishing over MoQ tracks using RFC 7396 JSON Merge Patch."
+description = "JSON publishing over MoQ tracks: snapshot/delta (RFC 7396 merge patch) objects, or append-log NDJSON streams."
 authors = ["Luke Curley <kixelated@gmail.com>"]
 repository = "https://github.com/moq-dev/moq"
 license = "MIT OR Apache-2.0"
@@ -27,6 +27,7 @@ thiserror = "2"
 
 [dev-dependencies]
 criterion = "0.8"
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [[bench]]
 name = "codec"

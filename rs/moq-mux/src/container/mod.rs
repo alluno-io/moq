@@ -27,7 +27,7 @@ pub mod mkv;
 pub mod ts;
 
 pub use consumer::Consumer;
-pub use producer::Producer;
+pub use producer::{Producer, ProducerConfig};
 pub(crate) use source::ExportSource;
 
 /// Microsecond presentation timestamp, the canonical timebase for media frames in moq-mux on `main`.

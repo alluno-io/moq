@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -31,6 +32,15 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// gets a clone (a `Copy` of the same epoch), so timestamps they synthesize when
 	/// a caller has none land on one timeline and audio/video stay in sync.
 	clock: crate::Clock,
+
+	/// A clone of the broadcast, retained so per-rendition timeline tracks can be created
+	/// lazily when a rendition is registered (the codec importers hold only their media
+	/// track, not the broadcast).
+	broadcast: moq_net::BroadcastProducer,
+
+	/// The per-rendition timeline producers, memoized by media-track name so the catalog
+	/// section and the media track's group recorder share one track. See [`timeline`](Self::timeline).
+	timelines: Arc<Mutex<BTreeMap<String, crate::timeline::Producer>>>,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -42,6 +52,8 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			msf_track: self.msf_track.clone(),
 			current: self.current.clone(),
 			clock: self.clock,
+			broadcast: self.broadcast.clone(),
+			timelines: self.timelines.clone(),
 		}
 	}
 }
@@ -83,6 +95,8 @@ impl<E: CatalogExt> Producer<E> {
 			msf_track,
 			current: Arc::new(Mutex::new(catalog)),
 			clock: crate::Clock::new(),
+			broadcast: broadcast.clone(),
+			timelines: Arc::new(Mutex::new(BTreeMap::new())),
 		})
 	}
 
@@ -128,6 +142,26 @@ impl<E: CatalogExt> Producer<E> {
 		super::AudioTrack::new(self.clone(), name)
 	}
 
+	/// The timeline producer for media rendition `name`, creating its track on first use.
+	///
+	/// Memoized by name, so the rendition's catalog section (via
+	/// [`VideoTrack::set`](super::VideoTrack::set) /
+	/// [`AudioTrack::set`](super::AudioTrack::set)) and the media track's group recorder (the
+	/// `timeline` argument to [`container::Producer::new`](crate::container::Producer::new)) share
+	/// one timeline. Panics only if the broadcast can't mint the track (a duplicate name),
+	/// which the `<name>.timeline` convention avoids.
+	pub fn timeline(&self, name: &str) -> crate::timeline::Producer {
+		let mut timelines = self.timelines.lock().unwrap();
+		if let Some(timeline) = timelines.get(name) {
+			return timeline.clone();
+		}
+
+		let timeline =
+			crate::timeline::Producer::new(&mut self.broadcast.clone(), name).expect("failed to create timeline track");
+		timelines.insert(name.to_string(), timeline.clone());
+		timeline
+	}
+
 	/// Create a consumer for this catalog, receiving updates as they're published.
 	pub fn consume(&self) -> Result<Consumer<E>, moq_net::Error> {
 		Ok(Consumer::new(self.hang.consume()))
@@ -138,6 +172,9 @@ impl<E: CatalogExt> Producer<E> {
 		self.hang.finish()?;
 		self.hangz.finish()?;
 		self.msf_track.finish()?;
+		for timeline in self.timelines.lock().unwrap().values_mut() {
+			timeline.finish()?;
+		}
 		Ok(())
 	}
 }

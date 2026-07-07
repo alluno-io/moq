@@ -42,9 +42,14 @@ impl<E: CatalogExt> Import<E> {
 	/// Publish on an existing track producer, registering the rendition in `catalog`.
 	pub fn new(track: moq_net::TrackProducer, catalog: crate::catalog::Producer<E>) -> Self {
 		let rendition = catalog.video_track(track.name());
+		let timeline = catalog.timeline(track.name());
 		Self {
 			avc1: false,
-			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
+			track: crate::container::Producer::with_config(
+				track,
+				crate::catalog::hang::Container::Legacy,
+				crate::container::ProducerConfig::default().with_timeline(timeline),
+			),
 			rendition,
 			config: None,
 			last_sps: None,

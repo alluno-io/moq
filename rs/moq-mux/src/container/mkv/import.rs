@@ -280,11 +280,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 		drop(catalog);
 
+		let timeline = self.catalog.timeline(track.name());
 		self.tracks.insert(
 			track_number,
 			MkvTrack {
 				kind,
-				track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
+				track: crate::container::Producer::with_config(
+					track,
+					crate::catalog::hang::Container::Legacy,
+					crate::container::ProducerConfig::default().with_timeline(timeline),
+				),
 				group: None,
 				last_emitted_ticks: None,
 			},

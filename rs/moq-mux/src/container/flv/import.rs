@@ -470,12 +470,17 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			.video
 			.renditions
 			.insert(net_track.name().to_string(), config.clone());
+		let timeline = self.catalog.timeline(net_track.name());
 		self.video.insert(
 			track_id,
 			VideoStream {
 				// Leading deltas before the first keyframe are skipped at the write
 				// site (the producer reports MissingKeyframe), so a mid-GOP join works.
-				track: crate::container::Producer::new(net_track, crate::catalog::hang::Container::Legacy),
+				track: crate::container::Producer::with_config(
+					net_track,
+					crate::catalog::hang::Container::Legacy,
+					crate::container::ProducerConfig::default().with_timeline(timeline),
+				),
 				config,
 			},
 		);
@@ -494,10 +499,15 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			.audio
 			.renditions
 			.insert(net_track.name().to_string(), config.clone());
+		let timeline = self.catalog.timeline(net_track.name());
 		self.audio.insert(
 			track_id,
 			AudioStream {
-				track: crate::container::Producer::new(net_track, crate::catalog::hang::Container::Legacy),
+				track: crate::container::Producer::with_config(
+					net_track,
+					crate::catalog::hang::Container::Legacy,
+					crate::container::ProducerConfig::default().with_timeline(timeline),
+				),
 				config,
 			},
 		);

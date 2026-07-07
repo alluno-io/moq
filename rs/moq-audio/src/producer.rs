@@ -63,10 +63,17 @@ impl<E: moq_mux::catalog::hang::CatalogExt> AudioProducer<E> {
 
 		let name = name.into();
 		let track = broadcast.create_track(moq_net::Track::new(name.clone()))?;
-		let track = moq_mux::container::Producer::new(track, moq_mux::container::legacy::Wire);
+		let timeline = catalog.timeline(&name);
+		let track = moq_mux::container::Producer::with_config(
+			track,
+			moq_mux::container::legacy::Wire,
+			moq_mux::container::ProducerConfig::default().with_timeline(timeline),
+		);
 
 		let mut catalog_mut = catalog.clone();
-		catalog_mut.lock().audio.insert(&name, encoder.catalog())?;
+		let mut config = encoder.catalog();
+		config.timeline = Some(catalog.timeline(&name).section());
+		catalog_mut.lock().audio.insert(&name, config)?;
 
 		Ok(Self {
 			encoder,

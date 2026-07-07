@@ -37,18 +37,63 @@ pub struct Producer<C: Container> {
 	/// Sequence to use for the next group opened by [`Self::write`].
 	/// Set by [`Self::seek`] and consumed on the next group creation.
 	pending_sequence: Option<u64>,
+
+	/// Records each group open (sequence + keyframe timestamp) into this rendition's
+	/// timeline track, when the producer was built with one.
+	timeline: Option<crate::timeline::Producer>,
+}
+
+/// Configuration for a media [`Producer`], built with the fluent `with_*` setters.
+///
+/// `#[non_exhaustive]`, so new options stay additive; build from [`Default`]:
+/// `ProducerConfig::default().with_timeline(timeline)`.
+#[derive(Default, Clone)]
+#[non_exhaustive]
+pub struct ProducerConfig {
+	/// Maximum buffering latency. When non-zero, frames are buffered and flushed together when the
+	/// buffered duration exceeds it, or a keyframe arrives, packing multiple samples into one
+	/// container frame (e.g. a CMAF moof+mdat). Zero (the default) flushes each frame immediately.
+	pub latency: std::time::Duration,
+
+	/// Records each group open (sequence + keyframe timestamp) into this rendition's timeline track
+	/// (from [`catalog::Producer::timeline`](crate::catalog::Producer::timeline)), so consumers can
+	/// index the media without downloading it. `None` (the default) is a plain media track.
+	/// Importers set this, so an importer-built broadcast publishes timelines by default.
+	pub timeline: Option<crate::timeline::Producer>,
+}
+
+impl ProducerConfig {
+	/// Set the maximum buffering latency; see [`ProducerConfig::latency`].
+	pub fn with_latency(mut self, latency: std::time::Duration) -> Self {
+		self.latency = latency;
+		self
+	}
+
+	/// Record each group open into `timeline`; see [`ProducerConfig::timeline`].
+	pub fn with_timeline(mut self, timeline: crate::timeline::Producer) -> Self {
+		self.timeline = Some(timeline);
+		self
+	}
 }
 
 impl<C: Container> Producer<C> {
-	/// Create a new Producer wrapping the given moq-lite producer.
+	/// Create a plain Producer wrapping the given moq-lite producer, with the default
+	/// [`ProducerConfig`] (no latency buffering, no timeline). Use
+	/// [`with_config`](Self::with_config) to configure it.
 	pub fn new(track: moq_net::TrackProducer, container: C) -> Self {
+		Self::with_config(track, container, ProducerConfig::default())
+	}
+
+	/// Create a Producer with an explicit [`ProducerConfig`].
+	pub fn with_config(track: moq_net::TrackProducer, container: C, config: ProducerConfig) -> Self {
 		Self {
 			inner: track,
 			container,
 			group: None,
 			buffer: Vec::new(),
-			latency: std::time::Duration::ZERO,
+			latency: config.latency,
 			pending_sequence: None,
+			timeline: config.timeline,
 		}
 	}
 
@@ -56,18 +101,6 @@ impl<C: Container> Producer<C> {
 	/// would sidestep group/keyframe invariants.
 	pub fn track(&self) -> &moq_net::TrackProducer {
 		&self.inner
-	}
-
-	/// Set the maximum buffering latency.
-	///
-	/// When non-zero, frames are buffered and flushed together when the buffered
-	/// duration exceeds this value, or when a keyframe arrives. This allows packing
-	/// multiple samples into a single container frame (e.g. CMAF moof+mdat).
-	///
-	/// Default is zero (flush immediately).
-	pub fn with_latency(mut self, latency: std::time::Duration) -> Self {
-		self.latency = latency;
-		self
 	}
 
 	/// Write a frame to the track.
@@ -89,10 +122,17 @@ impl<C: Container> Producer<C> {
 				// mid-stream join) decides whether to skip until the first keyframe.
 				return Err(super::MissingKeyframe.into());
 			}
-			self.group = Some(match self.pending_sequence.take() {
+			let group = match self.pending_sequence.take() {
 				Some(sequence) => self.inner.create_group(moq_net::Group { sequence })?,
 				None => self.inner.append_group()?,
-			});
+			};
+
+			// Index the group the moment it opens: its start is this keyframe's timestamp.
+			if let Some(timeline) = &mut self.timeline {
+				timeline.record(group.sequence, frame.timestamp)?;
+			}
+
+			self.group = Some(group);
 		}
 
 		// Buffer or write the frame.
@@ -357,7 +397,11 @@ mod tests {
 	async fn keyframe_backfills_batched_durations() {
 		let track = track_producer("test");
 		let recording = Recording::default();
-		let mut producer = Producer::new(track, recording.clone()).with_latency(std::time::Duration::from_secs(10));
+		let mut producer = Producer::with_config(
+			track,
+			recording.clone(),
+			ProducerConfig::default().with_latency(std::time::Duration::from_secs(10)),
+		);
 
 		producer.write(frame(0, true)).unwrap(); // group 0 opens
 		producer.write(frame(33_000, false)).unwrap(); // buffered

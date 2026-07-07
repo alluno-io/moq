@@ -137,10 +137,15 @@ impl<E: CatalogExt> Import<E> {
 		tracing::debug!(name = ?track.name(), config = ?audio_config, "starting track");
 
 		let mut rendition = catalog.audio_track(track.name());
+		let timeline = catalog.timeline(track.name());
 		rendition.set(audio_config);
 
 		Self {
-			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
+			track: crate::container::Producer::with_config(
+				track,
+				crate::catalog::hang::Container::Legacy,
+				crate::container::ProducerConfig::default().with_timeline(timeline),
+			),
 			rendition,
 		}
 	}
