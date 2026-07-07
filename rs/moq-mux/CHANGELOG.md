@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.2...moq-mux-v0.7.3) - 2026-07-07
+
+### Fixed
+
+- *(moq-mux)* match per-rendition init track id to its fragments ([#2104](https://github.com/moq-dev/moq/pull/2104))
+
 ## [0.7.2](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.1...moq-mux-v0.7.2) - 2026-07-05
 
 ### Other
