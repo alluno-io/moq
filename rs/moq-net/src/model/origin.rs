@@ -1112,10 +1112,13 @@ impl Dynamic {
 
 	/// Poll for the next requested broadcast, without blocking.
 	pub fn poll_requested_broadcast(&mut self, waiter: &kio::Waiter) -> Poll<Result<Request, Error>> {
-		let Some(mut state) = ready!(
-			self.queue
-				.poll_lock_when(waiter, |state| !state.request_order.is_empty())
-		) else {
+		let Some(mut state) = ready!(self.queue.poll(waiter, |state| {
+			if state.request_order.is_empty() {
+				Poll::Pending
+			} else {
+				Poll::Ready(())
+			}
+		})) else {
 			// Every sender (the origin and all its consumers) is gone: no request can
 			// ever arrive, so the handler loop ends.
 			return Poll::Ready(Err(Error::Dropped));

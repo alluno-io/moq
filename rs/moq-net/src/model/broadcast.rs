@@ -221,9 +221,7 @@ impl Producer {
 	/// gone, so a clone that outlives this call keeps it alive until it too is
 	/// dropped or closed.
 	pub fn close(self) {
-		if let Ok(mut state) = self.state.write() {
-			state.closed = true;
-		}
+		self.state.lock().closed = true;
 	}
 
 	/// Return true if this is the same broadcast instance.
@@ -238,12 +236,10 @@ impl Drop for Producer {
 		// leaves it live. Warn if that last exit wasn't an explicit close(), since
 		// consumers will then see Error::Dropped (classically a GC-collected handle
 		// in a language binding that tears the stream down mid-publish).
-		if !self.state.is_last() {
+		if !self.alive.is_last() {
 			return;
 		}
-		if let Ok(state) = self.state.write()
-			&& !state.closed
-		{
+		if !self.state.read().closed {
 			tracing::warn!(
 				"broadcast::Producer dropped without close(). Keep the producer alive while publishing, then call close()."
 			);
@@ -298,10 +294,13 @@ impl Dynamic {
 
 	/// Poll for the next consumer-requested track, without blocking.
 	pub fn poll_requested_track(&mut self, waiter: &kio::Waiter) -> Poll<Result<track::Request, Error>> {
-		let Some(mut state) = ready!(
-			self.state
-				.poll_lock_when(waiter, |state| !state.request_order.is_empty())
-		) else {
+		let Some(mut state) = ready!(self.state.poll(waiter, |state| {
+			if state.request_order.is_empty() {
+				Poll::Pending
+			} else {
+				Poll::Ready(())
+			}
+		})) else {
 			// Every sender (the producer and all consumers) is gone.
 			return Poll::Ready(Err(Error::Dropped));
 		};

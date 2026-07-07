@@ -1,17 +1,22 @@
-//! A two-sided shared-state channel: both ends mutate one lock-guarded value.
+//! A lock-guarded value that *both* sides mutate, with waker notification and per-side
+//! liveness.
 //!
-//! Unlike [`Producer`](crate::Producer)/[`Consumer`](crate::Consumer) (one writer,
-//! many read-only observers), a [`Sender`] and a [`Receiver`] *both* hold mutable
-//! access to the shared `T` by design. It's the primitive for a reverse queue: many
-//! senders enqueue (and can dedup against what's already there), one or more receivers
-//! drain, all under a single mutex, so the dedup is a plain lookup rather than a race.
+//! Nothing flows across it (it isn't a message pipe): a [`Sender`] and a [`Receiver`] both
+//! lock the same `T` and mutate it in place. It's the primitive for a reverse queue where a
+//! plain [`Consumer`](crate::Consumer) would otherwise have to illegally write back through
+//! its read handle: senders enqueue (and can dedup against what's already there) while
+//! receivers drain, all under one mutex, so the dedup is a plain lookup rather than a race.
 //!
-//! Liveness is channel-style, not condvar-style. A bare condvar blocks forever when a
-//! predicate can never be satisfied; here a wait resolves to `None` when the *opposite*
-//! side has no live handles. A drain (`Receiver`) ends once every `Sender` is gone, and
-//! an enqueue (`Sender`) reports `None` once every `Receiver` is gone. The two handle
-//! types are otherwise symmetric (both `DerefMut<T>` through the returned guard); they
-//! differ only in which counterpart's disappearance closes the wait.
+//! The two sides are asymmetric by role, not symmetric:
+//! - A [`Sender`] enqueues and never blocks. It mutates unconditionally ([`Sender::lock`])
+//!   and can ask whether a drainer exists ([`Sender::has_receivers`]).
+//! - A [`Receiver`] drains and can block: [`poll`](Receiver::poll) / [`wait`](Receiver::wait)
+//!   park until the state is drainable, then hand back a guard.
+//!
+//! Liveness is channel-style, not condvar-style: a `Receiver`'s wait resolves to `None` once
+//! every `Sender` is gone (drain-then-close, like an mpsc receiver) instead of blocking
+//! forever. Both sides are clone-counted, and either can mint the other
+//! ([`Sender::receiver`] / [`Receiver::sender`]).
 
 use std::{
 	sync::{
@@ -47,17 +52,22 @@ pub struct Sender<T> {
 
 impl<T: Default> Default for Sender<T> {
 	fn default() -> Self {
+		Self::new(T::default())
+	}
+}
+
+impl<T> Sender<T> {
+	/// Create a channel seeded with `value`, with no receivers yet.
+	pub fn new(value: T) -> Self {
 		Self {
-			state: Lock::new(State::default()),
+			state: Lock::new(State::new(value)),
 			counts: Arc::new(Counts {
 				senders: AtomicUsize::new(1),
 				receivers: AtomicUsize::new(0),
 			}),
 		}
 	}
-}
 
-impl<T> Sender<T> {
 	/// Mint a [`Receiver`] that drains this channel.
 	pub fn receiver(&self) -> Receiver<T> {
 		self.counts.receivers.fetch_add(1, Ordering::AcqRel);
@@ -145,30 +155,29 @@ impl<T> Receiver<T> {
 		}
 	}
 
-	/// Poll for the shared state to satisfy `pred`, then hand back a mutable guard to
-	/// drain it.
+	/// Poll a predicate; once it holds, hand back a mutable guard to drain the state.
 	///
-	/// `pred` sees only a `&T`, so it can't flag the state modified and spuriously wake
-	/// this poll (the same footgun [`Producer::poll`](crate::Producer::poll) avoids).
-	/// Returns `Ready(None)` once every [`Sender`] is gone and `pred` is still unsatisfied
-	/// (drain-then-close, like an mpsc receiver). Registers `waiter` while pending.
-	pub fn poll_lock_when<F>(&self, waiter: &Waiter, mut pred: F) -> Poll<Option<Mut<'_, T>>>
+	/// Mirrors [`Producer::poll`](crate::Producer::poll): `f` only sees a [`Ref`] (so it
+	/// can't flag the state modified and spuriously wake this poll), decides readiness, and
+	/// the satisfied poll upgrades to a [`Mut`] with the lock still held. Returns
+	/// `Ready(None)` once every [`Sender`] is gone and `f` is still pending (drain-then-close,
+	/// like an mpsc receiver). Registers `waiter` while pending.
+	pub fn poll<F>(&self, waiter: &Waiter, mut f: F) -> Poll<Option<Mut<'_, T>>>
 	where
-		F: FnMut(&T) -> bool,
+		F: FnMut(&Ref<'_, T>) -> Poll<()>,
 	{
-		let guard = Ref {
+		let mut guard = Ref {
 			state: self.state.lock(),
 		};
-		if pred(&guard) {
+		if let Poll::Ready(()) = f(&guard) {
 			return Poll::Ready(Some(Mut::new(guard.state)));
 		}
 
-		let mut state = guard.state;
 		if self.counts.senders.load(Ordering::Acquire) == 0 {
 			return Poll::Ready(None);
 		}
 
-		waiter.register(&mut state.waiters_value);
+		waiter.register(&mut guard.state.waiters_value);
 
 		// Re-check after registering to close the TOCTOU window where the last sender
 		// drops between the check above and the registration.
@@ -179,20 +188,26 @@ impl<T> Receiver<T> {
 		Poll::Pending
 	}
 
-	/// Await the next drainable state: resolves with a guard once `pred` holds, or `None`
-	/// once every [`Sender`] is gone.
-	pub async fn recv<F>(&self, mut pred: F) -> Option<Mut<'_, T>>
+	/// Await the next drainable state: resolves with a guard once `f` holds, or `None` once
+	/// every [`Sender`] is gone. The async sibling of [`poll`](Self::poll).
+	pub async fn wait<F>(&self, mut f: F) -> Option<Mut<'_, T>>
 	where
-		F: FnMut(&T) -> bool + Unpin,
+		F: FnMut(&Ref<'_, T>) -> Poll<()> + Unpin,
 	{
-		crate::wait(move |waiter| self.poll_lock_when(waiter, &mut pred)).await
+		crate::wait(move |waiter| self.poll(waiter, &mut f)).await
+	}
+
+	/// Read-only access to the shared state, without waking anyone.
+	pub fn read(&self) -> Ref<'_, T> {
+		Ref {
+			state: self.state.lock(),
+		}
 	}
 
 	/// Unconditionally lock for mutation.
 	///
-	/// Unlike [`poll_lock_when`](Self::poll_lock_when) this never waits or reports closure;
-	/// it's the direct-access counterpart used for cleanup (e.g. draining the queue in a
-	/// last-receiver `Drop`).
+	/// Unlike [`poll`](Self::poll) this never waits or reports closure; it's the direct-access
+	/// counterpart used for cleanup (e.g. draining the queue in a last-receiver `Drop`).
 	pub fn lock(&self) -> Mut<'_, T> {
 		Mut::new(self.state.lock())
 	}
@@ -287,22 +302,29 @@ mod test {
 		(waker, w)
 	}
 
+	/// Ready once the queue has something to drain.
+	fn nonempty(queue: &Ref<'_, Vec<u32>>) -> Poll<()> {
+		if queue.is_empty() {
+			Poll::Pending
+		} else {
+			Poll::Ready(())
+		}
+	}
+
 	#[test]
 	fn enqueue_then_drain() {
 		let sender = Sender::<Vec<u32>>::default();
 		let receiver = sender.receiver();
 		let waiter = Waiter::noop();
 
-		let nonempty = |q: &Vec<u32>| !q.is_empty();
-
 		// Nothing queued yet.
-		assert!(matches!(receiver.poll_lock_when(&waiter, nonempty), Poll::Pending));
+		assert!(matches!(receiver.poll(&waiter, nonempty), Poll::Pending));
 
 		// A sender enqueues.
 		sender.lock().push(1);
 
 		// The receiver drains it.
-		let Poll::Ready(Some(mut guard)) = receiver.poll_lock_when(&waiter, nonempty) else {
+		let Poll::Ready(Some(mut guard)) = receiver.poll(&waiter, nonempty) else {
 			panic!("expected a drainable guard");
 		};
 		assert_eq!(guard.pop(), Some(1));
@@ -331,21 +353,18 @@ mod test {
 
 		// No senders left and nothing queued: the drain resolves to None rather than
 		// blocking forever.
-		assert!(matches!(
-			receiver.poll_lock_when(&waiter, |q| !q.is_empty()),
-			Poll::Ready(None)
-		));
+		assert!(matches!(receiver.poll(&waiter, nonempty), Poll::Ready(None)));
 	}
 
 	#[test]
-	fn recv_wakes_on_enqueue() {
+	fn wait_wakes_on_enqueue() {
 		let sender = Sender::<Vec<u32>>::default();
 		let receiver = sender.receiver();
 
 		let (waker, w) = counting();
 		let mut cx = Context::from_waker(&w);
 
-		let mut recv = Box::pin(receiver.recv(|q| !q.is_empty()));
+		let mut recv = Box::pin(receiver.wait(nonempty));
 		assert!(
 			matches!(recv.as_mut().poll(&mut cx), Poll::Pending),
 			"pending until enqueue"

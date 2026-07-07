@@ -956,7 +956,14 @@ impl Dynamic {
 
 	pub fn poll_requested_group(&self, waiter: &kio::Waiter) -> Poll<Result<GroupRequest>> {
 		// Prefer serving a queued fetch, even if the track has since aborted.
-		match self.fetch.poll_lock_when(waiter, |queue| !queue.is_empty()) {
+		let drainable = |queue: &kio::Ref<'_, FetchQueue>| {
+			if queue.is_empty() {
+				Poll::Pending
+			} else {
+				Poll::Ready(())
+			}
+		};
+		match self.fetch.poll(waiter, drainable) {
 			Poll::Ready(Some(mut queue)) => {
 				let pending = queue.pop_front().expect("predicate guaranteed a request");
 				return Poll::Ready(Ok(GroupRequest {
@@ -1030,7 +1037,14 @@ fn drain_pending_subs(
 	state: &kio::Producer<TrackState>,
 	waiter: &kio::Waiter,
 ) {
-	let drained: Vec<_> = match pending.poll_lock_when(waiter, |queue| !queue.is_empty()) {
+	let drainable = |queue: &kio::Ref<'_, PendingSubs>| {
+		if queue.is_empty() {
+			Poll::Pending
+		} else {
+			Poll::Ready(())
+		}
+	};
+	let drained: Vec<_> = match pending.poll(waiter, drainable) {
 		Poll::Ready(Some(mut queue)) => queue.drain(..).collect(),
 		_ => return,
 	};
