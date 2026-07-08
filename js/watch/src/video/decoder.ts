@@ -13,6 +13,13 @@ import type { Source } from "./source";
 const BUFFERING = 500 as Time.Milli;
 const SWITCH = 100 as Time.Milli;
 
+// Bounded in-place recovery for video decode errors: instead of tearing the track
+// down on the first error (a permanent freeze), the decoder reconfigures and
+// resubscribes, resuming at the next keyframe group. Gives up after RECOVER_MAX
+// errors within RECOVER_WINDOW_MS so a persistently broken stream doesn't hot-loop.
+const RECOVER_MAX = 3;
+const RECOVER_WINDOW_MS = 8000;
+
 export type DecoderProps = {
 	enabled?: boolean | Signal<boolean>;
 };
@@ -224,6 +231,12 @@ class DecoderTrack {
 	// so in-flight decodes from before a rewind can be dropped on output.
 	#discontinuity = 0;
 
+	// In-place recovery state for decode errors. Bumping #recover re-runs #run
+	// (fresh decoder + resubscribe); the counters bound how often that can happen.
+	#recover = new Signal<number>(0);
+	#recoverAttempts = 0;
+	#recoverAt = 0;
+
 	signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
@@ -240,6 +253,9 @@ class DecoderTrack {
 	}
 
 	#run(effect: Effect): void {
+		// Re-run (fresh decoder + resubscribe) whenever a decode error bumps #recover.
+		effect.get(this.#recover);
+
 		const sub = this.broadcast.subscribe(this.track, Catalog.PRIORITY.video);
 		effect.cleanup(() => sub.close());
 
@@ -274,6 +290,9 @@ class DecoderTrack {
 
 					this.timestamp.set(timestamp);
 
+					// A rendered frame means decoding is healthy again.
+					this.#recoverAttempts = 0;
+
 					// Trim the decode buffer as frames are rendered
 					this.#trimBuffered(timestamp);
 
@@ -285,10 +304,21 @@ class DecoderTrack {
 					frame.close();
 				}
 			},
-			// TODO bubble up error
 			error: (error) => {
-				console.error(error);
-				effect.close();
+				const now = performance.now();
+				if (now - this.#recoverAt > RECOVER_WINDOW_MS) this.#recoverAttempts = 0;
+				this.#recoverAt = now;
+
+				if (this.#recoverAttempts >= RECOVER_MAX) {
+					console.error("video: decode error, giving up after retries", error);
+					effect.close();
+					return;
+				}
+
+				this.#recoverAttempts += 1;
+				// Recover in place: #run tears down the dead decoder and resubscribes,
+				// which the relay serves from the next keyframe group.
+				this.#recover.update((n) => n + 1);
 			},
 		});
 		effect.cleanup(() => {
