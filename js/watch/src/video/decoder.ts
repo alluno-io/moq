@@ -354,6 +354,8 @@ class DecoderTrack {
 			...this.config,
 			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
 			optimizeForLatency: this.config.optimizeForLatency ?? true,
+			// Offload decode to the GPU when available; falls back to software.
+			hardwareAcceleration: "prefer-hardware",
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
 		});
@@ -438,6 +440,8 @@ class DecoderTrack {
 			codec: this.config.codec,
 			description,
 			optimizeForLatency: this.config.optimizeForLatency ?? true,
+			// Offload decode to the GPU when available; falls back to software.
+			hardwareAcceleration: "prefer-hardware",
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
 		});

@@ -33,6 +33,9 @@ export class Connection implements Established {
 	// The version of the connection as a human-readable string.
 	readonly version: string;
 
+	/** The transport carrying this session (native WebTransport or WebSocket/qmux fallback). */
+	readonly transport: "webtransport" | "websocket";
+
 	// The version used for encoding/decoding.
 	#version: Version;
 
@@ -75,6 +78,11 @@ export class Connection implements Established {
 		this.#session = session;
 		this.version = versionName(version);
 		this.#version = version;
+
+		// A native WebTransport session is `instanceof WebTransport`; the qmux fallback
+		// only implements the interface, so it isn't. Guard the global for non-WT browsers.
+		this.transport =
+			typeof WebTransport !== "undefined" && quic instanceof WebTransport ? "webtransport" : "websocket";
 
 		// Send bandwidth is version-agnostic: depends on browser/QUIC support.
 		const hasGetStats = typeof (quic as unknown as { getStats?: unknown }).getStats === "function";

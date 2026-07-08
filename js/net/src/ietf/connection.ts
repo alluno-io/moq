@@ -27,6 +27,9 @@ export class Connection implements Established {
 	// The negotiated protocol version.
 	readonly version: string;
 
+	/** The transport carrying this session (native WebTransport or WebSocket/qmux fallback). */
+	readonly transport: "webtransport" | "websocket";
+
 	// The established WebTransport session.
 	#quic: WebTransport;
 
@@ -68,6 +71,11 @@ export class Connection implements Established {
 		this.url = url;
 		this.version = versionName(version);
 		this.#quic = quic;
+
+		// A native WebTransport session is `instanceof WebTransport`; the qmux fallback
+		// only implements the interface, so it isn't. Guard the global for non-WT browsers.
+		this.transport =
+			typeof WebTransport !== "undefined" && quic instanceof WebTransport ? "webtransport" : "websocket";
 
 		// Two-path dispatch: v14-v16 uses adapter, v17+ uses native bidi streams
 		if (version >= Version.DRAFT_17) {

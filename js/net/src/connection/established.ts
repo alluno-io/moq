@@ -13,6 +13,9 @@ export interface Established {
 	/** Negotiated wire protocol version. */
 	readonly version: string;
 
+	/** The transport carrying this session: native WebTransport (QUIC) or the WebSocket (qmux) fallback. */
+	readonly transport: "webtransport" | "websocket";
+
 	/** Estimated send bitrate from the congestion controller (if supported). */
 	readonly sendBandwidth?: Bandwidth;
 
