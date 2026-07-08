@@ -821,7 +821,7 @@ impl Producer {
 			info,
 			nodes: OriginNodes::default(),
 			root: PathOwned::default(),
-			dynamic: kio::shared::Sender::default(),
+			dynamic: kio::shared::Sender::with_cleanup(OriginDynamicState::default(), |state| state.reject_requests()),
 		}
 	}
 
@@ -834,7 +834,7 @@ impl Producer {
 			info,
 			nodes: OriginNodes { nodes: Vec::new() },
 			root: PathOwned::default(),
-			dynamic: kio::shared::Sender::default(),
+			dynamic: kio::shared::Sender::with_cleanup(OriginDynamicState::default(), |state| state.reject_requests()),
 		}
 	}
 
@@ -1138,18 +1138,6 @@ impl Dynamic {
 	/// Returns the prefix that is automatically stripped from requested paths.
 	pub fn root(&self) -> &Path<'_> {
 		&self.root
-	}
-}
-
-impl Drop for Dynamic {
-	fn drop(&mut self) {
-		// The last handler going away leaves nobody to fulfill the requests still queued
-		// (not yet picked up), so reject them: dropping their result channels resolves the
-		// awaiting requesters to `Unroutable`. Requests already handed to a `Request`
-		// live on independently, so an in-flight `accept` still works.
-		if self.queue.is_last() {
-			self.queue.lock().reject_requests();
-		}
 	}
 }
 
@@ -1484,7 +1472,9 @@ impl Consumer {
 			producer.consume()
 		} else {
 			// No handler is live to drain the queue, so an unannounced path is `Unroutable`.
-			if !self.dynamic.has_receivers() {
+			// Checked through the held guard, so it's atomic with the last handler's drop-time
+			// rejection.
+			if !state.has_receivers() {
 				return kio::Pending::new(Requested::failed(Error::Unroutable));
 			}
 

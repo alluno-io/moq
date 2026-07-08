@@ -1,5 +1,6 @@
 //! A lock-guarded value that *both* sides mutate, with waker notification and per-side
-//! liveness.
+//! liveness, built on the same counting the watch [`Producer`](crate::Producer) /
+//! [`Consumer`](crate::Consumer) use.
 //!
 //! Nothing flows across it (it isn't a message pipe): a [`Sender`] and a [`Receiver`] both
 //! lock the same `T` and mutate it in place. It's the primitive for a reverse queue where a
@@ -7,47 +8,50 @@
 //! its read handle: senders enqueue (and can dedup against what's already there) while
 //! receivers drain, all under one mutex, so the dedup is a plain lookup rather than a race.
 //!
-//! The two sides are asymmetric by role, not symmetric:
-//! - A [`Sender`] enqueues and never blocks. It mutates unconditionally ([`Sender::lock`])
-//!   and can ask whether a drainer exists ([`Sender::has_receivers`]).
-//! - A [`Receiver`] drains and can block: [`poll`](Receiver::poll) / [`wait`](Receiver::wait)
-//!   park until the state is drainable, then hand back a guard.
+//! The two sides map onto the watch roles:
+//! - A [`Sender`] is the producer role. It enqueues and never blocks: [`lock`](Sender::lock)
+//!   hands back a guard that mutates unconditionally and reports whether a drainer exists
+//!   ([`Guard::has_receivers`]). While no sender remains a receiver's drain resolves to `None`,
+//!   though a receiver can resurrect the sender side via [`Receiver::sender`].
+//! - A [`Receiver`] is the consumer role. It drains and can block: [`poll`](Receiver::poll) /
+//!   [`wait`](Receiver::wait) park until the state is drainable, then hand back a guard.
 //!
 //! Liveness is channel-style, not condvar-style: a `Receiver`'s wait resolves to `None` once
 //! every `Sender` is gone (drain-then-close, like an mpsc receiver) instead of blocking
 //! forever. Both sides are clone-counted, and either can mint the other
 //! ([`Sender::receiver`] / [`Receiver::sender`]).
+//!
+//! Receiver presence is the enqueue gate: with no receiver nobody will ever drain, so an
+//! enqueue path checks [`Guard::has_receivers`] and bails. Read through the guard, that check
+//! is ordered against the last receiver's drop (which locks to run its cleanup), so the two
+//! can't interleave and strand work. A channel built with [`Sender::with_cleanup`] runs its
+//! hook on the value when that last receiver drops, under the same lock, to reject whatever
+//! is queued.
 
 use std::{
-	sync::{
-		Arc,
-		atomic::{AtomicUsize, Ordering},
-	},
+	ops::{Deref, DerefMut},
+	sync::{Arc, atomic::Ordering},
 	task::Poll,
 };
 
 use crate::{
-	State,
+	Counts, State,
 	lock::Lock,
 	producer::{Mut, Ref},
 	waiter::*,
 };
 
-/// Live-handle counts for the two sides. A side's wait closes when the opposite count
-/// hits zero, which is what turns a shared mutex into a channel.
-struct Counts {
-	senders: AtomicUsize,
-	receivers: AtomicUsize,
-}
+/// Run on the value when the last [`Receiver`] drops, under the state lock.
+type Cleanup<T> = Arc<dyn Fn(&mut T) + Send + Sync>;
 
-/// The enqueue side of a [`shared`](self) channel.
+/// The enqueue (producer-role) side of a [`shared`](self) channel.
 ///
 /// Clone-counted: cloning mints another sender. [`lock`](Self::lock) hands back a mutable
-/// guard unless every [`Receiver`] is gone, in which case there is nobody to drain and it
-/// returns `None`.
+/// [`Guard`]; while no sender remains a [`Receiver`]'s drain resolves to `None`.
 pub struct Sender<T> {
 	state: Lock<State<T>>,
 	counts: Arc<Counts>,
+	cleanup: Cleanup<T>,
 }
 
 impl<T: Default> Default for Sender<T> {
@@ -57,35 +61,47 @@ impl<T: Default> Default for Sender<T> {
 }
 
 impl<T> Sender<T> {
-	/// Create a channel seeded with `value`, with no receivers yet.
+	/// Create a channel seeded with `value`, with no receivers yet and no cleanup hook.
 	pub fn new(value: T) -> Self {
+		Self::build(value, Arc::new(|_| {}))
+	}
+
+	/// Like [`new`](Self::new), but runs `on_unused` on the value when the last [`Receiver`]
+	/// drops, under the state lock (atomic with the drop). Use it to reject queued work that
+	/// nobody will ever drain once the last drainer is gone.
+	pub fn with_cleanup(value: T, on_unused: impl Fn(&mut T) + Send + Sync + 'static) -> Self {
+		Self::build(value, Arc::new(on_unused))
+	}
+
+	fn build(value: T, cleanup: Cleanup<T>) -> Self {
 		Self {
 			state: Lock::new(State::new(value)),
-			counts: Arc::new(Counts {
-				senders: AtomicUsize::new(1),
-				receivers: AtomicUsize::new(0),
-			}),
+			counts: Arc::new(Counts::default()),
+			cleanup,
 		}
 	}
 
 	/// Mint a [`Receiver`] that drains this channel.
 	pub fn receiver(&self) -> Receiver<T> {
-		self.counts.receivers.fetch_add(1, Ordering::AcqRel);
+		self.counts.consumers.fetch_add(1, Ordering::AcqRel);
 		Receiver {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
+			cleanup: self.cleanup.clone(),
 		}
 	}
 
-	/// Lock the shared state for mutation.
+	/// Lock the shared state for mutation, returning a [`Guard`].
 	///
 	/// Unconditional: unlike a queue-enqueue that only makes sense with a live drainer, a
 	/// [`Sender`] can always mutate the shared value (e.g. a producer maintaining a registry
 	/// that a [`Receiver`] isn't required for). Gate enqueue paths on
-	/// [`has_receivers`](Self::has_receivers). Mutating through the returned [`Mut`] wakes a
-	/// waiting receiver on drop.
-	pub fn lock(&self) -> Mut<'_, T> {
-		Mut::new(self.state.lock())
+	/// [`Guard::has_receivers`]. Mutating through the guard wakes a waiting receiver on drop.
+	pub fn lock(&self) -> Guard<'_, T> {
+		Guard {
+			inner: Mut::new(self.state.lock()),
+			counts: &self.counts,
+		}
 	}
 
 	/// Read-only access to the shared state, without waking anyone.
@@ -93,17 +109,6 @@ impl<T> Sender<T> {
 		Ref {
 			state: self.state.lock(),
 		}
-	}
-
-	/// Whether any [`Receiver`] is currently live.
-	///
-	/// Gate a queue enqueue on this: with no receiver, nobody will ever drain it. Checked
-	/// while holding [`lock`](Self::lock) it is ordered against a concurrent last-receiver
-	/// drop (which locks to run its cleanup), so `true` here means the request won't be
-	/// stranded (at worst it's rejected by that cleanup, which is the same benign race the
-	/// queue already tolerates).
-	pub fn has_receivers(&self) -> bool {
-		self.counts.receivers.load(Ordering::Acquire) > 0
 	}
 
 	/// Returns `true` if both handles share the same channel.
@@ -114,44 +119,85 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
 	fn clone(&self) -> Self {
-		self.counts.senders.fetch_add(1, Ordering::Relaxed);
+		self.counts.producers.fetch_add(1, Ordering::Relaxed);
 		Self {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
+			cleanup: self.cleanup.clone(),
 		}
 	}
 }
 
 impl<T> Drop for Sender<T> {
 	fn drop(&mut self) {
-		let prev = self.counts.senders.fetch_sub(1, Ordering::AcqRel);
+		let prev = self.counts.producers.fetch_sub(1, Ordering::AcqRel);
 		if prev > 1 {
 			return;
 		}
 
-		// Last sender gone: wake receivers so a pending drain observes `senders == 0`
-		// and resolves to `None` instead of blocking forever.
-		let mut waiters = self.state.lock().waiters_value.take();
-		waiters.wake();
+		// Last sender gone: wake any parked drain so it re-polls, observes `producers == 0`, and
+		// resolves to `None` instead of blocking forever. We track the live count (not a latch)
+		// because a [`Receiver`] can resurrect the sender side via [`Receiver::sender`].
+		let (mut value, mut closed) = {
+			let mut state = self.state.lock();
+			(state.waiters_value.take(), state.waiters_closed.take())
+		};
+		value.wake();
+		closed.wake();
 	}
 }
 
-/// The drain side of a [`shared`](self) channel.
+/// A mutable lock guard over a [`Sender`]'s state, with access to receiver presence.
+///
+/// Derefs to `T`. Mutating through it wakes a waiting [`Receiver`] on drop.
+pub struct Guard<'a, T> {
+	inner: Mut<'a, T>,
+	counts: &'a Counts,
+}
+
+impl<T> Guard<'_, T> {
+	/// Whether any [`Receiver`] is currently live.
+	///
+	/// Gate a queue enqueue on this: with no receiver, nobody will ever drain it. Read while
+	/// the lock is held, it is ordered against a concurrent last-receiver drop (which locks to
+	/// run its cleanup), so an enqueue and that cleanup can't interleave and strand work.
+	pub fn has_receivers(&self) -> bool {
+		self.counts.consumers.load(Ordering::Acquire) > 0
+	}
+}
+
+impl<T> Deref for Guard<'_, T> {
+	type Target = T;
+
+	fn deref(&self) -> &T {
+		&self.inner
+	}
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+	fn deref_mut(&mut self) -> &mut T {
+		&mut self.inner
+	}
+}
+
+/// The drain (consumer-role) side of a [`shared`](self) channel.
 ///
 /// Clone-counted, so several drainers can share one queue (work-stealing). Minted from a
 /// [`Sender`] via [`Sender::receiver`].
 pub struct Receiver<T> {
 	state: Lock<State<T>>,
 	counts: Arc<Counts>,
+	cleanup: Cleanup<T>,
 }
 
 impl<T> Receiver<T> {
 	/// Mint a [`Sender`] onto the same channel.
 	pub fn sender(&self) -> Sender<T> {
-		self.counts.senders.fetch_add(1, Ordering::Relaxed);
+		self.counts.producers.fetch_add(1, Ordering::Relaxed);
 		Sender {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
+			cleanup: self.cleanup.clone(),
 		}
 	}
 
@@ -173,15 +219,15 @@ impl<T> Receiver<T> {
 			return Poll::Ready(Some(Mut::new(guard.state)));
 		}
 
-		if self.counts.senders.load(Ordering::Acquire) == 0 {
+		if self.counts.producers.load(Ordering::Acquire) == 0 {
 			return Poll::Ready(None);
 		}
 
 		waiter.register(&mut guard.state.waiters_value);
 
-		// Re-check after registering to close the TOCTOU window where the last sender
-		// drops between the check above and the registration.
-		if self.counts.senders.load(Ordering::Acquire) == 0 {
+		// Re-check after registering to close the TOCTOU window where the last sender drops
+		// between the check above and the registration.
+		if self.counts.producers.load(Ordering::Acquire) == 0 {
 			return Poll::Ready(None);
 		}
 
@@ -204,31 +250,14 @@ impl<T> Receiver<T> {
 		}
 	}
 
-	/// Unconditionally lock for mutation.
-	///
-	/// Unlike [`poll`](Self::poll) this never waits or reports closure; it's the direct-access
-	/// counterpart used for cleanup (e.g. draining the queue in a last-receiver `Drop`).
-	pub fn lock(&self) -> Mut<'_, T> {
-		Mut::new(self.state.lock())
-	}
-
-	/// Returns `true` if this is the only remaining receiver.
-	///
-	/// Racy in general; intended for a receiver's own `Drop` (where this handle has not yet
-	/// been counted out) to gate last-receiver cleanup, mirroring
-	/// [`Producer::is_last`](crate::Producer::is_last).
-	pub fn is_last(&self) -> bool {
-		self.counts.receivers.load(Ordering::Acquire) == 1
-	}
-
 	/// Poll for every [`Sender`] to be gone (the channel's "closed" for a receiver).
 	pub fn poll_closed(&self, waiter: &Waiter) -> Poll<()> {
 		let mut state = self.state.lock();
-		if self.counts.senders.load(Ordering::Acquire) == 0 {
+		if self.counts.producers.load(Ordering::Acquire) == 0 {
 			return Poll::Ready(());
 		}
-		waiter.register(&mut state.waiters_value);
-		if self.counts.senders.load(Ordering::Acquire) == 0 {
+		waiter.register(&mut state.waiters_closed);
+		if self.counts.producers.load(Ordering::Acquire) == 0 {
 			return Poll::Ready(());
 		}
 		Poll::Pending
@@ -247,23 +276,29 @@ impl<T> Receiver<T> {
 
 impl<T> Clone for Receiver<T> {
 	fn clone(&self) -> Self {
-		self.counts.receivers.fetch_add(1, Ordering::Relaxed);
+		self.counts.consumers.fetch_add(1, Ordering::Relaxed);
 		Self {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
+			cleanup: self.cleanup.clone(),
 		}
 	}
 }
 
 impl<T> Drop for Receiver<T> {
 	fn drop(&mut self) {
-		let prev = self.counts.receivers.fetch_sub(1, Ordering::AcqRel);
+		// Decrement under the lock so the last-receiver cleanup is atomic with the count going
+		// to zero, and an enqueue that read `has_receivers` under this same lock can't slip in
+		// afterward and strand work.
+		let mut state = self.state.lock();
+		let prev = self.counts.consumers.fetch_sub(1, Ordering::AcqRel);
 		if prev > 1 {
 			return;
 		}
 
-		// Last receiver gone: wake senders so a pending enqueue-wait resolves.
-		let mut waiters = self.state.lock().waiters_value.take();
+		(self.cleanup)(&mut state.value);
+		let mut waiters = state.waiters_consumer.take();
+		drop(state);
 		waiters.wake();
 	}
 }
@@ -334,13 +369,16 @@ mod test {
 	fn has_receivers_tracks_receiver_presence() {
 		let sender = Sender::<Vec<u32>>::default();
 		// No receiver minted yet.
-		assert!(!sender.has_receivers());
+		assert!(!sender.lock().has_receivers());
 
 		let receiver = sender.receiver();
-		assert!(sender.has_receivers());
+		assert!(sender.lock().has_receivers());
 
 		drop(receiver);
-		assert!(!sender.has_receivers(), "dropping the last receiver reverts to false");
+		assert!(
+			!sender.lock().has_receivers(),
+			"dropping the last receiver reverts to false"
+		);
 	}
 
 	#[test]
@@ -380,14 +418,38 @@ mod test {
 	}
 
 	#[test]
-	fn is_last_tracks_receiver_count() {
-		let sender = Sender::<Vec<u32>>::default();
+	fn cleanup_fires_on_last_receiver() {
+		// The hook rejects whatever is queued so nobody waits on undrained work.
+		let sender = Sender::with_cleanup(Vec::<u32>::new(), |queue| queue.clear());
 		let receiver = sender.receiver();
-		assert!(receiver.is_last());
+		let receiver2 = receiver.clone();
 
-		let clone = receiver.clone();
-		assert!(!receiver.is_last());
-		drop(clone);
-		assert!(receiver.is_last());
+		sender.lock().push(1);
+		sender.lock().push(2);
+
+		// A non-last receiver dropping leaves the queue alone.
+		drop(receiver2);
+		assert_eq!(sender.read().len(), 2);
+
+		// The last receiver dropping runs the cleanup under the lock.
+		drop(receiver);
+		assert!(sender.read().is_empty(), "cleanup should have drained the queue");
+	}
+
+	#[test]
+	fn enqueue_gate_atomic_with_last_receiver_drop() {
+		// The has_receivers check and the enqueue share one lock; the last-receiver cleanup
+		// takes that same lock, so an item enqueued while a receiver still existed is rejected
+		// rather than stranded.
+		let sender = Sender::with_cleanup(Vec::<u32>::new(), |queue| queue.clear());
+		let receiver = sender.receiver();
+
+		let mut guard = sender.lock();
+		assert!(guard.has_receivers());
+		guard.push(9);
+		drop(guard);
+
+		drop(receiver);
+		assert!(sender.read().is_empty(), "the queued item should have been rejected");
 	}
 }

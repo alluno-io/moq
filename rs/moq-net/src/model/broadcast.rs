@@ -125,7 +125,12 @@ impl Producer {
 		Self {
 			info: Arc::new(info),
 			alive: Default::default(),
-			state: Default::default(),
+			// Reject any queued requests when the last dynamic handler (`Receiver`) drops, so a
+			// consumer never blocks on a request nobody will fulfill. Fired under the state lock,
+			// atomic with the handler count reaching zero.
+			state: kio::shared::Sender::with_cleanup(BroadcastState::default(), |state| {
+				state.reject_requests(Error::Dropped)
+			}),
 		}
 	}
 
@@ -339,16 +344,6 @@ impl Dynamic {
 	}
 }
 
-impl Drop for Dynamic {
-	fn drop(&mut self) {
-		// The last handler going away leaves nobody to fulfill the queued requests, so
-		// reject them. Requests already handed out as a `track::Request` live on independently.
-		if self.state.is_last() {
-			self.state.lock().reject_requests(Error::Dropped);
-		}
-	}
-}
-
 #[cfg(test)]
 use futures::FutureExt;
 
@@ -399,8 +394,9 @@ impl Consumer {
 			return Ok(pending.consume());
 		}
 
-		// No dynamic handler is live to serve the track.
-		if !self.state.has_receivers() {
+		// No dynamic handler is live to serve the track. Checked through the held guard, so it's
+		// atomic with the last handler's drop-time rejection.
+		if !state.has_receivers() {
 			return Err(Error::NotFound);
 		}
 

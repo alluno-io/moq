@@ -1201,22 +1201,28 @@ impl Consumer {
 
 		// Queue a request only when a handler can serve it but the group isn't cached yet. A cached
 		// group, an unservable sequence (NotFound), or a closed track all resolve through
-		// `Fetch::poll` without a queue entry. Read the forward state to decide, then enqueue
-		// onto the separate fetch channel (so no write-back into the track).
+		// `Fetch::poll` without a queue entry. Read the forward state to decide servability, then
+		// enqueue onto the separate fetch channel (so no write-back into the track).
 		let fetch = {
 			let state = self.state.read();
-			(state.poll_fetch(sequence).is_pending() && state.fetch.has_receivers()).then(|| state.fetch.clone())
+			state.poll_fetch(sequence).is_pending().then(|| state.fetch.clone())
 		};
 
-		let result = fetch.map(|fetch| {
+		let result = fetch.and_then(|fetch| {
+			// Gate on a live handler, checked and pushed under one lock so the check is atomic
+			// with a handler dropping (no fetch stranded on a queue nobody drains).
+			let mut queue = fetch.lock();
+			if !queue.has_receivers() {
+				return None;
+			}
 			let producer = kio::Producer::<FetchOutcome>::default();
 			let consumer = producer.consume();
-			fetch.lock().push_back(PendingFetch {
+			queue.push_back(PendingFetch {
 				sequence,
 				priority: options.priority,
 				result: producer,
 			});
-			consumer
+			Some(consumer)
 		});
 
 		kio::Pending::new(Fetch {
