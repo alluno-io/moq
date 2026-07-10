@@ -156,8 +156,8 @@ export default class MoqWatch extends HTMLElement {
 			// collapsed. An open range is expressed via latency-min/latency-max, and writing
 			// `latency` here would round-trip back through attributeChangedCallback and collapse it.
 			if (min !== max) return;
-			if (min === "real-time") {
-				this.setAttribute("latency", "real-time");
+			if (min === "real-time" || min === "adaptive") {
+				this.setAttribute("latency", min);
 			} else {
 				const jitter = Math.floor(effect.get(this.backend.jitter));
 				this.setAttribute("latency", jitter.toString());
@@ -206,6 +206,7 @@ export default class MoqWatch extends HTMLElement {
 	// Parse a single latency bound: absent or "real-time" is adaptive, otherwise a fixed ms value.
 	#parseBound(value: string | null): Bound {
 		if (!value || value === "real-time") return "real-time";
+		if (value === "adaptive") return "adaptive";
 		const parsed = Number.parseFloat(value);
 		return (Number.isFinite(parsed) ? parsed : 100) as Time.Milli;
 	}

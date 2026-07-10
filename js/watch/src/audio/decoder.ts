@@ -87,7 +87,7 @@ export class Decoder {
 		this.enabled = Signal.from(props?.enabled ?? false);
 
 		this.#signals.run((effect) => {
-			this.#consumerLatency.set(effect.get(this.source.sync.maxBuffer));
+			this.#consumerLatency.set(effect.get(this.source.sync.audioMaxBuffer));
 		});
 
 		this.#signals.run(this.#runWorklet.bind(this));
@@ -138,7 +138,7 @@ export class Decoder {
 			effect.cleanup(() => worklet.disconnect());
 
 			// Initial target latency in samples.
-			const latency = this.source.sync.buffer.peek();
+			const latency = this.source.sync.audioBuffer.peek();
 			const latencySamples = Math.ceil(sampleRate * Time.Second.fromMilli(latency));
 			const buffered = this.source.sync.buffered.peek();
 
@@ -182,7 +182,7 @@ export class Decoder {
 		const ring = this.#ring;
 		if (!ring) return;
 
-		const latency = effect.get(this.source.sync.buffer);
+		const latency = effect.get(this.source.sync.audioBuffer);
 		const latencySamples = Math.ceil(ring.rate * Time.Second.fromMilli(latency));
 		ring.setLatency(latencySamples);
 	}
