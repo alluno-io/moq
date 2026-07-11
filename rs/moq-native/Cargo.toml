@@ -22,7 +22,7 @@ noq = ["dep:web-transport-noq", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki",
 quiche = ["dep:web-transport-quiche", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "dep:rustls-native-certs"]
 # Filesystem watcher for hot-reloading on-disk TLS certs/keys; the QUIC backends imply it.
 watch = ["dep:notify"]
-aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs"]
+aws-lc-rs = ["rustls/aws-lc-rs", "rcgen?/aws_lc_rs", "quinn?/rustls-aws-lc-rs", "web-transport-quinn?/aws-lc-rs", "rustls-webpki?/aws-lc-rs"]
 iroh = ["dep:web-transport-iroh", "dep:web-transport-proto"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 websocket = ["dep:qmux"]
@@ -31,7 +31,7 @@ tcp = ["dep:qmux"]
 # Unix-domain-socket qmux transport (`unix://`), unix-only. Adds peer-credential
 # inspection on accept. Pulls in `tcp` (shares qmux's stream transport).
 uds = ["tcp", "qmux/uds"]
-ring = ["rustls/ring", "rcgen?/ring", "quinn?/rustls-ring"]
+ring = ["rustls/ring", "rcgen?/ring", "quinn?/rustls-ring", "web-transport-quinn?/ring", "rustls-webpki?/ring"]
 android-logcat = ["dep:tracing-android"]
 
 [dependencies]
@@ -49,12 +49,12 @@ quinn = { version = "0.11", default-features = false, features = ["platform-veri
 rand = "0.10.1"
 rcgen = { version = "0.14", default-features = false, optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
 rustls-native-certs = { version = "0.8", optional = true }
 # OS-native server-cert verifier for the rustls backends. Version matched to the
 # copy quinn-proto already pulls in, to avoid duplication.
 rustls-platform-verifier = "0.7"
-rustls-webpki = { version = "0.103", features = ["aws-lc-rs"], optional = true }
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_with = { version = "3", features = ["hex"] }
 socket2 = "0.6"

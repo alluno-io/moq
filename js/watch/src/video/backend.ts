@@ -27,4 +27,6 @@ export interface Stats {
 	frameCount: number;
 	/** Number of encoded bytes received. */
 	bytesReceived: number;
+	/** Number of decoded frames dropped (late or superseded by a rewind). */
+	droppedCount: number;
 }

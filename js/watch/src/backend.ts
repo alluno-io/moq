@@ -89,6 +89,9 @@ class AudioBackend implements Audio.Backend {
 	// The AudioContext used for playback (set by the WebCodecs backend; undefined under MSE).
 	context = new Signal<AudioContext | undefined>(undefined);
 
+	// Output audio level (RMS 0..1), set by the WebCodecs emitter; 0 under MSE.
+	level = new Signal<number>(0);
+
 	constructor(source: Audio.Source) {
 		this.source = source;
 	}
@@ -196,6 +199,7 @@ export class MultiBackend implements Backend {
 		effect.proxy(this.audio.stats, audioSource.stats);
 		effect.proxy(this.audio.buffered, audioSource.buffered);
 		effect.proxy(this.audio.context, audioSource.context);
+		effect.proxy(this.audio.level, audioEmitter.level);
 	}
 
 	#runMse(effect: Effect, element: HTMLVideoElement): void {

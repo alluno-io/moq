@@ -269,6 +269,7 @@ class DecoderTrack {
 					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
+						this.#markDropped();
 						return;
 					}
 
@@ -280,11 +281,16 @@ class DecoderTrack {
 					const wait = this.source.sync.wait(timestamp).then(() => true);
 					const ok = await Promise.race([wait, effect.cancel]);
 					if (!ok) return;
-					if (generation !== this.#discontinuity) return; // a rewind happened while waiting
+					if (generation !== this.#discontinuity) {
+						// A rewind happened while waiting; this frame is stale.
+						this.#markDropped();
+						return;
+					}
 
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
 						// NOTE: This can happen when the ref is updated, such as on playback start.
+						this.#markDropped();
 						return;
 					}
 
@@ -394,6 +400,7 @@ class DecoderTrack {
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + 1,
 					bytesReceived: (current?.bytesReceived ?? 0) + frame.data.byteLength,
+					droppedCount: current?.droppedCount ?? 0,
 				}));
 
 				// Track decode buffer: frames sent to decoder but not yet rendered
@@ -473,6 +480,7 @@ class DecoderTrack {
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + 1,
 					bytesReceived: (current?.bytesReceived ?? 0) + frame.data.byteLength,
+					droppedCount: current?.droppedCount ?? 0,
 				}));
 
 				// Track decode buffer
@@ -547,6 +555,16 @@ class DecoderTrack {
 				current.shift();
 			}
 		});
+	}
+
+	// Count a decoded frame that was dropped instead of rendered (late or superseded
+	// by a rewind), for the stats overlay.
+	#markDropped(): void {
+		this.stats.update((current) => ({
+			frameCount: current?.frameCount ?? 0,
+			bytesReceived: current?.bytesReceived ?? 0,
+			droppedCount: (current?.droppedCount ?? 0) + 1,
+		}));
 	}
 
 	close(): void {

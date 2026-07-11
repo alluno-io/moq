@@ -20,6 +20,9 @@ export class Emitter {
 	// That way we can be "muted" but also download audio for visualizations.
 	paused: Signal<boolean>;
 
+	// Output audio level (RMS, 0..1), tapped from the gain node for a stats meter.
+	readonly level = new Signal<number>(0);
+
 	#signals = new Effect();
 
 	// The volume to use when unmuted.
@@ -33,6 +36,11 @@ export class Emitter {
 		this.volume = Signal.from(props?.volume ?? 0.5);
 		this.muted = Signal.from(props?.muted ?? false);
 		this.paused = Signal.from(props?.paused ?? props?.muted ?? false);
+
+		// Seed the restore-on-unmute level from the initial volume so an embedder's
+		// pre-set (e.g. saved) volume survives the first not-muted effect run below
+		// instead of being reset to the 0.5 default the moment audio starts.
+		this.#unmuteVolume = this.volume.peek() || 0.5;
 
 		// Set the volume to 0 when muted.
 		this.#signals.run((effect) => {
@@ -64,6 +72,23 @@ export class Emitter {
 			root.connect(gain);
 
 			effect.set(this.#gain, gain);
+
+			// Tap the post-gain signal with an analyser and poll its RMS so embedders
+			// can show an output-level meter. The analyser is a dead-end (not routed to
+			// the speakers), so it only measures, never doubles the audio.
+			const analyser = new AnalyserNode(root.context, { fftSize: 256, smoothingTimeConstant: 0.5 });
+			gain.connect(analyser);
+			const samples = new Float32Array(analyser.fftSize);
+			effect.interval(() => {
+				analyser.getFloatTimeDomainData(samples);
+				let sum = 0;
+				for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+				this.level.set(Math.sqrt(sum / samples.length));
+			}, 100);
+			effect.cleanup(() => {
+				gain.disconnect(analyser);
+				this.level.set(0);
+			});
 
 			effect.run((inner) => {
 				// We only connect/disconnect when enabled to save power.
