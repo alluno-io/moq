@@ -9,11 +9,15 @@ moq-relay uses JWT (JSON Web Tokens) for authentication and authorization. Token
 
 ## Overview
 
-There are two authentication modes:
+There are three authentication modes:
 
 ### Single Key (`--auth-key`)
 
 A single JWK file used to verify all tokens. No `kid` header is required in JWTs. Good for development and simple deployments.
+
+### Raw Secret (`--auth-secret`)
+
+An inline raw shared secret. Its bytes are used directly as the HS256 HMAC key, so the same string signs and verifies. No `kid` header is required. Good when the secret is already provisioned elsewhere.
 
 ### Key Directory (`--auth-key-dir`)
 
@@ -54,6 +58,13 @@ Single key (simplest):
 ```toml
 [auth]
 key = "my-key.jwk"
+```
+
+Raw secret (no key file):
+
+```toml
+[auth]
+secret = "your-shared-secret"
 ```
 
 Key directory (for key rotation):

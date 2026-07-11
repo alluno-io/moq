@@ -275,6 +275,12 @@ pub struct AuthConfig {
 	#[arg(long = "auth-key-dir", env = "MOQ_AUTH_KEY_DIR")]
 	pub key_dir: Option<String>,
 
+	/// A raw shared secret used directly as an HS256 verification key: its bytes
+	/// are the HMAC key. No `kid` header is required in JWTs. Mutually exclusive
+	/// with `key` and `key_dir`.
+	#[arg(long = "auth-secret", env = "MOQ_AUTH_SECRET")]
+	pub secret: Option<String>,
+
 	/// Deprecated `--auth-tls-*` overrides; see [`AuthTls`].
 	#[command(flatten)]
 	#[serde(default)]
@@ -630,6 +636,8 @@ impl AuthToken {
 }
 
 enum KeySource {
+	/// An in-memory key, built from a raw shared secret. No kid required.
+	Static(Arc<Key>),
 	/// A single key file. No kid required.
 	File(PathBuf),
 	/// A directory of key files, resolved by kid as `{dir}/{kid}.jwk`.
@@ -657,6 +665,7 @@ impl KeyResolver {
 
 	async fn resolve(&self, kid: Option<&str>) -> Result<Arc<Key>, AuthError> {
 		match &self.source {
+			KeySource::Static(key) => Ok(key.clone()),
 			KeySource::File(path) => {
 				let key = Key::from_file_async(path).await.map_err(|_| AuthError::KeyNotFound)?;
 				Ok(Arc::new(key))
@@ -713,8 +722,11 @@ pub struct Auth {
 impl Auth {
 	pub async fn new(config: AuthConfig) -> anyhow::Result<Self> {
 		anyhow::ensure!(
-			config.key.is_none() || config.key_dir.is_none(),
-			"cannot specify both --auth-key and --auth-key-dir"
+			[config.key.is_some(), config.key_dir.is_some(), config.secret.is_some()]
+				.into_iter()
+				.filter(|set| *set)
+				.count() <= 1,
+			"specify at most one of --auth-key / --auth-key-dir / --auth-secret"
 		);
 
 		// The unified --auth-api supplies key + public + alias itself, so it
@@ -723,11 +735,12 @@ impl Auth {
 			config.auth_api.is_none()
 				|| (config.key.is_none()
 					&& config.key_dir.is_none()
+					&& config.secret.is_none()
 					&& config.public.is_none()
 					&& config.public_subscribe.is_none()
 					&& config.public_publish.is_none()
 					&& config.public_api.is_none()),
-			"--auth-api cannot be combined with --auth-key/--auth-key-dir/--auth-public/--auth-public-api"
+			"--auth-api cannot be combined with --auth-key/--auth-key-dir/--auth-secret/--auth-public/--auth-public-api"
 		);
 
 		// Outbound auth HTTP (JWK + auth/public-API fetches) reuses the cluster
@@ -745,7 +758,9 @@ impl Auth {
 		};
 		let tls = tls_config.build()?;
 
-		let source = if let Some(key) = config.key {
+		let source = if let Some(secret) = config.secret {
+			Some(KeySource::Static(Arc::new(Key::from_secret(secret.into_bytes()))))
+		} else if let Some(key) = config.key {
 			let source = if let Ok(url) = Url::parse(&key) {
 				KeySource::Url {
 					url,
