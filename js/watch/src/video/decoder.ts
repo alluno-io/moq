@@ -20,8 +20,25 @@ const SWITCH = 100 as Time.Milli;
 const RECOVER_MAX = 3;
 const RECOVER_WINDOW_MS = 8000;
 
+/**
+ * WebCodecs hardware-acceleration preference (the `HardwarePreference` enum from
+ * `VideoDecoder.configure`). Declared locally because the WebCodecs DOM lib types
+ * aren't guaranteed to be present in every consumer's `tsconfig`.
+ */
+export type HardwareAcceleration = "no-preference" | "prefer-hardware" | "prefer-software";
+
 export type DecoderProps = {
 	enabled?: boolean | Signal<boolean>;
+
+	/**
+	 * WebCodecs hardware-acceleration preference passed to `VideoDecoder.configure`.
+	 * Defaults to `"no-preference"`, which uses a hardware decoder when one is available
+	 * and falls back to software otherwise (the best-available path). `"prefer-hardware"`
+	 * does NOT fall back: on a software SwiftShader GPU (blocklisted, accel disabled, RDP,
+	 * bad driver) it fails to produce frames, so video stalls while audio keeps playing.
+	 * `"prefer-software"` forces software decode.
+	 */
+	hardwareAcceleration?: HardwareAcceleration | Signal<HardwareAcceleration>;
 };
 
 // The types in VideoDecoderConfig that cause a hard reload.
@@ -32,6 +49,9 @@ type RequiredDecoderConfig = Omit<Catalog.VideoConfig, "codedWidth" | "codedHeig
 export class Decoder implements Backend {
 	enabled: Signal<boolean>; // Don't download any longer
 	source: Source;
+
+	// WebCodecs hardware-acceleration preference for VideoDecoder.configure. See DecoderProps.
+	hardwareAcceleration: Signal<HardwareAcceleration>;
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
@@ -70,6 +90,7 @@ export class Decoder implements Backend {
 
 	constructor(source: Source, props?: DecoderProps) {
 		this.enabled = Signal.from(props?.enabled ?? false);
+		this.hardwareAcceleration = Signal.from(props?.hardwareAcceleration ?? "no-preference");
 
 		this.source = source;
 		this.source.supported.set(supported); // super hacky
@@ -90,6 +111,10 @@ export class Decoder implements Backend {
 		}
 		const [_, source, track, config] = values;
 
+		// Subscribe so changing the preference rebuilds the pending track (a fresh
+		// decoder.configure with the new value); resolved to a plain string below.
+		const hardwareAcceleration = effect.get(this.hardwareAcceleration);
+
 		const broadcast: Moq.Broadcast | undefined = effect.get(source.active);
 		if (!broadcast) {
 			// Going offline should clear the last rendered frame.
@@ -105,6 +130,7 @@ export class Decoder implements Backend {
 			broadcast,
 			track,
 			config,
+			hardwareAcceleration,
 			stats: this.#stats,
 		});
 
@@ -207,6 +233,7 @@ interface DecoderTrackProps {
 	broadcast: Moq.Broadcast;
 	track: string;
 	config: Catalog.VideoConfig;
+	hardwareAcceleration: HardwareAcceleration;
 
 	stats: Signal<Stats | undefined>;
 }
@@ -216,6 +243,7 @@ class DecoderTrack {
 	broadcast: Moq.Broadcast;
 	track: string;
 	config: RequiredDecoderConfig;
+	hardwareAcceleration: HardwareAcceleration;
 	stats: Signal<Stats | undefined>;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
@@ -247,6 +275,7 @@ class DecoderTrack {
 		this.broadcast = props.broadcast;
 		this.track = props.track;
 		this.config = requiredConfig;
+		this.hardwareAcceleration = props.hardwareAcceleration;
 		this.stats = props.stats;
 
 		this.signals.run(this.#run.bind(this));
@@ -360,8 +389,8 @@ class DecoderTrack {
 			...this.config,
 			description: this.config.description ? Util.Hex.toBytes(this.config.description) : undefined,
 			optimizeForLatency: this.config.optimizeForLatency ?? true,
-			// Offload decode to the GPU when available; falls back to software.
-			hardwareAcceleration: "prefer-hardware",
+			// Defaults to "no-preference" (hardware when available, software fallback). See DecoderProps.
+			hardwareAcceleration: this.hardwareAcceleration,
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
 		});
@@ -447,8 +476,8 @@ class DecoderTrack {
 			codec: this.config.codec,
 			description,
 			optimizeForLatency: this.config.optimizeForLatency ?? true,
-			// Offload decode to the GPU when available; falls back to software.
-			hardwareAcceleration: "prefer-hardware",
+			// Defaults to "no-preference" (hardware when available, software fallback). See DecoderProps.
+			hardwareAcceleration: this.hardwareAcceleration,
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
 		});

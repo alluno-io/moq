@@ -5,7 +5,7 @@ import { Effect, Signal } from "@moq/signals";
 import { MultiBackend } from "./backend";
 import { Broadcast, type CatalogFormat, parseCatalogFormat } from "./broadcast";
 import { type Bound, type Latency, latencyBounds, latencyFromBounds } from "./sync";
-import type { Visible } from "./video";
+import type { HardwareAcceleration, Visible } from "./video";
 
 const OBSERVED = [
 	"url",
@@ -20,8 +20,23 @@ const OBSERVED = [
 	"latency-max",
 	"jitter",
 	"catalog-format",
+	"hardware-acceleration",
 ] as const;
 type Observed = (typeof OBSERVED)[number];
+
+// Parse the `hardware-acceleration` attribute, falling back to "no-preference".
+function parseHardwareAcceleration(value: string | null): HardwareAcceleration {
+	const trimmed = value?.trim();
+	if (trimmed === "prefer-hardware" || trimmed === "prefer-software" || trimmed === "no-preference") {
+		return trimmed;
+	}
+	if (trimmed) {
+		console.warn(
+			`moq-watch: invalid hardware-acceleration="${value}", expected "no-preference", "prefer-hardware", or "prefer-software"`,
+		);
+	}
+	return "no-preference";
+}
 
 // Parse the `visible` attribute into a Visible value, falling back to "20%".
 function parseVisible(value: string | null): Visible {
@@ -243,6 +258,8 @@ export default class MoqWatch extends HTMLElement {
 			this.latency = this.#parseBound(newValue);
 		} else if (name === "catalog-format") {
 			this.broadcast.catalogFormat.set(parseCatalogFormat(newValue));
+		} else if (name === "hardware-acceleration") {
+			this.backend.hardwareAcceleration.set(parseHardwareAcceleration(newValue));
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
@@ -376,6 +393,19 @@ export default class MoqWatch extends HTMLElement {
 
 	set catalog(value: Catalog.Root | undefined) {
 		this.broadcast.catalog.set(value);
+	}
+
+	/**
+	 * WebCodecs hardware-acceleration preference for video decode. `"no-preference"` (default)
+	 * uses a hardware decoder when available and falls back to software. `"prefer-hardware"`
+	 * requires a hardware decoder (no software fallback) and `"prefer-software"` forces software.
+	 */
+	get hardwareAcceleration(): HardwareAcceleration {
+		return this.backend.hardwareAcceleration.peek();
+	}
+
+	set hardwareAcceleration(value: HardwareAcceleration) {
+		this.backend.hardwareAcceleration.set(value);
 	}
 }
 

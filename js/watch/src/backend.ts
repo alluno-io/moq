@@ -46,6 +46,10 @@ export interface MultiBackendProps {
 
 	// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
 	visible?: Video.Visible | Signal<Video.Visible>;
+
+	// WebCodecs hardware-acceleration preference for video decode. Defaults to "no-preference"
+	// (hardware when available, software fallback). See {@link Video.DecoderProps}.
+	hardwareAcceleration?: Video.HardwareAcceleration | Signal<Video.HardwareAcceleration>;
 }
 
 // We have to proxy some of these signals because we support both the MSE and WebCodecs.
@@ -113,6 +117,9 @@ export class MultiBackend implements Backend {
 	// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
 	visible: Signal<Video.Visible>;
 
+	// WebCodecs hardware-acceleration preference for video decode. See {@link Video.DecoderProps}.
+	hardwareAcceleration: Signal<Video.HardwareAcceleration>;
+
 	video: VideoBackend;
 	#videoSource: Video.Source;
 
@@ -150,6 +157,7 @@ export class MultiBackend implements Backend {
 
 		this.paused = Signal.from(props?.paused ?? false);
 		this.visible = Signal.from(props?.visible ?? "20%");
+		this.hardwareAcceleration = Signal.from(props?.hardwareAcceleration ?? "no-preference");
 
 		this.signals.run(this.#runElement.bind(this));
 	}
@@ -166,7 +174,9 @@ export class MultiBackend implements Backend {
 	}
 
 	#runWebcodecs(effect: Effect, element: HTMLCanvasElement): void {
-		const videoSource = new Video.Decoder(this.#videoSource);
+		const videoSource = new Video.Decoder(this.#videoSource, {
+			hardwareAcceleration: this.hardwareAcceleration,
+		});
 		const audioSource = new Audio.Decoder(this.#audioSource);
 		this.#audioDecoder = audioSource;
 
