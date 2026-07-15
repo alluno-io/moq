@@ -2,6 +2,7 @@ use std::task::{Poll, ready};
 use std::time::Duration;
 
 use moq_net::kio;
+use moq_net::{BandwidthConsumer, BandwidthProducer, Version};
 use url::Url;
 
 use crate::{Client, Error};
@@ -79,6 +80,8 @@ pub enum Status {
 struct State {
 	/// Current connection status, or `None` before the first connect.
 	status: Option<Status>,
+	/// The negotiated MoQ version of the live session, or `None` when disconnected.
+	version: Option<Version>,
 	/// Set when the reconnect loop permanently gives up (reconnect timeout exceeded).
 	error: Option<Error>,
 }
@@ -86,11 +89,19 @@ struct State {
 /// Handle to a background reconnect loop.
 ///
 /// Spawns a tokio task that connects, waits for session close, then reconnects with exponential
-/// backoff. [`status`](Self::status) reports connection changes; [`closed`](Self::closed) waits for
-/// the loop to stop. Dropping the handle aborts the background task.
+/// backoff. The read surface mirrors [`moq_net::Session`] so a caller can treat it like a session
+/// that transparently reconnects: [`version`](Self::version), [`send_bandwidth`](Self::send_bandwidth),
+/// and [`recv_bandwidth`](Self::recv_bandwidth) track the live session and reset while disconnected.
+/// The extra toggle a plain session doesn't have is the connection lifecycle: [`connected`](Self::connected)
+/// reads it synchronously and [`status`](Self::status) waits for the next change. [`closed`](Self::closed)
+/// waits for the loop to stop. Dropping the handle aborts the background task.
 pub struct Reconnect {
 	abort: tokio::task::AbortHandle,
 	state: kio::Consumer<State>,
+	/// Persistent send-bitrate estimate, fed by the loop from each live session.
+	send_bandwidth: BandwidthConsumer,
+	/// Persistent recv-bitrate estimate, fed by the loop from each live session.
+	recv_bandwidth: BandwidthConsumer,
 	/// The last status returned by [`status`](Self::status), for change detection.
 	last_reported: Option<Status>,
 }
@@ -99,23 +110,40 @@ impl Reconnect {
 	pub(crate) fn new(client: Client, url: Url, backoff: Backoff) -> Self {
 		let producer = kio::Producer::<State>::default();
 		let state = producer.consume();
+
+		// The loop feeds these across every reconnect, so a consumer's handle survives session churn
+		// (unlike a session's own bandwidth consumer, which dies with the session).
+		let send_bw = BandwidthProducer::new();
+		let recv_bw = BandwidthProducer::new();
+		let send_bandwidth = send_bw.consume();
+		let recv_bandwidth = recv_bw.consume();
+
 		let task = tokio::spawn(async move {
-			if let Err(err) = Self::run(&producer, client, url, backoff).await {
+			if let Err(err) = Self::run(&producer, &send_bw, &recv_bw, client, url, backoff).await {
 				tracing::error!(%err, "reconnect loop exited");
 				if let Ok(mut state) = producer.write() {
 					state.error = Some(err);
 				}
 			}
-			// Dropping the producer here closes the channel, signaling consumers.
+			// Dropping the producers here closes the channels, signaling consumers.
 		});
 		Self {
 			abort: task.abort_handle(),
 			state,
+			send_bandwidth,
+			recv_bandwidth,
 			last_reported: None,
 		}
 	}
 
-	async fn run(state: &kio::Producer<State>, client: Client, url: Url, backoff: Backoff) -> crate::Result<()> {
+	async fn run(
+		state: &kio::Producer<State>,
+		send_bw: &BandwidthProducer,
+		recv_bw: &BandwidthProducer,
+		client: Client,
+		url: Url,
+		backoff: Backoff,
+	) -> crate::Result<()> {
 		let mut delay = backoff.initial;
 		let mut retry_start = tokio::time::Instant::now();
 		let mut last_error: Option<Error> = None;
@@ -137,13 +165,20 @@ impl Reconnect {
 					tracing::info!(%url, "connected");
 					if let Ok(mut state) = state.write() {
 						state.status = Some(Status::Connected);
+						state.version = Some(session.version());
 					}
 
 					let connected = tokio::time::Instant::now();
-					let closed = session.closed().await;
+					// Wait for the session to close, forwarding its bandwidth estimates into the
+					// persistent producers meanwhile so consumers track the live stats across the connection.
+					let closed = run_session(send_bw, recv_bw, &session).await;
 					if let Ok(mut state) = state.write() {
 						state.status = Some(Status::Disconnected);
+						state.version = None;
 					}
+					// The estimates belonged to the now-closed session; reset until the next connect.
+					let _ = send_bw.set(None);
+					let _ = recv_bw.set(None);
 
 					if connected.elapsed() >= backoff.initial {
 						// Stayed up past the initial backoff: a healthy session. Reset the backoff
@@ -207,6 +242,39 @@ impl Reconnect {
 		kio::wait(|waiter| self.poll_status(waiter)).await
 	}
 
+	/// Whether a session is currently connected.
+	///
+	/// The synchronous read behind [`status`](Self::status), for callers that just want the current
+	/// state rather than the next change.
+	pub fn connected(&self) -> bool {
+		self.state.read().status == Some(Status::Connected)
+	}
+
+	/// The negotiated MoQ version of the live session, or `None` while disconnected.
+	///
+	/// The [`moq_net::Session::version`] counterpart; `Option` because a reconnecting handle can be
+	/// between sessions.
+	pub fn version(&self) -> Option<Version> {
+		self.state.read().version
+	}
+
+	/// A consumer for the live session's estimated send bitrate, mirroring
+	/// [`moq_net::Session::send_bandwidth`].
+	///
+	/// Unlike the session's, this handle is persistent: the reconnect loop forwards each session's
+	/// estimate into it, so it survives reconnects. Its value is `None` while disconnected or when the
+	/// backend has no estimate.
+	pub fn send_bandwidth(&self) -> BandwidthConsumer {
+		self.send_bandwidth.clone()
+	}
+
+	/// A consumer for the live session's estimated receive bitrate, mirroring
+	/// [`moq_net::Session::recv_bandwidth`]. Persistent across reconnects like
+	/// [`send_bandwidth`](Self::send_bandwidth); `None` while disconnected or unavailable.
+	pub fn recv_bandwidth(&self) -> BandwidthConsumer {
+		self.recv_bandwidth.clone()
+	}
+
 	/// Poll whether the reconnect loop has stopped.
 	///
 	/// `Ready(Err)` if it permanently gave up (reconnect timeout exceeded), `Ready(Ok(()))` if
@@ -222,6 +290,49 @@ impl Reconnect {
 	/// Wait until the reconnect loop stops.
 	pub async fn closed(&self) -> crate::Result<()> {
 		kio::wait(|waiter| self.poll_closed(waiter)).await
+	}
+}
+
+/// Wait for `session` to close, forwarding its send/recv bandwidth estimates into the persistent
+/// producers meanwhile so [`Reconnect`] consumers track the live estimates across the connection.
+/// Returns the session's close result (the loop uses it to distinguish a healthy drop from an
+/// immediate sever).
+///
+/// One `poll_*` step drives it all: [`poll_forward`] mirrors each kio bandwidth estimate, and the
+/// transport's close future (the one non-kio source) is polled through the waiter's own waker.
+async fn run_session(
+	send_bw: &BandwidthProducer,
+	recv_bw: &BandwidthProducer,
+	session: &moq_net::Session,
+) -> Result<(), moq_net::Error> {
+	let mut send = session.send_bandwidth();
+	let mut recv = session.recv_bandwidth();
+	let closed = session.closed();
+	tokio::pin!(closed);
+
+	kio::wait(|waiter| {
+		poll_forward(&mut send, send_bw, waiter);
+		poll_forward(&mut recv, recv_bw, waiter);
+		waiter.poll_future(closed.as_mut())
+	})
+	.await
+}
+
+/// Mirror `bw`'s live estimate into `out` for as long as it changes, dropping the source handle once
+/// the backend stops reporting (`None`) so we don't keep polling a dead arm. A `poll_*` step: on
+/// return, `waiter` is registered for the next change (unless the source is gone). Seeding is implicit
+/// (the first call forwards the current value if there is one).
+fn poll_forward(bw: &mut Option<BandwidthConsumer>, out: &BandwidthProducer, waiter: &kio::Waiter) {
+	loop {
+		let Some(consumer) = bw.as_mut() else { return };
+		let Poll::Ready(rate) = consumer.poll_changed(waiter) else {
+			return;
+		};
+		let _ = out.set(rate);
+		if rate.is_none() {
+			*bw = None;
+			return;
+		}
 	}
 }
 
@@ -250,5 +361,35 @@ mod tests {
 		assert_eq!(backoff.multiplier, 2);
 		assert_eq!(backoff.max, Duration::from_secs(30));
 		assert_eq!(backoff.timeout, Duration::from_secs(300));
+	}
+
+	#[test]
+	fn poll_forward_mirrors_then_drops_on_none() {
+		let src = BandwidthProducer::new();
+		let out = BandwidthProducer::new();
+		let out_rx = out.consume();
+		let waiter = kio::Waiter::noop();
+
+		// No estimate yet: nothing forwarded, source retained.
+		let mut bw = Some(src.consume());
+		poll_forward(&mut bw, &out, &waiter);
+		assert_eq!(out_rx.peek(), None);
+		assert!(bw.is_some());
+
+		// A value is mirrored through.
+		src.set(Some(3_000)).unwrap();
+		poll_forward(&mut bw, &out, &waiter);
+		assert_eq!(out_rx.peek(), Some(3_000));
+
+		// Going None mirrors the None and drops the source, so we stop polling a dead arm.
+		src.set(None).unwrap();
+		poll_forward(&mut bw, &out, &waiter);
+		assert_eq!(out_rx.peek(), None);
+		assert!(bw.is_none());
+
+		// Source gone: a later value on the (now-defunct) session's producer is ignored.
+		src.set(Some(9_000)).unwrap();
+		poll_forward(&mut bw, &out, &waiter);
+		assert_eq!(out_rx.peek(), None);
 	}
 }

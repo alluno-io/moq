@@ -1,6 +1,6 @@
 # js/CLAUDE.md
 
-Scopes the `/js` TypeScript/JavaScript workspace. Universal rules (writing style / no em-dashes, Branch Targeting, Cross-Package Sync, AI Attribution, Public API Scrutiny, Refactor As You Go, comment/doc conventions) live in the root `CLAUDE.md` and are not repeated here.
+Scopes the `/js` TypeScript/JavaScript workspace. Universal rules (writing style / no em-dashes, Root Cause First, Cross-Package Sync, Public API Scrutiny, Refactor As You Go, comment/doc conventions) live in the root `CLAUDE.md`; PR/commit/release mechanics live in the root `CONTRIBUTING.md`. Neither is repeated here.
 
 ## Workspace layout
 
@@ -13,11 +13,12 @@ Bun workspaces; members listed in the repo-root `package.json` (not in `js/`). D
 **Transport / protocol**
 
 - `@moq/net` (`net/`): browser networking. Connect to a relay, then publish/consume broadcasts/tracks/groups/frames over WebTransport (WebSocket fallback). Negotiates `moq-lite` (`lite/`) or IETF `moq-transport` (`ietf/`). Mirror of `rs/moq-net`. Optional `zod` peer dep for `./zod` JSON-frame helpers.
+- `@moq/wasm` (`wasm/`): experimental browser bindings for `rs/moq-wasm` (wasm-bindgen over `moq-net`); typed npm wrapper built via `just wasm`.
 
 **Container / catalog formats**
 
 - `@moq/loc` (`loc/`): Low Overhead Container frame encoding. Thin layer on `@moq/net`.
-- `@moq/json` (`json/`): snapshot/delta JSON over a track via RFC 7396 merge-patch. Exposes the base `Producer`/`Consumer` that `@moq/hang`'s catalog extends. DEFLATE via `@moq/flate`.
+- `@moq/json` (`json/`): JSON over a track, in two namespaces. `Snapshot` is lossy latest-value (RFC 7396 merge-patch deltas; consumers only get the most recent value; the base `Snapshot.Producer`/`Snapshot.Consumer` that `@moq/hang`'s catalog extends); `Stream` is a lossless append-log (every record preserved in order). DEFLATE via `@moq/flate`.
 - `@moq/flate` (`flate/`): group-scoped DEFLATE primitive (only deps on `pako`). `Encoder`/`Decoder` turn a stream of payloads into self-delimited sync-flushed frames sharing one window; wire-interoperable with the Rust `moq-flate` crate. Used by `@moq/json`.
 - `@moq/msf` (`msf/`): MOQT Streaming Format catalog types (zod schemas).
 

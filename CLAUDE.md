@@ -17,13 +17,15 @@ nix develop --command just build        # Build all packages
 
 Use the Nix dev shell for project commands so local runs match CI tooling. If Nix is unavailable, use `cargo` or `bun` directly.
 
+CI runs `just ci`, which layers a few checks on top of `just check` (notably `cargo doc` with `-D warnings`, so a broken doc link after a rename or visibility change passes `just check` but fails CI).
+
 ## Architecture
 
 The project contains multiple layers of protocols:
 
 1. **quic** - Does all the networking.
 2. **web-transport** - A small layer on top of QUIC/HTTP3 for browser support. Provided by the browser or the `web-transport` crates.
-3. **moq-net** - The networking layer on top of `web-transport`, implemented by CDNs. At session setup it negotiates one of two wire protocols: the simplified `moq-lite` protocol (the layer name) or the full IETF `moq-transport` protocol. Content splits into:
+3. **moq-net** - The networking layer on top of `web-transport`, implemented by CDNs. At session setup it negotiates one of two wire protocols: the simplified `moq-lite` protocol or the full IETF `moq-transport` protocol. Content splits into:
    - broadcast: a collection of tracks produced by a publisher
    - track: a live stream of groups within a broadcast.
    - group: a live stream of frames within a track, each delivered independently over a QUIC stream.
@@ -32,10 +34,9 @@ The project contains multiple layers of protocols:
    - catalog: a JSON track containing a description of other tracks and their properties (for WebCodecs).
    - container: each frame consists of a timestamp and codec bitstream
    - watch/publish: dedicated packages for subscribing/publishing with optional UI overlays
-5. **moq-audio** - Native Opus encode/decode for raw PCM (more codecs to come). Used by `moq-ffi`/`libmoq` so native callers don't have to bring their own codec.
-6. **application** - Users building on top of `moq-net` or `hang`
+5. **application** - Users building on top of `moq-net` or `hang`
 
-Key architectural rule: The CDN/relay does not know anything about media. Anything in the `moq` layer should be generic, using rules on the wire on how to deliver content.
+Key architectural rule: The CDN/relay does not know anything about media. Anything in the `moq-net` layer should be generic, using rules on the wire on how to deliver content.
 
 ## Project Structure
 
@@ -46,7 +47,9 @@ Top-level layout only. Per-crate and per-package detail lives in the nested guid
 - `/py/`, `/swift/`, `/kt/`, `/go/` - language wrappers over `rs/moq-ffi` (see [Language Bindings](#language-bindings)). `/py/` has `py/CLAUDE.md`; the others defer to their `README.md`.
 - `/cpp/` - C/C++ consumers of `libmoq`. `cpp/obs/` is the OBS Studio plugin (CMake; links `libmoq` via `MOQ_LOCAL`), licensed GPL-2.0-or-later because it links `libobs`. See `doc/bin/obs.md`.
 - `/demo/` - demos and test media: relay configs, the web demo, MoQ Boy, media hosting, and a network throttle script.
+- `/test/` - cross-language interop smoke tests (`test/smoke/`), run via `just test smoke[-full]`.
 - `/doc/` - documentation site (VitePress, deployed via Cloudflare).
+- `/drafts/` - IETF Internet-Drafts (kramdown-rfc) for the MoQ protocols implemented here. Built and published to the datatracker via `just drafts`. See `drafts/CLAUDE.md`.
 
 ## Language Bindings
 
@@ -62,17 +65,12 @@ Language-specific conventions, crate/package maps, and patterns live in nested `
 
 The `swift/`, `kt/`, and `go/` directories are thin wrappers over `rs/moq-ffi` (mirrored to external repos); see each directory's `README.md` rather than a dedicated guide.
 
-This root file holds only cross-cutting rules that apply everywhere (writing style, branch targeting, cross-package sync, public-API scrutiny, comment/doc conventions).
+This root file holds only cross-cutting rules that apply everywhere (writing style, root-cause and maintainability rules, cross-package sync, public-API scrutiny, comment/doc conventions). When editing any of these guides, reference code by file path and symbol name, never by line number; line numbers rot with every edit. The mechanics of landing a change (branch targeting, commit messages, PR descriptions, reviews, releases) live in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Dependencies
 
 - When adding new dependencies, always use the **newest stable version** available.
 - **Prefer a maintained third-party crate over hand-rolling non-core functionality** (standard container/codec parsers, compression, serialization, etc.). Reserve bespoke code for the wire/protocol layers where we need full control or no suitable crate exists.
-
-## Development Tips
-
-1. The project uses `just` as the task runner - check `justfile` for all available commands
-2. Consult `doc/` for documentation and the [IETF datatracker](https://datatracker.ietf.org/doc/draft-lcurley-moq-lite/) for specification drafts when working on protocol-level code
 
 ## Writing Style
 
@@ -84,6 +82,7 @@ This root file holds only cross-cutting rules that apply everywhere (writing sty
 - **Public API symbols are the exception: document every exported symbol.** Each `pub` Rust item and each exported JS/TS symbol (function, class, interface, type, const, enum, plus their notable public members) gets a doc comment (`///` / `/** */`), even when it looks self-explanatory. These render on the published docs (JSR builds API docs from the `.d.ts`; docs.rs from `///`), so a missing doc is a hole a consumer hits, not a self-evident line of code. Add a module-level doc to every entrypoint too (a `/** ... @module */` block at the top of each JS entrypoint file; a `//!` block on each Rust module root). Keep these one line where possible and say what a *consumer* needs (units, ownership, lifecycle, what it wraps), not throat-clearing.
 - Write the way you'd say it out loud, not the way a doc generator would. One short line is almost always enough. Skip throat-clearing like "This function is responsible for...".
 - Comments must reflect the **current** state of the code, not its history. Don't write "X no longer does Y" or "this used to cascade". Describe what the code does today, or delete the comment. Migration context belongs in commit messages and PR descriptions, where it ages with the change rather than rotting in the source.
+- Never tag code comments, doc comments, or `/doc` pages with AI attribution: source markers rot. Attribution for commits and PR prose lives in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Deprecation
 
@@ -94,13 +93,21 @@ Don't document deprecated flags, options, or APIs. User-facing docs (`/doc`), `-
 
 The rename/removal rationale lives in the commit message and PR description, not in docs that users read. A runtime warning when someone *uses* the deprecated path is fine (it fires on use, it isn't documentation); a standing note that advertises the dead name is not.
 
-## AI Attribution
+## Root Cause First
 
-LLM-authored prose visible to humans (PR descriptions, PR comments, review replies) should end with the agent model, e.g. `(Written by GPT-5)`. Do **not** tag code comments, doc comments, or `/doc` pages: source markers rot. Commit attribution lives in the `Co-Authored-By` trailer, not the commit body.
+- Before fixing a bug, reproduce it and explain the mechanism. A fix that adds a retry, sleep, widened timeout, defensive check, or call-site special case without a stated mechanism is a symptom patch, not a fix.
+- If the mechanism lives in a lower layer, fix it there rather than working around it in the caller. The workaround becomes load-bearing and hides the bug from the next caller.
+- "It's a flake" is a claim that needs evidence; assume an intermittent CI failure is a real race until proven otherwise.
+- State the root cause in the PR description so reviewers can check the diagnosis, not just the patch.
+- Land each bug fix with a regression test that fails without it, encoding the root cause rather than just the reported symptom.
 
 ## Refactor As You Go
 
-A function with 4+ args, or a call site passing the same 3+ values into multiple functions, is a struct waiting to happen. Make the change in the same PR rather than leaving a TODO. Same for repeated tuples returned across modules.
+A change isn't done when it works; it's done when it's the shape you'd want to maintain. Spend the extra cycles:
+
+- A function with 4+ args, or a call site passing the same 3+ values into multiple functions, is a struct waiting to happen. Same for repeated tuples returned across modules. Make the change in the same PR rather than leaving a TODO.
+- Prefer extending an existing primitive over adding a parallel one-off, and generalizing a helper over copying it. If a fix needs the same edit in N places, reshape so it's one place first, then fix.
+- When a task can be solved by patching around an awkward internal shape or by fixing the shape, fix the shape in the same PR. The Public API Scrutiny "don't preserve an awkward shape just to avoid churn" rule applies to internal code too.
 
 ## Public API Scrutiny
 
@@ -117,7 +124,7 @@ Favor composable building blocks over one-off functions. A handful of orthogonal
 
 Then future-proof what you do expose so additions don't force a breaking change:
 
-- **Take an options struct/object, not positional parameters, whenever a function or constructor could plausibly gain more knobs later.** A single `Config`/options bag (Rust struct, TS interface) lets you add fields without changing the signature; positional params force a breaking change (or an awkward `(track, undefined, opts)` call) the moment a second option shows up. Reach for it even when there's only one option today: a lone `compression: bool` arg is a future breaking change waiting to happen, whereas `Config { compression }` absorbs the next field for free. This applies in both languages. In Rust, `#[non_exhaustive]` is what keeps those additions non-breaking; see the [`rs/CLAUDE.md`](rs/CLAUDE.md) Rust conventions for when to reach for it (and for enum variants and builders).
+- **Take an options struct/object, not positional parameters, whenever a function or constructor could plausibly gain more knobs later.** A single `Config`/options bag (Rust struct, TS interface) lets you add fields without changing the signature; positional params force a breaking change (or an awkward `(track, undefined, opts)` call) the moment a second option shows up. Reach for it even when there's only one option today: a lone `compression: bool` arg is a future breaking change waiting to happen, whereas `Config { compression }` absorbs the next field for free. This applies in both languages.
 - **Don't leak a third-party type** (`ffmpeg_next`, etc.) in a signature unless the crate is explicitly a thin wrapper. If you must, re-export the dependency and document that a major bump is a breaking change; keep the recommended high-level path free of it.
 
 This applies whenever you add or widen a `pub` item, especially in library crates (`rs/moq-*`, `js/*`) with the [Branch Targeting](#branch-targeting) breaking-change rules. Language-specific encodings of these rules (Rust `self`-consuming terminal methods, `Drop` cleanup handles, role-based module namespacing) live in the per-directory guides.
@@ -131,11 +138,6 @@ Language-specific tooling (TypeScript/`bun`/Biome, JS async patterns, Web Compon
 - **Local-first**: When work can live in a `just` recipe (invoked via `nix develop --command`) or as logic in a GitHub Actions workflow step, prefer the recipe. The same code then runs reproducibly on a developer machine and in CI, and is debuggable locally without pushing commits. Workflow YAML should mostly delegate to `just`; reach for plugins (`dorny/paths-filter`, custom actions, etc.) only when a recipe genuinely can't express the logic.
 - **CI**: Prefer building release artifacts inside Nix (`nix build .#pkg`) over relying on runner-provided toolchains and `apt`/`brew` packages. Pinning the build environment in `flake.lock` makes artifacts deterministic and decouples them from drift in GitHub Actions runner images. Reach for the runner-native toolchain only when Nix doesn't fit (e.g. Windows runners).
 
-## Testing Approach
-
-- Run `just check` to execute all tests and linting.
-- Run `just fix` to automatically fix formating and easy things.
-
 ## Cross-Package Sync
 
 Changes in one area usually need matching updates elsewhere, including docs. If you skip a row, say why in the PR description.
@@ -143,8 +145,8 @@ Changes in one area usually need matching updates elsewhere, including docs. If 
 | Change in | Also update |
 |---|---|
 | `rs/moq-ffi` | `rs/libmoq`, `{py,swift,kt,go}/`, `doc/lib/{py,swift,kt,go,c}` |
-| `rs/moq-net` wire/API | `js/net`, `doc/concept` |
-| `rs/hang` catalog/container | `js/hang`, `doc/concept` |
+| `rs/moq-net` wire/API | `js/net`, `doc/concept`, `drafts/draft-lcurley-moq-lite.md` (if the wire spec changes) |
+| `rs/hang` catalog/container | `js/hang`, `doc/concept`, `drafts/draft-lcurley-moq-hang.md` (if the format spec changes) |
 | `rs/moq-token` | `js/token` |
 | `rs/moq-relay` config/behavior | `doc/bin/relay/` |
 | `rs/moq-cli` | `doc/bin/cli.md` |
@@ -153,19 +155,13 @@ Changes in one area usually need matching updates elsewhere, including docs. If 
 | `rs/libmoq` C ABI (`moq.h`) | `cpp/obs/src`, `doc/bin/obs.md` |
 | `js/{watch,publish}` UI/API | `demo/web` if it consumes the API |
 
+For wire, `moq-ffi`, or gateway changes, also run the cross-language interop matrix: `just test smoke-full` (see `test/justfile`; plain `smoke` is rust-only).
+
 **When a command-line tool's interface changes (a flag, argument, subcommand, or positional renamed/added/removed/reordered), update every doc that shows an example invocation, not just the tool's primary page.** Sample commands for `moq-cli`, `moq-relay`, and `moq-token` are scattered across `doc/bin/`, `doc/lib/`, `doc/setup/`, and `doc/concept/`, plus the `justfile`s under `demo/`. Grep the whole repo for the binary name and reconcile each hit against the binary's `--help`. A stale example that no longer parses is worse than no example.
 
 ## Branch Targeting
 
-Two long-lived branches. The split is about **semver breakage, not size or novelty**: `dev` is only for changes that break an existing published contract. Everything else (bug fixes, new behavior, new/additive APIs, docs, refactors) goes to `main`, however large.
-
-- **`main`**: the default. Bug fixes, new behavior, new/additive APIs, docs, and refactors that preserve the existing public/wire contract. A change that only *adds* is additive and lands here even when it is big: a new `pub` item, a new option, or a parser accepting a broader set of inputs it previously rejected. Changing what a component does with input it *already* takes (e.g. recognizing a media pattern it used to mishandle) is a fix, not a break, so it also lands here.
-- **`dev`**: reserved for changes that violate semver by breaking an existing contract. Target it only for:
-  - Wire-protocol changes (anything under `rs/moq-net`, including `moq-lite` / `moq-transport` framing or draft bumps).
-  - Breaking changes to public APIs in `rs/moq-ffi`, `rs/libmoq`, `rs/moq-net`, `rs/hang`, `js/net`, `js/hang`, or any of the language wrappers under `swift/`, `kt/`, `go/`, `py/`. This means a renamed, removed, or signature-changed `pub` item, not a newly *added* one (adding is additive, so it goes to `main`).
-  - Catalog/container format changes in `rs/hang` or `js/hang` that alter existing on-the-wire framing or fields.
-
-`dev` periodically merges into `main` (or vice versa) when the batch is ready to ship. When in doubt, target `main`; reviewers will redirect to `dev` if a change turns out to break an existing contract. CI (`pull_request:` workflows) runs on PRs against either branch, so no extra setup is needed when you switch the base.
+PRs target `main` by default, however large the change: bug fixes, new behavior, additive APIs, docs, refactors. `dev` is reserved for changes that break an existing published contract: wire-protocol changes under `rs/moq-net`, breaking (renamed/removed/signature-changed, not newly added) `pub` API changes in the core libraries or language wrappers, and catalog/container format breaks. When in doubt, target `main`. Full rules in [CONTRIBUTING.md](CONTRIBUTING.md#branch-targeting).
 
 ## Workflow
 
@@ -176,23 +172,5 @@ When making changes to the codebase:
 3. Run `just fix` to auto-format and fix linting issues
 4. Run `just check` to verify everything passes
 5. Walk the Cross-Package Sync table; update paired packages and docs in the same PR
-6. Add tests where they're easy to write
-7. Commit and push changes
-
-## PR Reviews
-
-CodeRabbit reviews PRs automatically, but it has an hourly quota and runs out of org credits. If a PR shows a "Review limit reached" / "out of usage credits" message instead of an actual review (or CodeRabbit otherwise fails to produce one), run the `/review` skill locally against the PR to get review feedback without waiting for the quota to refill. Then act on the findings the same way you would CodeRabbit's: push the high-confidence, unambiguous fixes directly, and escalate anything ambiguous, architectural, or open to interpretation by asking first rather than guessing.
-
-When reviewing a PR, always include a list of the public API changes (new/renamed/removed/signature-changed `pub` items in `rs/moq-*` and `js/*`), and call out anything that is breaking per [Branch Targeting](#branch-targeting). Distinguish genuinely public surface from `pub(crate)` / private items so the breaking-change and branch-targeting rules are applied to the right things.
-
-## PR Title and Description Maintenance
-
-When pushing additional commits to an existing PR, check whether the title and description still describe the change accurately. They often go stale during review iterations: a flag gets renamed, an API gets reshaped, an extra fix lands, etc. The PR description is what shows up in the squash-merge commit, so a stale title/body means a misleading entry in `git log` forever.
-
-Update them with `gh pr edit <num> --title "..." --body "..."` whenever the scope shifts. Specifically watch for:
-
-- Flags, file names, or public APIs renamed in later commits but still referenced by their old name in the PR body.
-- Bullet points in the "Summary" section that describe behavior the latest commits have changed or removed.
-- The test-plan checklist getting out of date as new tests are added.
-
-When you edit a PR description you authored, keep the agent model marker so reviewers still know the body wasn't human-authored.
+6. Add tests where they're easy to write; bug fixes need a regression test (see Root Cause First)
+7. Commit and push; follow [CONTRIBUTING.md](CONTRIBUTING.md) for commit messages, PR descriptions, and reviews

@@ -170,6 +170,11 @@ impl Web {
 
 	/// Build the default relay web router.
 	///
+	/// This is the public-facing router (customer media routes plus a liveness
+	/// probe). `/metrics` is deliberately NOT here: node traffic counters ride
+	/// the separate internal listener ([`Internal`](crate::Internal)) so they're
+	/// never exposed on the public listener.
+	///
 	/// The returned router already has relay state applied, so embedders can
 	/// merge in their own state-applied routers before calling [`serve`](Self::serve).
 	pub fn routes(&self) -> Router {

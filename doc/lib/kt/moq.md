@@ -131,6 +131,32 @@ dynamic.requestedTracks().collect { track ->
 }
 ```
 
+### JSON tracks
+
+For JSON payloads, publish and subscribe with the framing handled for you, in one of two modes. Snapshot (lossy) carries one value updated over time; a subscriber only sees the latest. Stream (lossless) is an ordered append-log where every record is preserved. Values cross as JSON strings; serialize with your JSON library of choice.
+
+```kotlin
+import dev.moq.*
+import uniffi.moq.MoqBroadcastProducer
+import uniffi.moq.MoqJsonConfig
+import uniffi.moq.MoqJsonStreamConfig
+
+// Snapshot: each update supersedes the last.
+val config = MoqJsonConfig(deltaRatio = 8u, compression = true)
+val status = broadcast.publishJson("status", config)
+status.update("""{"state":"live"}""")
+
+val broadcastConsumer = broadcast.consume()
+val consumer = broadcastConsumer.subscribeJson("status", config)
+consumer.values().collect { value -> println(value) }
+
+// Stream: every record is delivered in order.
+val events = broadcast.publishJsonStream("events", MoqJsonStreamConfig(compression = false))
+events.append("""{"event":"started"}""")
+```
+
+`compression` must match on the producer and subscriber. In snapshot mode, `deltaRatio` of `0` disables merge-patch deltas (every change is a fresh snapshot).
+
 ## Cancellation
 
 The wrapper exposes consumers as Kotlin `Flow`s. Cancelling the collector's coroutine scope calls `cancel()` on the native side via the wrapper's `onCompletion` hook, releasing resources promptly:
@@ -154,7 +180,7 @@ To build and run the JVM tests locally:
 just kt check
 ```
 
-This builds `moq-ffi` for the host arch, regenerates the UniFFI Kotlin bindings, drops the host cdylib into the JNA resource layout, and runs `gradle :moq:jvmTest`.
+This builds `moq-ffi` for the host arch, regenerates the UniFFI Kotlin bindings, drops the host cdylib into the JNA resource layout, and runs `gradle :moq:jvmTest`. It needs `cargo`, a JDK, and Gradle, all of which ship in the `nix develop` shell; run it from there. To only regenerate the checked-in bindings without compiling or testing (for an environment that intentionally lacks Gradle), use `just kt generate`.
 
 Android targets are opt-in via `-Pandroid.enabled=true`. Local builds without the Android SDK still produce a working JVM variant.
 

@@ -140,6 +140,16 @@
           opentofu
         ];
 
+        # IETF Internet-Draft tooling (drafts/justfile). kramdown-rfc renders
+        # the kramdown-rfc markdown to RFC XML; xml2rfc produces the txt/html;
+        # mmark covers any mmark-format drafts; libxml2 provides xmllint.
+        draftsDeps = with pkgs; [
+          rubyPackages.kramdown-rfc2629
+          xml2rfc
+          mmark
+          libxml2
+        ];
+
         # Tools for producing .deb/.rpm artifacts. Cross-platform so that
         # `just rs package` works from `nix develop` on both Linux and macOS.
         packagingDeps = with pkgs; [
@@ -185,6 +195,16 @@
           nixfmt
         ];
 
+        # Kotlin wrapper (kt/) toolchain so `just kt check` actually compiles
+        # the wrapper and runs :moq:jvmTest instead of silently skipping.
+        # Pinned to gradle 8.x (Kotlin 2.0.21's Gradle plugin predates Gradle
+        # 9) and JDK 17 (the wrapper's jvmTarget). Cross-platform: the kt check
+        # builds moq-ffi for the host and runs on both Linux and macOS.
+        ktDeps = with pkgs; [
+          jdk17
+          gradle_8
+        ];
+
         # Dependencies for building the OBS plugin (`just obs build`).
         # Linux-only: nixpkgs marks obs-studio broken on Darwin, so macOS
         # and Windows fetch libobs/Qt6 via the OBS buildspec instead (see
@@ -218,6 +238,7 @@
           inherit (overlayPkgs)
             moq-relay
             moq-cli
+            moq-bench
             moq-token
             moq-token-cli
             moq-boy
@@ -241,6 +262,7 @@
           inherit (overlayPkgs)
             moq-relay-x86_64-apple-darwin
             moq-cli-x86_64-apple-darwin
+            moq-bench-x86_64-apple-darwin
             moq-token-x86_64-apple-darwin
             moq-token-cli-x86_64-apple-darwin
             libmoq-x86_64-apple-darwin
@@ -262,7 +284,16 @@
 
         devShells.default = pkgs.mkShell {
           packages =
-            rustDeps ++ jsDeps ++ pyDeps ++ cdnDeps ++ packagingDeps ++ lintDeps ++ obsDeps ++ devTools;
+            rustDeps
+            ++ jsDeps
+            ++ pyDeps
+            ++ cdnDeps
+            ++ draftsDeps
+            ++ packagingDeps
+            ++ lintDeps
+            ++ obsDeps
+            ++ ktDeps
+            ++ devTools;
 
           # jemalloc's configure uses -O0 test builds, which conflict with
           # Nix's _FORTIFY_SOURCE hardening (requires -O).

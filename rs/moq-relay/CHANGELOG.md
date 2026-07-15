@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.3...moq-relay-v0.13.4) - 2026-07-12
+
+### Added
+
+- *(moq-native)* add quic::Client/quic::Server transport config ([#2161](https://github.com/moq-dev/moq/pull/2161))
+
+### Other
+
+- expose a Prometheus /metrics endpoint for node traffic ([#2172](https://github.com/moq-dev/moq/pull/2172))
+
+## [0.13.3](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.2...moq-relay-v0.13.3) - 2026-07-09
+
+### Added
+
+- *(moq-net,js/net)* add moq-transport draft-19 (moqt-19) ([#2106](https://github.com/moq-dev/moq/pull/2106))
+
 ## [0.13.2](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.1...moq-relay-v0.13.2) - 2026-07-05
 
 ### Other
