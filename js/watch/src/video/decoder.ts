@@ -39,6 +39,13 @@ export type DecoderProps = {
 	 * `"prefer-software"` forces software decode.
 	 */
 	hardwareAcceleration?: HardwareAcceleration | Signal<HardwareAcceleration>;
+
+	/**
+	 * Unseals each frame payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
+	 * A stable function (the app's key state lives inside its closure), so it is not reactive.
+	 * Omit for cleartext.
+	 */
+	decrypt?: Container.FrameDecrypt;
 };
 
 // The types in VideoDecoderConfig that cause a hard reload.
@@ -52,6 +59,9 @@ export class Decoder implements Backend {
 
 	// WebCodecs hardware-acceleration preference for VideoDecoder.configure. See DecoderProps.
 	hardwareAcceleration: Signal<HardwareAcceleration>;
+
+	// Unseals each frame payload for E2EE, or undefined for cleartext. See DecoderProps.
+	#decrypt?: Container.FrameDecrypt;
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
@@ -91,6 +101,7 @@ export class Decoder implements Backend {
 	constructor(source: Source, props?: DecoderProps) {
 		this.enabled = Signal.from(props?.enabled ?? false);
 		this.hardwareAcceleration = Signal.from(props?.hardwareAcceleration ?? "no-preference");
+		this.#decrypt = props?.decrypt;
 
 		this.source = source;
 		this.source.supported.set(supported); // super hacky
@@ -131,6 +142,7 @@ export class Decoder implements Backend {
 			track,
 			config,
 			hardwareAcceleration,
+			decrypt: this.#decrypt,
 			stats: this.#stats,
 		});
 
@@ -234,6 +246,7 @@ interface DecoderTrackProps {
 	track: string;
 	config: Catalog.VideoConfig;
 	hardwareAcceleration: HardwareAcceleration;
+	decrypt?: Container.FrameDecrypt;
 
 	stats: Signal<Stats | undefined>;
 }
@@ -244,6 +257,7 @@ class DecoderTrack {
 	track: string;
 	config: RequiredDecoderConfig;
 	hardwareAcceleration: HardwareAcceleration;
+	#decrypt?: Container.FrameDecrypt;
 	stats: Signal<Stats | undefined>;
 
 	timestamp = new Signal<Time.Milli | undefined>(undefined);
@@ -276,6 +290,7 @@ class DecoderTrack {
 		this.track = props.track;
 		this.config = requiredConfig;
 		this.hardwareAcceleration = props.hardwareAcceleration;
+		this.#decrypt = props.decrypt;
 		this.stats = props.stats;
 
 		this.signals.run(this.#run.bind(this));
@@ -375,6 +390,7 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			latency: this.source.sync.buffer,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -461,6 +477,7 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			latency: this.source.sync.buffer,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 

@@ -41,6 +41,12 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// The per-rendition timeline producers, memoized by media-track name so the catalog
 	/// section and the media track's group recorder share one track. See [`media_producer`](Self::media_producer).
 	timelines: Arc<Mutex<BTreeMap<String, crate::timeline::Producer>>>,
+
+	/// Seals every media producer this catalog builds, for end-to-end encryption. `None`
+	/// leaves media in the clear. Set via [`with_media_transform`](Self::with_media_transform);
+	/// the catalog's own JSON manifest is never sealed. Shared across renditions, so one
+	/// transform (and its single sealing counter) covers video and audio together.
+	transform: Option<Arc<dyn crate::container::FrameTransform>>,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -54,6 +60,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			clock: self.clock,
 			broadcast: self.broadcast.clone(),
 			timelines: self.timelines.clone(),
+			transform: self.transform.clone(),
 		}
 	}
 }
@@ -97,7 +104,17 @@ impl<E: CatalogExt> Producer<E> {
 			clock: crate::Clock::new(),
 			broadcast: broadcast.clone(),
 			timelines: Arc::new(Mutex::new(BTreeMap::new())),
+			transform: None,
 		})
+	}
+
+	/// Seal every media producer this catalog builds through `transform`, for end-to-end
+	/// encryption. Video and audio share the one transform, so they share its sealing
+	/// counter, which a shared key requires. The catalog's own JSON manifest stays in the
+	/// clear (it is metadata the relay routes on). See [`FrameTransform`](crate::container::FrameTransform).
+	pub fn with_media_transform(mut self, transform: Arc<dyn crate::container::FrameTransform>) -> Self {
+		self.transform = Some(transform);
+		self
 	}
 
 	/// Resolve a timestamp, synthesizing one from the broadcast's shared
@@ -154,7 +171,11 @@ impl<E: CatalogExt> Producer<E> {
 		container: C,
 	) -> crate::container::Producer<C> {
 		let recorder = self.timeline_recorder(track.name());
-		crate::container::Producer::new(track, container).with_recorder(recorder)
+		let producer = crate::container::Producer::new(track, container).with_recorder(recorder);
+		match &self.transform {
+			Some(transform) => producer.with_transform(transform.clone()),
+			None => producer,
+		}
 	}
 
 	/// The catalog [`Timeline`](hang::catalog::Timeline) section for media rendition `name`, to

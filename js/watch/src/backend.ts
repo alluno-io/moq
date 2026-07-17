@@ -1,3 +1,4 @@
+import type * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
 import * as Audio from "./audio";
@@ -50,6 +51,10 @@ export interface MultiBackendProps {
 	// WebCodecs hardware-acceleration preference for video decode. Defaults to "no-preference"
 	// (hardware when available, software fallback). See {@link Video.DecoderProps}.
 	hardwareAcceleration?: Video.HardwareAcceleration | Signal<Video.HardwareAcceleration>;
+
+	// Unseals each media frame's payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
+	// A stable function (not reactive). Only the WebCodecs path decrypts (per-object); MSE cannot.
+	decrypt?: Container.FrameDecrypt;
 }
 
 // We have to proxy some of these signals because we support both the MSE and WebCodecs.
@@ -120,6 +125,11 @@ export class MultiBackend implements Backend {
 	// WebCodecs hardware-acceleration preference for video decode. See {@link Video.DecoderProps}.
 	hardwareAcceleration: Signal<Video.HardwareAcceleration>;
 
+	// Unseals each media frame for E2EE, or undefined for cleartext. Read when the WebCodecs
+	// path starts, so it must be set before the decode element (canvas) is attached. See
+	// {@link MultiBackendProps}.
+	decrypt?: Container.FrameDecrypt;
+
 	video: VideoBackend;
 	#videoSource: Video.Source;
 
@@ -158,6 +168,7 @@ export class MultiBackend implements Backend {
 		this.paused = Signal.from(props?.paused ?? false);
 		this.visible = Signal.from(props?.visible ?? "20%");
 		this.hardwareAcceleration = Signal.from(props?.hardwareAcceleration ?? "no-preference");
+		this.decrypt = props?.decrypt;
 
 		this.signals.run(this.#runElement.bind(this));
 	}
@@ -176,8 +187,11 @@ export class MultiBackend implements Backend {
 	#runWebcodecs(effect: Effect, element: HTMLCanvasElement): void {
 		const videoSource = new Video.Decoder(this.#videoSource, {
 			hardwareAcceleration: this.hardwareAcceleration,
+			decrypt: this.decrypt,
 		});
-		const audioSource = new Audio.Decoder(this.#audioSource);
+		const audioSource = new Audio.Decoder(this.#audioSource, {
+			decrypt: this.decrypt,
+		});
 		this.#audioDecoder = audioSource;
 
 		const audioEmitter = new Audio.Emitter(audioSource, {

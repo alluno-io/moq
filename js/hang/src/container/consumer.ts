@@ -5,12 +5,26 @@ import { Effect, type Getter, Signal } from "@moq/signals";
 import type { Format } from "./format";
 import type { BufferedRanges, Frame } from "./types";
 
+/**
+ * Unseals one media frame's payload for end-to-end encryption, given its position on the
+ * wire (track name, group sequence, object index) to bind as AEAD associated data. Runs on
+ * the payload after the container framing is stripped, before the decoder sees it. The
+ * mirror of the Rust `moq-mux` publish-side `FrameTransform`. Left unset, frames pass
+ * through in the clear.
+ */
+export type FrameDecrypt = (
+	payload: Uint8Array,
+	ctx: { track: string; group: number; object: number },
+) => Promise<Uint8Array>;
+
 /** Options for constructing a {@link Consumer}. */
 export interface ConsumerProps {
 	/** The container format used to decode each MoQ frame. */
 	format: Format;
 	/** Target latency in milliseconds, controlling how aggressively slow groups are skipped (default: 0). */
 	latency?: Signal<Time.Milli> | Time.Milli;
+	/** Unseals each frame payload for E2EE; see {@link FrameDecrypt}. Omit for cleartext. */
+	decrypt?: FrameDecrypt;
 }
 
 interface Group {
@@ -77,6 +91,7 @@ export class Consumer {
 	#track: Moq.Track;
 	#format: Format;
 	#latency: Signal<Time.Milli>;
+	#decrypt?: FrameDecrypt;
 	#groups: Group[] = [];
 	#active?: number; // the active group sequence number
 	#rewind = new Rewind(); // live edge + active boundary + discontinuity count
@@ -95,6 +110,7 @@ export class Consumer {
 		this.#track = track;
 		this.#format = props.format;
 		this.#latency = Signal.from(props.latency ?? Moq.Time.Milli.zero);
+		this.#decrypt = props.decrypt;
 
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
@@ -163,8 +179,20 @@ export class Consumer {
 				const decoded = this.#format.decode(next);
 
 				for (const sample of decoded) {
+					// Unseal the payload after container framing is stripped, binding it to its
+					// (track, group, object) slot. `index` is the per-group object counter, the
+					// mirror of the Rust producer's. Must run here, not in the sync `Format.decode`,
+					// because WebCrypto is async.
+					const data = this.#decrypt
+						? await this.#decrypt(sample.data, {
+								track: this.#track.name,
+								group: group.consumer.sequence,
+								object: index,
+							})
+						: sample.data;
+
 					const frame: Frame = {
-						data: sample.data,
+						data,
 						timestamp: sample.timestamp,
 						// Protocol invariant: groups always start at a keyframe.
 						// For index 0, we enforce this regardless of what the format reports.

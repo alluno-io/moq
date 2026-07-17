@@ -14,6 +14,13 @@ import type { Source } from "./source";
 export type DecoderProps = {
 	// Enable to download the audio track.
 	enabled?: boolean | Signal<boolean>;
+
+	/**
+	 * Unseals each frame payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
+	 * A stable function (the app's key state lives inside its closure), so it is not reactive.
+	 * Omit for cleartext.
+	 */
+	decrypt?: Container.FrameDecrypt;
 };
 
 export interface AudioStats {
@@ -29,6 +36,9 @@ export interface AudioStats {
 export class Decoder {
 	source: Source;
 	enabled: Signal<boolean>;
+
+	// Unseals each frame payload for E2EE, or undefined for cleartext. See DecoderProps.
+	#decrypt?: Container.FrameDecrypt;
 
 	#context = new Signal<AudioContext | undefined>(undefined);
 	readonly context: Getter<AudioContext | undefined> = this.#context;
@@ -85,6 +95,7 @@ export class Decoder {
 		this.source.supported.set(supported); // super hacky
 
 		this.enabled = Signal.from(props?.enabled ?? false);
+		this.#decrypt = props?.decrypt;
 
 		this.#signals.run((effect) => {
 			this.#consumerLatency.set(effect.get(this.source.sync.audioMaxBuffer));
@@ -220,6 +231,7 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			latency: this.#consumerLatency,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -314,6 +326,7 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			latency: this.#consumerLatency,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 

@@ -1,4 +1,6 @@
-use super::{Container, Frame, Timestamp};
+use std::sync::Arc;
+
+use super::{Container, Frame, FrameContext, FrameTransform, Timestamp};
 
 /// A producer for media tracks that manages group boundaries.
 ///
@@ -41,6 +43,14 @@ pub struct Producer<C: Container> {
 	/// Records each group open (sequence + keyframe timestamp) into this rendition's
 	/// timeline track, when the producer was built with one.
 	recorder: Option<crate::timeline::Recorder>,
+
+	/// Seals each frame's payload before it is written, for end-to-end encryption.
+	/// `None` leaves payloads in the clear. Set via [`with_transform`](Self::with_transform).
+	transform: Option<Arc<dyn FrameTransform>>,
+
+	/// The next frame's index within the current group, for the transform's AAD.
+	/// Reset to zero each time a group opens.
+	object: u64,
 }
 
 impl<C: Container> Producer<C> {
@@ -58,6 +68,8 @@ impl<C: Container> Producer<C> {
 			latency: std::time::Duration::ZERO,
 			pending_sequence: None,
 			recorder: None,
+			transform: None,
+			object: 0,
 		}
 	}
 
@@ -83,6 +95,14 @@ impl<C: Container> Producer<C> {
 		self
 	}
 
+	/// Seal each frame's payload through `transform` before writing it, for end-to-end
+	/// encryption. The relay then routes ciphertext it cannot read. Left unset, payloads
+	/// are written in the clear. See [`FrameTransform`](super::FrameTransform).
+	pub fn with_transform(mut self, transform: Arc<dyn FrameTransform>) -> Self {
+		self.transform = Some(transform);
+		self
+	}
+
 	/// The underlying moq-lite track producer. Read-only; mutating it directly
 	/// would sidestep group/keyframe invariants.
 	pub fn track(&self) -> &moq_net::TrackProducer {
@@ -94,7 +114,7 @@ impl<C: Container> Producer<C> {
 	/// A keyframe closes any open group and starts a new one. A non-keyframe extends
 	/// the current group; if no group is open it returns [`MissingKeyframe`](super::MissingKeyframe),
 	/// so a caller joining mid-stream can skip frames until the first keyframe.
-	pub fn write(&mut self, frame: Frame) -> Result<(), C::Error> {
+	pub fn write(&mut self, mut frame: Frame) -> Result<(), C::Error> {
 		// Close the current group on an explicit keyframe, passing its timestamp so
 		// the previous group's last frame can borrow it as a duration boundary.
 		if frame.keyframe {
@@ -126,6 +146,21 @@ impl<C: Container> Producer<C> {
 			}
 
 			self.group = Some(group);
+			self.object = 0;
+		}
+
+		// Seal the payload once the group is open, so the transform can bind the frame
+		// to its (track, group, object) slot. Sealing here covers both the immediate
+		// write and the buffered flush, since a buffered frame is sealed as it arrives.
+		if let Some(transform) = &self.transform {
+			let group = self.group.as_ref().unwrap().sequence;
+			let ctx = FrameContext {
+				track: self.inner.name(),
+				group,
+				object: self.object,
+			};
+			frame.payload = transform.transform(ctx, frame.payload);
+			self.object += 1;
 		}
 
 		// Buffer or write the frame.
@@ -404,5 +439,76 @@ mod tests {
 		assert_eq!(group0[0].duration, Some(Timestamp::from_micros(33_000).unwrap()));
 		// The last sample's duration is backfilled from the next keyframe: 66ms - 33ms.
 		assert_eq!(group0[1].duration, Some(Timestamp::from_micros(33_000).unwrap()));
+	}
+
+	/// Records the context of every frame it seals and prepends a marker byte, so a test
+	/// can check both the AAD position handed in and that the transformed bytes are what
+	/// actually get written.
+	#[derive(Clone, Default)]
+	struct SealSpy(std::sync::Arc<std::sync::Mutex<Vec<(String, u64, u64)>>>);
+
+	impl super::FrameTransform for SealSpy {
+		fn transform(&self, ctx: super::FrameContext<'_>, payload: Bytes) -> Bytes {
+			self.0
+				.lock()
+				.unwrap()
+				.push((ctx.track.to_string(), ctx.group, ctx.object));
+			let mut sealed = vec![0x53];
+			sealed.extend_from_slice(&payload);
+			Bytes::from(sealed)
+		}
+	}
+
+	/// The transform sees each frame's (track, group, object): the group tracks the moq
+	/// group sequence and the object resets to zero on each new group, and the bytes it
+	/// returns are what land on the wire.
+	#[tokio::test]
+	async fn transform_seals_with_group_and_object_aad() {
+		let track = track_producer("cam");
+		let consumer = track.consume();
+		let spy = SealSpy::default();
+		let mut producer = Producer::new(track, Container::Legacy).with_transform(std::sync::Arc::new(spy.clone()));
+
+		producer.write(frame(0, true)).unwrap(); // group 0, object 0
+		producer.write(frame(10_000, false)).unwrap(); // group 0, object 1
+		producer.write(frame(20_000, true)).unwrap(); // group 1, object 0 (object resets)
+		producer.write(frame(30_000, false)).unwrap(); // group 1, object 1
+		producer.finish().unwrap();
+
+		assert_eq!(
+			*spy.0.lock().unwrap(),
+			vec![
+				("cam".to_string(), 0, 0),
+				("cam".to_string(), 0, 1),
+				("cam".to_string(), 1, 0),
+				("cam".to_string(), 1, 1),
+			]
+		);
+
+		// Every frame's payload on the wire is the transformed one (0x53 marker +
+		// original). Legacy prepends a VarInt timestamp, so check the payload suffix.
+		let mut consumer = consumer;
+		while let Some(mut group) = consumer.recv_group().await.unwrap() {
+			while let Some(mut frame) = group.next_frame().await.unwrap() {
+				assert!(frame.read_all().await.unwrap().ends_with(&[0x53, 0xDE, 0xAD]));
+			}
+		}
+	}
+
+	/// With no transform set, payloads are written in the clear.
+	#[tokio::test]
+	async fn without_transform_payload_is_cleartext() {
+		let track = track_producer("cam");
+		let consumer = track.consume();
+		let mut producer = Producer::new(track, Container::Legacy);
+
+		producer.write(frame(0, true)).unwrap();
+		producer.finish().unwrap();
+
+		let mut consumer = consumer;
+		let mut group = consumer.recv_group().await.unwrap().unwrap();
+		let mut frame = group.next_frame().await.unwrap().unwrap();
+		// VarInt timestamp 0 (0x00) then the raw payload, with no 0x53 seal marker.
+		assert_eq!(&frame.read_all().await.unwrap()[..], &[0x00, 0xDE, 0xAD]);
 	}
 }

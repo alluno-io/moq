@@ -73,6 +73,40 @@ pub struct Frame {
 	pub keyframe: bool,
 }
 
+/// Seals each media frame's payload just before it is written, for end-to-end
+/// encryption.
+///
+/// Given the frame's position on the wire (to bind as AEAD associated data), it
+/// returns the payload to write in place of the original. moq-mux stays
+/// crypto-agnostic: the transform is supplied by the application, carried on the
+/// [`catalog::Producer`](crate::catalog::Producer) via
+/// [`with_media_transform`](crate::catalog::Producer::with_media_transform), and
+/// applied to every media track that catalog produces.
+///
+/// `transform` takes `&self` so one instance can be shared across every track sealed
+/// under the same key, which is required: with a shared key the nonce derives from a
+/// single counter, so all those tracks must run through one stateful sealer. It must
+/// never return the plaintext and never panic (a panic in a spawned publish task can
+/// hang `finished().await`); an implementation that cannot seal a frame returns a
+/// sealed-empty payload the receiver drops, failing closed rather than open.
+pub trait FrameTransform: Send + Sync {
+	/// Return the sealed payload to write in place of `payload`.
+	fn transform(&self, ctx: FrameContext<'_>, payload: Bytes) -> Bytes;
+}
+
+/// The position of a frame on the wire, handed to a [`FrameTransform`] so it can bind
+/// the ciphertext to its slot (AEAD associated data) and stop a relay splicing frames
+/// between tracks, groups, or objects.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameContext<'a> {
+	/// The track name the frame is published on.
+	pub track: &'a str,
+	/// The group (sequence) the frame belongs to.
+	pub group: u64,
+	/// The frame's index within its group, from zero.
+	pub object: u64,
+}
+
 /// A non-keyframe frame arrived with no open group.
 ///
 /// A track must open with a keyframe (and so must the frame after

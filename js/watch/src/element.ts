@@ -1,4 +1,5 @@
 import type * as Catalog from "@moq/hang/catalog";
+import type * as Container from "@moq/hang/container";
 import type { Time } from "@moq/net";
 import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -406,6 +407,20 @@ export default class MoqWatch extends HTMLElement {
 
 	set hardwareAcceleration(value: HardwareAcceleration) {
 		this.backend.hardwareAcceleration.set(value);
+	}
+
+	/**
+	 * Unseals each media frame's payload for end-to-end encryption. A JS property, not an
+	 * attribute (it is a function). Set it before attaching the decode `<canvas>`, since it is
+	 * read when the WebCodecs path starts. Only the WebCodecs path decrypts; MSE cannot.
+	 * See {@link Container.FrameDecrypt}.
+	 */
+	get decrypt(): Container.FrameDecrypt | undefined {
+		return this.backend.decrypt;
+	}
+
+	set decrypt(value: Container.FrameDecrypt | undefined) {
+		this.backend.decrypt = value;
 	}
 }
 
