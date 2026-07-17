@@ -55,6 +55,11 @@ pub struct ServerConfig {
 	#[serde(default)]
 	pub quic: crate::quic::Server,
 
+	/// Use BBR congestion control instead of the default (Cubic/NewReno).
+	#[arg(skip)]
+	#[serde(default)]
+	pub bbr: bool,
+
 	/// Restrict the server to specific MoQ protocol version(s).
 	///
 	/// By default, the server accepts all supported versions.
