@@ -29,6 +29,10 @@ export class Mse implements Backend {
 	#timestamp = new Signal<Moq.Time.Milli>(Moq.Time.Milli.zero);
 	readonly timestamp: Getter<Moq.Time.Milli> = this.#timestamp;
 
+	// MSE hands presentation to the video element, so this stays false.
+	#hdr = new Signal<boolean>(false);
+	readonly hdr: Getter<boolean> = this.#hdr;
+
 	signals = new Effect();
 
 	constructor(muxer: Muxer, source: Source) {

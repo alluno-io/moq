@@ -55,6 +55,9 @@ type RequiredDecoderConfig = Omit<Catalog.VideoConfig, "codedWidth" | "codedHeig
 
 export class Decoder implements Backend {
 	enabled: Signal<boolean>; // Don't download any longer
+
+	// Whether the frames on screen are presented in HDR; driven by the Renderer painting them.
+	hdr = new Signal<boolean>(false);
 	source: Source;
 
 	// WebCodecs hardware-acceleration preference for VideoDecoder.configure. See DecoderProps.

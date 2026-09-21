@@ -22,6 +22,7 @@ const OBSERVED = [
 	"jitter",
 	"catalog-format",
 	"hardware-acceleration",
+	"hdr",
 ] as const;
 type Observed = (typeof OBSERVED)[number];
 
@@ -261,6 +262,8 @@ export default class MoqWatch extends HTMLElement {
 			this.broadcast.catalogFormat.set(parseCatalogFormat(newValue));
 		} else if (name === "hardware-acceleration") {
 			this.backend.hardwareAcceleration.set(parseHardwareAcceleration(newValue));
+		} else if (name === "hdr") {
+			this.backend.hdr.set(parseBoolean(newValue, true));
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
@@ -407,6 +410,14 @@ export default class MoqWatch extends HTMLElement {
 
 	set hardwareAcceleration(value: HardwareAcceleration) {
 		this.backend.hardwareAcceleration.set(value);
+	}
+
+	get hdr(): boolean {
+		return this.backend.hdr.peek();
+	}
+
+	set hdr(value: boolean) {
+		this.backend.hdr.set(value);
 	}
 
 	/**

@@ -19,6 +19,9 @@ export interface Backend {
 
 	/** The timestamp of the current frame. */
 	timestamp: Getter<Moq.Time.Milli | undefined>;
+
+	/** Whether the frame on screen is presented in HDR (WebCodecs path on an HDR display; never under MSE). */
+	hdr: Getter<boolean>;
 }
 
 /** Video playback statistics. */

@@ -52,6 +52,11 @@ export interface MultiBackendProps {
 	// (hardware when available, software fallback). See {@link Video.DecoderProps}.
 	hardwareAcceleration?: Video.HardwareAcceleration | Signal<Video.HardwareAcceleration>;
 
+	// Present PQ (HDR10) video in HDR on an HDR display through WebGPU where the browser supports
+	// it; off keeps the 2D canvas, which tone-maps to SDR. Read when the canvas is attached.
+	// Defaults to true. See {@link Video.RendererProps.hdr}.
+	hdr?: boolean | Signal<boolean>;
+
 	// Unseals each media frame's payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
 	// A stable function (not reactive). Only the WebCodecs path decrypts (per-object); MSE cannot.
 	decrypt?: Container.FrameDecrypt;
@@ -73,6 +78,9 @@ class VideoBackend implements Video.Backend {
 
 	// The timestamp of the current frame
 	timestamp = new Signal<Moq.Time.Milli>(Moq.Time.Milli.zero);
+
+	// Whether the frame on screen is presented in HDR (WebCodecs path only).
+	hdr = new Signal<boolean>(false);
 
 	constructor(source: Video.Source) {
 		this.source = source;
@@ -125,6 +133,9 @@ export class MultiBackend implements Backend {
 	// WebCodecs hardware-acceleration preference for video decode. See {@link Video.DecoderProps}.
 	hardwareAcceleration: Signal<Video.HardwareAcceleration>;
 
+	// Whether PQ video may be presented in HDR through WebGPU. See {@link MultiBackendProps.hdr}.
+	hdr: Signal<boolean>;
+
 	// Unseals each media frame for E2EE, or undefined for cleartext. Read when the WebCodecs
 	// path starts, so it must be set before the decode element (canvas) is attached. See
 	// {@link MultiBackendProps}.
@@ -168,6 +179,7 @@ export class MultiBackend implements Backend {
 		this.paused = Signal.from(props?.paused ?? false);
 		this.visible = Signal.from(props?.visible ?? "20%");
 		this.hardwareAcceleration = Signal.from(props?.hardwareAcceleration ?? "no-preference");
+		this.hdr = Signal.from(props?.hdr ?? true);
 		this.decrypt = props?.decrypt;
 
 		this.signals.run(this.#runElement.bind(this));
@@ -204,6 +216,7 @@ export class MultiBackend implements Backend {
 			canvas: element,
 			paused: this.paused,
 			visible: this.visible,
+			hdr: this.hdr,
 		});
 
 		effect.cleanup(() => {
@@ -219,6 +232,7 @@ export class MultiBackend implements Backend {
 		effect.proxy(this.video.buffered, videoSource.buffered);
 		effect.proxy(this.video.stalled, videoSource.stalled);
 		effect.proxy(this.video.timestamp, videoSource.timestamp);
+		effect.proxy(this.video.hdr, videoSource.hdr);
 
 		effect.proxy(this.audio.stats, audioSource.stats);
 		effect.proxy(this.audio.buffered, audioSource.buffered);
@@ -249,6 +263,7 @@ export class MultiBackend implements Backend {
 		effect.proxy(this.video.buffered, video.buffered);
 		effect.proxy(this.video.stalled, video.stalled);
 		effect.proxy(this.video.timestamp, video.timestamp);
+		effect.proxy(this.video.hdr, video.hdr);
 
 		effect.proxy(this.audio.stats, audio.stats);
 		effect.proxy(this.audio.buffered, audio.buffered);
