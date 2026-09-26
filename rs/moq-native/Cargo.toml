@@ -17,7 +17,7 @@ doctest = false
 
 [features]
 default = ["quinn", "aws-lc-rs", "websocket", "tcp", "uds"]
-quinn = ["dep:quinn", "dep:web-transport-quinn", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch"]
+quinn = ["dep:quinn", "dep:quinn-proto", "dep:web-transport-quinn", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch"]
 noq = ["dep:web-transport-noq", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "watch"]
 quiche = ["dep:web-transport-quiche", "dep:rcgen", "dep:reqwest", "dep:rustls-webpki", "dep:rustls-native-certs"]
 # Filesystem watcher for hot-reloading on-disk TLS certs/keys; the QUIC backends imply it.
@@ -46,6 +46,7 @@ notify = { version = "8", optional = true }
 parking_lot = { version = "0.12", features = ["deadlock_detection"] }
 qmux = { workspace = true, features = ["wss", "tls", "tcp"], optional = true }
 quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"], optional = true }
+quinn-proto = { version = "0.11", default-features = false, optional = true }
 rand = "0.10.1"
 rcgen = { version = "0.14", default-features = false, optional = true }
 reqwest = { version = "0.13", default-features = false, optional = true }

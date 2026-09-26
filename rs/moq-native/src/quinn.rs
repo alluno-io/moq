@@ -153,7 +153,7 @@ impl QuinnClient {
 		// the server: a loss-based controller halves a publisher's uplink on one transient
 		// WiFi loss and stalls the live edge despite spare capacity.
 		if config.bbr {
-			transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+			transport.congestion_controller_factory(Arc::new(crate::bbr::BbrConfig::default()));
 		}
 		apply_transport(&mut transport, config.quic.resolve());
 		let transport = Arc::new(transport);
@@ -336,7 +336,7 @@ impl QuinnServer {
 		// controller cuts its window on a transient WiFi/interface loss and stalls the
 		// stream (a visible hiccup) despite spare capacity.
 		if config.bbr {
-			transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+			transport.congestion_controller_factory(Arc::new(crate::bbr::BbrConfig::default()));
 		}
 		apply_transport(&mut transport, config.quic.resolve());
 		let transport = Arc::new(transport);

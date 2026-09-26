@@ -4194,6 +4194,7 @@ dependencies = [
  "parking_lot",
  "qmux",
  "quinn",
+ "quinn-proto",
  "rand 0.10.2",
  "rcgen",
  "reqwest",
