@@ -78,7 +78,9 @@ export class Sync {
 	readonly maxBuffer: Signal<Time.Milli> = this.#maxBuffer;
 
 	// The video playout floor: jitter + video delay. Audio uses `#audioBuffer` instead, so video
-	// stays low-latency and is not dragged by audio's larger headroom.
+	// stays low-latency and is not dragged by audio's larger headroom. WebCodecs video waits on it
+	// only while playback is buffered and otherwise renders each frame as it is decoded; the MSE
+	// players and the group-skip threshold still use it.
 	#buffer = new Signal<Time.Milli>(Time.Milli.zero);
 	readonly buffer: Signal<Time.Milli> = this.#buffer;
 
@@ -302,7 +304,8 @@ export class Sync {
 		return Time.Milli.sub(Time.Milli.sub(Time.Milli.now(), reference), this.#buffer.peek());
 	}
 
-	// Sleep until it's time to render this frame.
+	// Sleep until it's time to render this frame. WebCodecs video calls this only while playback is
+	// buffered.
 	async wait(timestamp: Time.Milli): Promise<void> {
 		const reference = this.#reference.peek();
 		if (reference === undefined) {

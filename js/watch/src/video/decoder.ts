@@ -325,9 +325,11 @@ class DecoderTrack {
 						this.frame.set(frame.clone());
 					}
 
-					const wait = this.source.sync.wait(timestamp).then(() => true);
-					const ok = await Promise.race([wait, effect.cancel]);
-					if (!ok) return;
+					if (this.source.sync.buffered.peek()) {
+						const wait = this.source.sync.wait(timestamp).then(() => true);
+						const ok = await Promise.race([wait, effect.cancel]);
+						if (!ok) return;
+					}
 					if (generation !== this.#discontinuity) {
 						// A rewind happened while waiting; this frame is stale.
 						this.#markDropped();
