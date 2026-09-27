@@ -43,6 +43,9 @@ export interface WebTransportProps extends Omit<WebTransportOptions, "serverCert
 	// computed for you. Accepts a PEM string or raw DER bytes. Use this when you
 	// have the certificate but not its precomputed fingerprint.
 	serverCertificate?: string | BufferSource;
+
+	// Attempt WebTransport even where this browser defaults to WebSocket.
+	force?: boolean;
 }
 
 /** Options for {@link connect}. */
@@ -61,10 +64,12 @@ export interface ConnectProps {
 // Save if WebSocket won the last race, so we won't give QUIC a head start next time.
 const websocketWon = new Set<string>();
 
-// Firefox's WebTransport implementation drops server-initiated bidi streams,
-// breaking publish (the relay opens a subscribe bidi back to us). Force WebSocket.
-// TODO: remove once Firefox fixes incoming bidi delivery.
-const isFirefox = typeof navigator !== "undefined" && navigator.userAgent.toLowerCase().includes("firefox");
+const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+
+/** Whether to attempt WebTransport: Firefox takes WebSocket unless the connection forces WebTransport. */
+export function allowsWebTransport(agent: string, props?: WebTransportProps): boolean {
+	return !agent.toLowerCase().includes("firefox") || props?.force === true;
+}
 
 /**
  * Establishes a connection to a MOQ server.
@@ -81,7 +86,9 @@ export async function connect(url: URL, props?: ConnectProps): Promise<Establish
 	const { promise: cancel, resolve: done } = Promise.withResolvers<void>();
 
 	const webtransport =
-		globalThis.WebTransport && !isFirefox ? connectWebTransport(url, cancel, props?.webtransport) : undefined;
+		globalThis.WebTransport && allowsWebTransport(userAgent, props?.webtransport)
+			? connectWebTransport(url, cancel, props?.webtransport)
+			: undefined;
 
 	// Give QUIC a head start to connect before trying WebSocket, unless WebSocket has won in the past.
 	// NOTE that QUIC should be faster because it involves 1/2 fewer RTTs.
@@ -356,7 +363,12 @@ async function connectWebTransport(
 	let finalUrl = url;
 
 	// Our custom pinning fields are normalized separately; the rest are DOM options.
-	const { serverCertificate: _cert, serverCertificateHashes: _hashes, ...webtransport } = options ?? {};
+	const {
+		serverCertificate: _cert,
+		serverCertificateHashes: _hashes,
+		force: _force,
+		...webtransport
+	} = options ?? {};
 
 	const finalOptions: WebTransportOptions = {
 		allowPooling: false,
