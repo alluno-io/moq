@@ -148,13 +148,8 @@ impl QuinnClient {
 	pub fn new(config: &ClientConfig) -> Result<Self> {
 		let socket = crate::bind::udp(config.bind).map_err(Error::BindSocket)?;
 
+		// TODO Validate the BBR implementation before enabling it
 		let mut transport = quinn::TransportConfig::default();
-		// BBR over the default (Cubic/NewReno) when the client opts in, for the same reason as
-		// the server: a loss-based controller halves a publisher's uplink on one transient
-		// WiFi loss and stalls the live edge despite spare capacity.
-		if config.bbr {
-			transport.congestion_controller_factory(Arc::new(crate::bbr::BbrConfig::default()));
-		}
 		apply_transport(&mut transport, config.quic.resolve());
 		let transport = Arc::new(transport);
 
@@ -331,13 +326,9 @@ pub(crate) struct QuinnServer {
 
 impl QuinnServer {
 	pub fn new(config: ServerConfig) -> Result<Self> {
+		// Enable BBR congestion control
+		// TODO Validate the BBR implementation before enabling it
 		let mut transport = quinn::TransportConfig::default();
-		// BBR over the default (Cubic/NewReno) when the server opts in: a loss-based
-		// controller cuts its window on a transient WiFi/interface loss and stalls the
-		// stream (a visible hiccup) despite spare capacity.
-		if config.bbr {
-			transport.congestion_controller_factory(Arc::new(crate::bbr::BbrConfig::default()));
-		}
 		apply_transport(&mut transport, config.quic.resolve());
 		let transport = Arc::new(transport);
 

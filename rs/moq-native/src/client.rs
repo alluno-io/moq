@@ -39,11 +39,6 @@ pub struct ClientConfig {
 	#[serde(default)]
 	pub quic: crate::quic::Client,
 
-	/// Use BBR congestion control instead of the default (Cubic/NewReno) on the quinn backend.
-	#[arg(skip)]
-	#[serde(default)]
-	pub bbr: bool,
-
 	/// Restrict the client to specific MoQ protocol version(s).
 	///
 	/// By default, the client offers all supported versions and lets the server choose.
@@ -91,7 +86,6 @@ impl Default for ClientConfig {
 			bind: "[::]:0".parse().unwrap(),
 			backend: None,
 			quic: crate::quic::Client::default(),
-			bbr: false,
 			version: Vec::new(),
 			tls: crate::tls::Client::default(),
 			backoff: Backoff::default(),

@@ -10,8 +10,6 @@
 //!
 //! See [`Client`] for connecting to relays and [`Server`] for accepting connections.
 
-#[cfg(feature = "quinn")]
-mod bbr;
 pub mod bind;
 mod client;
 mod connect;

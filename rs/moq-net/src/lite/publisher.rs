@@ -603,7 +603,7 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 		let stream = session.open_uni().await.map_err(Error::from_transport)?;
 
 		let mut stream = Writer::new(stream, version);
-		stream.set_priority(priority.current());
+		stream.set_priority(priority.send_order());
 		stream.encode(&lite::DataType::Group).await?;
 		stream.encode(&msg).await?;
 		track_stats.group();
@@ -617,8 +617,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 				biased;
 				_ = stream.closed() => return Err(Error::Cancel),
 				frame = group.next_frame() => frame,
-				new_pri = priority.next() => {
-					stream.set_priority(new_pri);
+				_ = priority.next() => {
+					stream.set_priority(priority.send_order());
 					continue;
 				}
 				Ok(()) = track_priority.changed() => {
@@ -648,8 +648,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 					biased;
 					_ = stream.closed() => return Err(Error::Cancel),
 					chunk = frame.read_chunk() => chunk,
-					new_pri = priority.next() => {
-						stream.set_priority(new_pri);
+					_ = priority.next() => {
+						stream.set_priority(priority.send_order());
 						continue;
 					}
 					Ok(()) = track_priority.changed() => {
@@ -668,8 +668,8 @@ impl<S: web_transport_trait::Session> Publisher<S> {
 									result?;
 									break;
 								}
-								new_pri = priority.next() => {
-									stream.set_priority(new_pri);
+								_ = priority.next() => {
+									stream.set_priority(priority.send_order());
 								}
 								Ok(()) = track_priority.changed() => {
 									priority.set_track(*track_priority.borrow_and_update());

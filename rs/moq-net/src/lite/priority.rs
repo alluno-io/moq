@@ -279,6 +279,12 @@ impl PriorityHandle {
 		*self.rx.borrow_and_update()
 	}
 
+	/// The current rank as a transport send order, where higher values are transmitted
+	/// first; the rank is the opposite (0 = most urgent).
+	pub fn send_order(&mut self) -> u8 {
+		u8::MAX - self.current()
+	}
+
 	/// Change this item's track priority and re-sort the queue.
 	/// No-op if the track value hasn't changed.
 	pub fn set_track(&mut self, new_track: u8) {
@@ -293,6 +299,18 @@ impl PriorityHandle {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_send_order_inverts_rank() {
+		let queue = PriorityQueue::default();
+		let mut top = queue.insert(Priority::new(200, 0));
+		let mut low = queue.insert(Priority::new(100, 0));
+
+		assert_eq!(top.current(), 0);
+		assert_eq!(top.send_order(), 255, "most urgent rank gets the highest send order");
+		assert_eq!(low.current(), 1);
+		assert_eq!(low.send_order(), 254);
+	}
 
 	#[test]
 	fn test_single_item() {

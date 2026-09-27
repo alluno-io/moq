@@ -270,6 +270,7 @@ impl Resolved {
 	}
 
 	/// Whether the config asks to turn GSO off, which not every backend can honor.
+	#[cfg_attr(not(any(feature = "iroh", feature = "quiche")), allow(dead_code))]
 	pub(crate) fn gso_disabled(&self) -> bool {
 		self.gso == Some(false)
 	}
