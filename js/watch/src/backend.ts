@@ -82,6 +82,9 @@ class VideoBackend implements Video.Backend {
 	// Whether the frame on screen is presented in HDR (WebCodecs path only).
 	hdr = new Signal<boolean>(false);
 
+	// How many decoded frames have reached the canvas (WebCodecs path only).
+	painted = new Signal<number | undefined>(undefined);
+
 	constructor(source: Video.Source) {
 		this.source = source;
 	}
@@ -233,6 +236,8 @@ export class MultiBackend implements Backend {
 		effect.proxy(this.video.stalled, videoSource.stalled);
 		effect.proxy(this.video.timestamp, videoSource.timestamp);
 		effect.proxy(this.video.hdr, videoSource.hdr);
+		effect.proxy(this.video.painted, videoRenderer.painted);
+		effect.cleanup(() => this.video.painted.set(undefined));
 
 		effect.proxy(this.audio.stats, audioSource.stats);
 		effect.proxy(this.audio.buffered, audioSource.buffered);

@@ -68,24 +68,32 @@ interface Painter {
 const WORKER_SRC = `
 let ctx = null;
 let frame = null;
+let fresh = false;
 let flip = false;
 let raf = 0;
 
 function paint() {
 	raf = 0;
-	if (!ctx) return;
+	if (!ctx || ctx.isContextLost?.()) return;
 	const canvas = ctx.canvas;
 	ctx.fillStyle = "#000";
 	ctx.fillRect(0, 0, canvas.width, canvas.height);
 	if (!frame) return;
 	if (flip) {
 		ctx.save();
-		ctx.scale(-1, 1);
-		ctx.translate(-canvas.width, 0);
-		ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-		ctx.restore();
+		try {
+			ctx.scale(-1, 1);
+			ctx.translate(-canvas.width, 0);
+			ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+		} finally {
+			ctx.restore();
+		}
 	} else {
 		ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+	}
+	if (fresh) {
+		fresh = false;
+		self.postMessage({ type: "painted" });
 	}
 }
 
@@ -98,11 +106,13 @@ self.onmessage = (e) => {
 	switch (m.type) {
 		case "canvas":
 			ctx = m.canvas.getContext("2d", { desynchronized: true, alpha: false });
+			m.canvas.addEventListener("contextrestored", schedule);
 			schedule();
 			break;
 		case "frame":
 			if (frame) frame.close();
 			frame = m.frame;
+			fresh = true;
 			schedule();
 			break;
 		case "resize":
@@ -151,8 +161,11 @@ class WorkerPainter implements Painter {
 	readonly path = new Signal<PaintPath | undefined>("2d");
 	#worker: Worker;
 
-	constructor(canvas: HTMLCanvasElement) {
+	constructor(canvas: HTMLCanvasElement, painted: () => void) {
 		this.#worker = new Worker(getWorkerUrl());
+		this.#worker.onmessage = (e: MessageEvent<{ type: string }>) => {
+			if (e.data.type === "painted") painted();
+		};
 
 		let offscreen: OffscreenCanvas;
 		try {
@@ -193,13 +206,20 @@ class WorkerPainter implements Painter {
 class MainPainter implements Painter {
 	readonly hdr = new Signal(false);
 	readonly path = new Signal<PaintPath | undefined>("2d");
+	#canvas: HTMLCanvasElement;
 	#ctx: CanvasRenderingContext2D | undefined;
 	#frame: VideoFrame | undefined;
+	#fresh = false;
 	#flip = false;
 	#raf = 0;
+	#painted: () => void;
+	#restored = () => this.#schedule();
 
-	constructor(canvas: HTMLCanvasElement) {
+	constructor(canvas: HTMLCanvasElement, painted: () => void) {
+		this.#canvas = canvas;
+		this.#painted = painted;
 		this.#ctx = canvas.getContext("2d", { desynchronized: true, alpha: false }) ?? undefined;
+		canvas.addEventListener("contextrestored", this.#restored);
 	}
 
 	#schedule(): void {
@@ -211,7 +231,7 @@ class MainPainter implements Painter {
 	#paint(): void {
 		this.#raf = 0;
 		const ctx = this.#ctx;
-		if (!ctx) return;
+		if (!ctx || ctx.isContextLost?.()) return;
 
 		const canvas = ctx.canvas;
 		ctx.fillStyle = "#000";
@@ -222,12 +242,20 @@ class MainPainter implements Painter {
 
 		if (this.#flip) {
 			ctx.save();
-			ctx.scale(-1, 1);
-			ctx.translate(-canvas.width, 0);
-			ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-			ctx.restore();
+			try {
+				ctx.scale(-1, 1);
+				ctx.translate(-canvas.width, 0);
+				ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+			} finally {
+				ctx.restore();
+			}
 		} else {
 			ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+		}
+
+		if (this.#fresh) {
+			this.#fresh = false;
+			this.#painted();
 		}
 	}
 
@@ -250,6 +278,7 @@ class MainPainter implements Painter {
 	frame(frame: VideoFrame): void {
 		this.#frame?.close();
 		this.#frame = frame;
+		this.#fresh = true;
 		this.#schedule();
 	}
 
@@ -261,6 +290,7 @@ class MainPainter implements Painter {
 
 	close(): void {
 		if (this.#raf) cancelAnimationFrame(this.#raf);
+		this.#canvas.removeEventListener("contextrestored", this.#restored);
 		this.#frame?.close();
 		this.#frame = undefined;
 		this.#ctx = undefined;
@@ -480,47 +510,55 @@ class GpuPainter implements Painter {
 	#context: GPUCanvasContext;
 	#format: GPUTextureFormat | undefined;
 	#frame: VideoFrame | undefined;
+	#fresh = false;
 	#flip = false;
 	#displayHdr = false;
 	#raf = 0;
+	#painted: () => void;
+	#lost = false;
+	#closed = false;
 
-	private constructor(state: GpuState, context: GPUCanvasContext) {
+	private constructor(state: GpuState, context: GPUCanvasContext, painted: () => void) {
 		this.#state = state;
 		this.#context = context;
+		this.#painted = painted;
+		this.#watch(state.device);
 	}
 
-	static async create(canvas: HTMLCanvasElement): Promise<GpuPainter | undefined> {
+	static async create(canvas: HTMLCanvasElement, painted: () => void): Promise<GpuPainter | undefined> {
 		if (typeof navigator === "undefined" || !navigator.gpu || typeof OffscreenCanvas === "undefined")
 			return undefined;
-		const adapter = await navigator.gpu.requestAdapter();
-		if (!adapter) return undefined;
-		const device = await adapter.requestDevice();
-		const probe = new OffscreenCanvas(1, 1).getContext("webgpu");
-		if (!probe || typeof probe.getConfiguration !== "function") return undefined;
-		probe.configure({
-			device,
-			format: "rgba16float",
-			toneMapping: { mode: "extended" },
-			colorSpace: "srgb",
-			alphaMode: "opaque",
-		});
-		const configured = probe.getConfiguration();
-		probe.unconfigure();
-		if (configured?.toneMapping?.mode !== "extended") return undefined;
-
-		const base = {
-			device,
-			module: device.createShaderModule({ code: SHADER_SRC }),
-			sampler: device.createSampler({ magFilter: "linear", minFilter: "linear" }),
-			uniform: device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
-			pipelines: new Map<GPUTextureFormat, GPURenderPipeline>(),
-			preferred: navigator.gpu.getPreferredCanvasFormat(),
-		};
-		const model = await calibrate(base);
-		if (!model) return undefined;
+		const state = await prepareGpu();
+		if (!state) return undefined;
 		const context = canvas.getContext("webgpu");
 		if (!context) return undefined;
-		return new GpuPainter({ ...base, model }, context);
+		return new GpuPainter(state, context, painted);
+	}
+
+	#watch(device: GPUDevice): void {
+		void device.lost.then((info) => {
+			if (this.#closed || info.reason === "destroyed") return;
+			console.warn("moq-watch: webgpu device lost, recreating it", info.message);
+			this.#lost = true;
+			void this.#revive();
+		});
+	}
+
+	async #revive(): Promise<void> {
+		const state = await prepareGpu().catch((err: unknown) => {
+			console.warn("moq-watch: webgpu device could not be recreated", err);
+			return undefined;
+		});
+		if (this.#closed) {
+			state?.device.destroy();
+			return;
+		}
+		if (!state) return;
+		this.#state = state;
+		this.#format = undefined;
+		this.#lost = false;
+		this.#watch(state.device);
+		this.#schedule();
 	}
 
 	#configure(hdr: boolean): void {
@@ -542,6 +580,7 @@ class GpuPainter implements Painter {
 
 	#paint(): void {
 		this.#raf = 0;
+		if (this.#lost) return;
 		try {
 			const frame = this.#frame;
 			const pq = !!frame && isPq(frame);
@@ -565,6 +604,10 @@ class GpuPainter implements Painter {
 			}
 			this.#state.device.queue.submit([encoder.finish()]);
 			this.hdr.set(hdr);
+			if (frame && this.#fresh) {
+				this.#fresh = false;
+				this.#painted();
+			}
 		} catch (err) {
 			console.warn("moq-watch: webgpu paint failed", err);
 		}
@@ -592,6 +635,7 @@ class GpuPainter implements Painter {
 	frame(frame: VideoFrame): void {
 		this.#frame?.close();
 		this.#frame = frame;
+		this.#fresh = true;
 		this.#schedule();
 	}
 
@@ -602,6 +646,7 @@ class GpuPainter implements Painter {
 	}
 
 	close(): void {
+		this.#closed = true;
 		if (this.#raf) cancelAnimationFrame(this.#raf);
 		this.#frame?.close();
 		this.#frame = undefined;
@@ -609,6 +654,36 @@ class GpuPainter implements Painter {
 		this.#context.unconfigure();
 		this.#state.device.destroy();
 	}
+}
+
+async function prepareGpu(): Promise<GpuState | undefined> {
+	const adapter = await navigator.gpu.requestAdapter();
+	if (!adapter) return undefined;
+	const device = await adapter.requestDevice();
+	const probe = new OffscreenCanvas(1, 1).getContext("webgpu");
+	if (!probe || typeof probe.getConfiguration !== "function") return undefined;
+	probe.configure({
+		device,
+		format: "rgba16float",
+		toneMapping: { mode: "extended" },
+		colorSpace: "srgb",
+		alphaMode: "opaque",
+	});
+	const configured = probe.getConfiguration();
+	probe.unconfigure();
+	if (configured?.toneMapping?.mode !== "extended") return undefined;
+
+	const base = {
+		device,
+		module: device.createShaderModule({ code: SHADER_SRC }),
+		sampler: device.createSampler({ magFilter: "linear", minFilter: "linear" }),
+		uniform: device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+		pipelines: new Map<GPUTextureFormat, GPURenderPipeline>(),
+		preferred: navigator.gpu.getPreferredCanvasFormat(),
+	};
+	const model = await calibrate(base);
+	if (!model) return undefined;
+	return { ...base, model };
 }
 
 // Holds what arrives while the WebGPU probe runs, then replays it into whichever painter wins.
@@ -660,15 +735,15 @@ class PendingPainter implements Painter {
 }
 
 // Pick the worker painter when possible, falling back to the main thread on any setup failure.
-function createPainter(canvas: HTMLCanvasElement): Painter {
+function createPainter(canvas: HTMLCanvasElement, painted: () => void): Painter {
 	if (canUseWorker(canvas)) {
 		try {
-			return new WorkerPainter(canvas);
+			return new WorkerPainter(canvas, painted);
 		} catch (err) {
 			console.warn("moq-watch: offscreen render worker unavailable, painting on the main thread", err);
 		}
 	}
-	return new MainPainter(canvas);
+	return new MainPainter(canvas, painted);
 }
 
 // Whether the canvas sits on a display that can show HDR right now.
@@ -700,6 +775,11 @@ export class Renderer {
 
 	// Which surface paints the video, once the painter has settled on one.
 	readonly path = new Signal<PaintPath | undefined>(undefined);
+
+	// How many decoded frames have reached the canvas, each counted once when it is first painted.
+	readonly painted = new Signal<number>(0);
+
+	#onPainted = () => this.painted.update((count) => count + 1);
 
 	// The active painter for the current canvas (worker, main thread, or pending a probe).
 	#painter = new Signal<Painter | undefined>(undefined);
@@ -744,7 +824,7 @@ export class Renderer {
 		});
 
 		if (!this.hdr.peek() || !displayIsHdr()) {
-			live = createPainter(canvas);
+			live = createPainter(canvas, this.#onPainted);
 			this.#painter.set(live);
 			return;
 		}
@@ -752,13 +832,13 @@ export class Renderer {
 		const pending = new PendingPainter();
 		live = pending;
 		this.#painter.set(pending);
-		GpuPainter.create(canvas).then(
+		GpuPainter.create(canvas, this.#onPainted).then(
 			(gpu) => {
 				if (cancelled) {
 					gpu?.close();
 					return;
 				}
-				const painter = gpu ?? createPainter(canvas);
+				const painter = gpu ?? createPainter(canvas, this.#onPainted);
 				pending.handOver(painter);
 				live = painter;
 				this.#painter.set(painter);
@@ -766,7 +846,7 @@ export class Renderer {
 			(err) => {
 				if (cancelled) return;
 				console.warn("moq-watch: webgpu unavailable, painting through the 2d canvas", err);
-				const painter = createPainter(canvas);
+				const painter = createPainter(canvas, this.#onPainted);
 				pending.handOver(painter);
 				live = painter;
 				this.#painter.set(painter);

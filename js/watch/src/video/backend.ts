@@ -26,7 +26,7 @@ export interface Backend {
 
 /** Video playback statistics. */
 export interface Stats {
-	/** Number of frames decoded. */
+	/** Number of frames received and handed to the decoder. */
 	frameCount: number;
 	/** Number of encoded bytes received. */
 	bytesReceived: number;
