@@ -97,6 +97,13 @@ pub struct Producer<C: Container, R = ()> {
 
 	/// The catalog rendition this media producer owns, when it was created through a catalog.
 	rendition: Option<Box<dyn Rendition<R>>>,
+
+	/// Seals each frame's payload before it is written, for end-to-end encryption.
+	/// `None` leaves payloads in the clear. Set via [`with_transform`](Self::with_transform).
+	transform: Option<std::sync::Arc<dyn super::FrameTransform>>,
+
+	/// The next frame's index within the current group, for the transform's AAD.
+	object: u64,
 }
 
 trait Rendition<R>: Send {
@@ -164,6 +171,8 @@ impl<C: Container> Producer<C> {
 			estimator: crate::catalog::Estimator::new(),
 			bandwidth: None,
 			rendition: None,
+			transform: None,
+			object: 0,
 		}
 	}
 }
@@ -200,6 +209,8 @@ where
 			estimator: rendition.estimator(),
 			bandwidth: None,
 			rendition: Some(Box::new(rendition)),
+			transform: None,
+			object: 0,
 		}
 	}
 
@@ -350,6 +361,14 @@ where
 		self
 	}
 
+	/// Seal each frame's payload through `transform` before writing it, for end-to-end
+	/// encryption. The relay then routes ciphertext it cannot read. Left unset, payloads
+	/// are written in the clear. See [`FrameTransform`](super::FrameTransform).
+	pub fn with_transform(mut self, transform: std::sync::Arc<dyn super::FrameTransform>) -> Self {
+		self.transform = Some(transform);
+		self
+	}
+
 	/// Report each written frame and finished group through `recorder`, enrolling this track in
 	/// its timeline so consumers can index the media without downloading it.
 	///
@@ -406,7 +425,7 @@ where
 	/// without writing, the way an oversized frame is refused. That is a restart, which is a new
 	/// broadcast. Frames may still dip below the previous group's content: B-frames, open-GOP
 	/// leading pictures, and a keyframe that overlaps the previous group's last frame.
-	pub fn write(&mut self, frame: Frame) -> crate::Result<()> {
+	pub fn write(&mut self, mut frame: Frame) -> crate::Result<()> {
 		let floor = match frame.keyframe {
 			true => self.start,
 			false => self.floor,
@@ -448,6 +467,17 @@ where
 			self.floor = self.start;
 			self.start = Some(frame.timestamp);
 			self.group = Some(group);
+			self.object = 0;
+		}
+
+		if let Some(transform) = &self.transform {
+			let context = super::FrameContext {
+				track: self.inner.name(),
+				group: self.group.as_ref().map_or(0, |group| group.sequence),
+				object: self.object,
+			};
+			frame.payload = transform.transform(context, frame.payload);
+			self.object += 1;
 		}
 
 		// Buffer or write the frame.

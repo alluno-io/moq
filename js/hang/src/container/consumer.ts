@@ -6,6 +6,18 @@ import type { Format } from "./format";
 import { Jitter } from "./jitter";
 import type { BufferedRanges, ReceivedFrame } from "./types";
 
+/**
+ * Unseals one media frame's payload for end-to-end encryption, given its position on the
+ * wire (track name, group sequence, object index) to bind as AEAD associated data. Runs on
+ * the payload after the container framing is stripped, before the decoder sees it. The
+ * mirror of the Rust `moq-mux` publish-side `FrameTransform`. Left unset, frames pass
+ * through in the clear.
+ */
+export type FrameDecrypt = (
+	payload: Uint8Array,
+	ctx: { track: string; group: number; object: number },
+) => Promise<Uint8Array>;
+
 /** Options for constructing a {@link Consumer}; the obsolete `maxAge` prop is refused. */
 export interface ConsumerProps {
 	/** The container format used to decode each MoQ frame. */
@@ -19,6 +31,8 @@ export interface ConsumerProps {
 	 */
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxDelay?: GetterInit<Time.Milli>;
+	/** Unseals each frame payload for E2EE; see {@link FrameDecrypt}. Omit for cleartext. */
+	decrypt?: FrameDecrypt;
 }
 
 /** One item of a {@link Consumer.next} read, in delivery order. Mirrors Rust's `container::Read`. */
@@ -93,6 +107,7 @@ export class Consumer {
 	#track: Moq.Track.Subscriber;
 	#format: Format;
 	#maxDelay: Getter<Time.Milli>;
+	#decrypt?: FrameDecrypt;
 	#groups: Group[] = [];
 	#active?: number; // the active group sequence number
 	// Presentation end (max PTS + duration) of the group we most recently advanced past, so next()'s
@@ -142,6 +157,7 @@ export class Consumer {
 		this.#track = track;
 		this.#format = props.format;
 		this.#maxDelay = getter(props.maxDelay ?? Moq.Time.Milli.zero);
+		this.#decrypt = props.decrypt;
 
 		this.#signals.spawn(this.#run.bind(this));
 		this.#signals.cleanup(() => {
@@ -219,9 +235,17 @@ export class Consumer {
 						this.#jitter.observe(arrival, Moq.Time.Milli.fromMicro(sample.timestamp));
 						this.#spread.set(this.#jitter.measured);
 					}
+					const payload =
+						!marker && this.#decrypt
+							? await this.#decrypt(sample.payload, {
+									track: this.#track.name,
+									group: group.consumer.sequence,
+									object: index,
+								})
+							: sample.payload;
 					const frame: ReceivedFrame = {
 						arrival,
-						payload: sample.payload,
+						payload,
 						timestamp: sample.timestamp,
 						// Protocol invariant: groups always start at a keyframe.
 						// For index 0, we enforce this regardless of what the format reports.

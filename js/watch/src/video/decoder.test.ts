@@ -446,7 +446,7 @@ for (const kind of ["legacy", "cmaf"] as const) {
 					timestamp: Time.Milli(timestamp),
 				});
 			// Rejected payloads were still received, but never counted as frames.
-			expect(playback.decoder.out.stats.peek()).toEqual({ frameCount: 3, bytesReceived: 5 });
+			expect(playback.decoder.out.stats.peek()).toEqual({ frameCount: 3, bytesReceived: 5, droppedCount: 0 });
 		} finally {
 			playback.close();
 		}

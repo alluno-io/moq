@@ -33,6 +33,8 @@ pub enum Keys {
 	Dir(PathBuf),
 	/// A JWK Set file, selected by the token's `kid`.
 	Set(PathBuf),
+	/// One in-memory key built from a raw shared secret; a token's `kid` is not checked.
+	Secret(Box<Key>),
 }
 
 /// Caps on live sessions, counted from `connect` and `end` events.
@@ -184,6 +186,7 @@ impl Policy {
 				.await
 				.map_err(|_| Refusal::UnknownKey)?
 				.verify(jwt),
+			Keys::Secret(key) => key.verify(jwt),
 			Keys::Dir(dir) => {
 				let header = jsonwebtoken::decode_header(jwt).map_err(|err| Refusal::InvalidToken(err.to_string()))?;
 				let kid = header.kid.ok_or(Refusal::MissingKeyId)?;

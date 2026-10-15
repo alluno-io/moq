@@ -310,6 +310,22 @@ impl Key {
 		}
 	}
 
+	/// Build an HS256 key from a raw shared secret; the bytes are used directly as
+	/// the HMAC key, with no base64url or JWK wrapper.
+	pub fn from_secret(secret: impl Into<Vec<u8>>) -> Self {
+		Key {
+			jwk: Jwk {
+				algorithm: Algorithm::HS256,
+				operations: sign_verify(),
+				material: KeyMaterial::OCT { secret: secret.into() },
+				kid: None,
+				scope: None,
+			},
+			decode: OnceLock::new(),
+			encode: OnceLock::new(),
+		}
+	}
+
 	/// Load a key from a file, auto-detecting JSON or base64url encoding.
 	pub fn from_file<P: AsRef<StdPath>>(path: P) -> crate::Result<Self> {
 		let contents = std::fs::read_to_string(&path)?;

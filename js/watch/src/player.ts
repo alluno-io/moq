@@ -1,4 +1,5 @@
 import type * as Catalog from "@moq/hang/catalog";
+import type * as Container from "@moq/hang/container";
 import type * as Moq from "@moq/net";
 import { Path, Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
@@ -46,6 +47,14 @@ export type PlayerInput = {
 	target: Getter<Video.Target | undefined>;
 	/** Selected caption track, or undefined for off. */
 	captions: Getter<string | undefined>;
+	/** WebCodecs hardware-acceleration preference for video decode. */
+	hardwareAcceleration: Getter<Video.HardwareAcceleration>;
+	/** Video decode errors recovered in place before the failure is reported; see the video decoder's `recover`. */
+	recover: Getter<number>;
+	/** Unseals each media frame for end-to-end encryption, or undefined for cleartext. */
+	decrypt: Getter<Container.FrameDecrypt | undefined>;
+	/** Present PQ video in HDR on an HDR display when the browser can. */
+	hdr: Getter<boolean>;
 };
 
 /** Constructor options for {@link Player}; omitted controls use the element defaults. */
@@ -99,6 +108,10 @@ export class Player {
 			buffer: getter(props.buffer ?? Time.Milli.zero),
 			target: getter<Video.Target | undefined>(props.target),
 			captions: getter<string | undefined>(props.captions),
+			hardwareAcceleration: getter(props.hardwareAcceleration ?? "no-preference"),
+			recover: getter(props.recover ?? 0),
+			decrypt: getter<Container.FrameDecrypt | undefined>(props.decrypt),
+			hdr: getter(props.hdr ?? true),
 		});
 
 		this.broadcast = new Broadcast(this.in);
@@ -125,8 +138,20 @@ export class Player {
 		this.sync = new Sync({ delay: this.in.delay, buffer: this.in.buffer });
 		this.#signals.cleanup(() => this.sync.close());
 
-		this.video = new Video.Decoder({ source: videoSource, sync: this.sync, enabled: this.#videoEnabled });
-		this.audio = new Audio.Decoder({ source: audioSource, sync: this.sync, enabled: this.#audioEnabled });
+		this.video = new Video.Decoder({
+			source: videoSource,
+			sync: this.sync,
+			enabled: this.#videoEnabled,
+			hardwareAcceleration: this.in.hardwareAcceleration,
+			recover: this.in.recover,
+			decrypt: this.in.decrypt,
+		});
+		this.audio = new Audio.Decoder({
+			source: audioSource,
+			sync: this.sync,
+			enabled: this.#audioEnabled,
+			decrypt: this.in.decrypt,
+		});
 		this.#signals.cleanup(() => {
 			this.video.close();
 			this.audio.close();
@@ -147,6 +172,7 @@ export class Player {
 			canvas: this.in.canvas,
 			visible: this.in.visible,
 			backend: this.in.backend,
+			hdr: this.in.hdr,
 		});
 		this.#signals.cleanup(() => {
 			this.emitter.close();

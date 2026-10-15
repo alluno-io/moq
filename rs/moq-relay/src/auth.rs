@@ -98,6 +98,13 @@ pub struct Config {
 	#[usage(skip)]
 	#[serde(skip_serializing)]
 	pub(crate) tls: Option<serde::de::IgnoredAny>,
+
+	/// A raw shared secret that verifies HS256 JWTs in process: its bytes are the HMAC key
+	/// and no `kid` is required. Combines with the `--auth-public` patterns for anonymous
+	/// sessions and excludes `--auth-url`.
+	#[usage(long = "auth-secret", env = "MOQ_AUTH_SECRET", setting = "auth.secret")]
+	#[serde(skip_serializing)]
+	pub secret: Option<String>,
 }
 
 /// The `--auth-*` flags 0.14 had and #3688 removed, with their env vars: a relay
@@ -240,7 +247,7 @@ impl Config {
 	/// [`Relay::load`](crate::Relay::load) hands its sessions to the embedder as
 	/// [`Admissions`], and [`validate`](Self::validate) refuses it for a binary.
 	pub fn is_empty(&self) -> bool {
-		self.url.is_none() && self.public_grant().is_none()
+		self.url.is_none() && self.secret.is_none() && self.public_grant().is_none()
 	}
 
 	/// Refuse a configuration that admits nobody, that names both a server and a
@@ -269,7 +276,11 @@ impl Config {
 			}
 		}
 		match (&self.url, self.public_grant()) {
+			(Some(_), _) if self.secret.is_some() => {
+				anyhow::bail!("--auth-url and --auth-secret cannot both be set; the server decides")
+			}
 			(Some(_), Some(_)) => anyhow::bail!("--auth-url and --auth-public cannot both be set; the server decides"),
+			(None, None) if self.secret.is_some() => Ok(()),
 			(None, None) => anyhow::bail!(
 				"no --auth-url or --auth-public configured; nobody can authenticate (a client certificate admits nothing on its own)"
 			),
@@ -292,6 +303,7 @@ impl Config {
 	) -> anyhow::Result<Auth> {
 		self.validate(client_ca)?;
 		let decider = match (&self.url, self.public_grant()) {
+			_ if self.secret.is_some() => Decider::Policy(Arc::new(self.secret_policy())),
 			(Some(url), _) => {
 				let tls = tls.build()?;
 				Decider::Server(moq_auth::Client::new(url.clone(), Some(tls))?)
@@ -307,6 +319,16 @@ impl Config {
 		auth.in_band = matches!(decider, Decider::Server(_));
 		decider.spawn(admissions);
 		Ok(auth)
+	}
+
+	fn secret_policy(&self) -> moq_auth::serve::Policy {
+		let secret = self.secret.clone().unwrap_or_default();
+		let publish: Patterns = self.public.iter().chain(&self.public_publish).cloned().collect();
+		let subscribe: Patterns = self.public.iter().chain(&self.public_subscribe).cloned().collect();
+		let mut policy = moq_auth::serve::Policy::default();
+		policy.keys = Some(moq_auth::serve::Keys::Secret(Box::new(moq_auth::Key::from_secret(secret.into_bytes()))));
+		policy.public = moq_auth::Permissions::new(publish, subscribe);
+		policy
 	}
 }
 
@@ -638,6 +660,7 @@ enum Decider {
 	Server(moq_auth::Client),
 	/// The public rules, as a token with an empty root.
 	Public(moq_auth::Claims),
+	Policy(Arc<moq_auth::serve::Policy>),
 	Refuse,
 }
 
@@ -678,6 +701,18 @@ impl Decider {
 							admission.refuse(Error::Refused);
 						}
 					},
+					Self::Policy(policy) => {
+						let policy = policy.clone();
+						tokio::spawn(async move {
+							match policy.decide(&admission.request).await {
+								Ok(grant) => admission.grant(lease::Consumer::fixed(grant)),
+								Err(refusal) => {
+									tracing::debug!(%refusal, "session refused");
+									admission.refuse(Error::Refused);
+								}
+							}
+						});
+					}
 					Self::Refuse => admission.refuse(Error::Refused),
 				}
 			}

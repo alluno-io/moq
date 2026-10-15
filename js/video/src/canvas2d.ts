@@ -8,9 +8,10 @@ export class Canvas2D {
 		this.#ctx = ctx;
 	}
 
-	/** Draw `frame`, or clear to black without one. */
-	draw(frame: VideoFrame | undefined, presentation: Presentation | undefined) {
+	/** Draw `frame`, or clear to black without one. Draws nothing and returns false while the context is lost. */
+	draw(frame: VideoFrame | undefined, presentation: Presentation | undefined): boolean {
 		const ctx = this.#ctx;
+		if (ctx.isContextLost?.()) return false;
 		const { width, height } = ctx.canvas;
 
 		ctx.save();
@@ -24,6 +25,7 @@ export class Canvas2D {
 		}
 
 		ctx.restore();
+		return true;
 	}
 
 	close() {}

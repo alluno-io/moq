@@ -61,7 +61,7 @@ http-body = "1.0.1"
 http-cache-reqwest = { version = "1.0.0-alpha.6", features = ["manager-moka", "reqwest-middleware", "url-standard"], default-features = false }
 humantime = { workspace = true }
 hyper-util = { workspace = true }
-moq-auth = { workspace = true, features = ["client"] }
+moq-auth = { workspace = true, features = ["client", "serve"] }
 moq-net = { workspace = true }
 moq-stats = { workspace = true }
 moq-tokio = { workspace = true, default-features = false, features = ["aws-lc-rs", "watch", "tcp"] }

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Signal } from "@moq/signals";
+import { PQ_CALIBRATION } from "./hdr";
 import { type Backend, Renderer } from "./renderer";
 
 // Let the probe's promise chain and the effects it wakes run to completion.
@@ -10,7 +11,7 @@ async function settle(): Promise<void> {
 type Kind = "2d" | "webgpu";
 
 // A canvas that, like a real one, keeps the first kind of context it hands out.
-class FakeCanvas {
+class FakeCanvas extends EventTarget {
 	width = 640;
 	height = 360;
 	kind?: Kind;
@@ -18,6 +19,7 @@ class FakeCanvas {
 	transforms: number[][] = [];
 	configured: GPUCanvasConfiguration[] = [];
 	unconfigured = 0;
+	lost = false;
 
 	getContext(kind: Kind): unknown {
 		if (this.kind && this.kind !== kind) return null;
@@ -31,6 +33,7 @@ class FakeCanvas {
 				fillRect: () => {},
 				setTransform: (...matrix: number[]) => this.transforms.push(matrix),
 				drawImage: (...args: unknown[]) => this.draws.push(args),
+				isContextLost: () => this.lost,
 			};
 		}
 		return {
@@ -42,22 +45,39 @@ class FakeCanvas {
 	}
 }
 
-type DeviceOptions = { importThrows?: boolean; importInvalid?: boolean };
+type DeviceOptions = { importThrows?: boolean; importInvalid?: boolean; calibration?: number[] };
+
+function half(value: number): number {
+	const bits = new Uint32Array(new Float32Array([value]).buffer)[0];
+	const sign = (bits >> 16) & 0x8000;
+	const exponent = ((bits >> 23) & 0xff) - 112;
+	if (exponent <= 0) return sign;
+	if (exponent >= 31) return sign | 0x7c00;
+	return sign | (exponent << 10) | ((bits & 0x7fffff) >> 13);
+}
 
 // Just enough of a GPUDevice for the probe and one pipeline.
 class FakeDevice {
 	destroyed = false;
 	draws = 0;
 	imports: unknown[] = [];
+	writes: Float32Array[] = [];
 	options: DeviceOptions;
 	#lose!: (info: { reason: string; message: string }) => void;
 	lost = new Promise<{ reason: string; message: string }>((resolve) => {
 		this.#lose = resolve;
 	});
 	#invalid?: { message: string };
+	#samples: number[];
 
 	constructor(options: DeviceOptions = {}) {
 		this.options = options;
+		this.#samples = [...(options.calibration ?? [])];
+	}
+
+	createTexture() {
+		if (!this.options.calibration) throw new Error("no readback in this test");
+		return { createView: () => ({}), destroy: () => {} };
 	}
 
 	lose() {
@@ -97,7 +117,15 @@ class FakeDevice {
 	}
 
 	createBuffer() {
-		return { destroy: () => {} };
+		let sample = Number.NaN;
+		return {
+			destroy: () => {},
+			mapAsync: async () => {
+				sample = this.#samples.shift() ?? Number.NaN;
+			},
+			getMappedRange: () => new Uint16Array([half(sample)]).buffer,
+			unmap: () => {},
+		};
 	}
 
 	createBindGroup() {
@@ -112,11 +140,15 @@ class FakeDevice {
 				draw: () => this.draws++,
 				end: () => {},
 			}),
+			copyTextureToBuffer: () => {},
 			finish: () => ({}),
 		};
 	}
 
-	queue = { writeBuffer: () => {}, submit: () => {} };
+	queue = {
+		writeBuffer: (_buffer: unknown, _offset: number, data: Float32Array) => this.writes.push(data),
+		submit: () => {},
+	};
 }
 
 type AdapterOptions = { fallback?: boolean; legacyFallback?: boolean; deviceThrows?: boolean; device?: DeviceOptions };
@@ -147,16 +179,37 @@ class Gpu {
 	}
 }
 
-function frame(timestamp = 1_000): VideoFrame {
+function frame(timestamp = 1_000, colorSpace: object = { primaries: "bt709" }): VideoFrame {
 	return {
 		timestamp,
-		colorSpace: { primaries: "bt709" },
+		colorSpace,
 		clone() {
 			return this;
 		},
 		close() {},
 	} as unknown as VideoFrame;
 }
+
+function pqFrame(): VideoFrame {
+	return frame(1_000, { primaries: "bt2020", transfer: "pq", matrix: "bt2020-ncl", fullRange: false });
+}
+
+class FakeQuery extends EventTarget {
+	matches: boolean;
+
+	constructor(matches: boolean) {
+		super();
+		this.matches = matches;
+	}
+
+	change(matches: boolean) {
+		this.matches = matches;
+		this.dispatchEvent(new Event("change"));
+	}
+}
+
+const SIGNAL = PQ_CALIBRATION.map((patch) => patch.signal);
+const NATIVE = PQ_CALIBRATION.map((patch) => Math.min(patch.native, 1));
 
 describe("Renderer", () => {
 	let callbacks: Map<number, FrameRequestCallback>;
@@ -215,6 +268,99 @@ describe("Renderer", () => {
 			backend,
 		});
 	}
+
+	describe("painted", () => {
+		function create2d(
+			canvas: FakeCanvas,
+			source: Signal<VideoFrame | undefined>,
+			display?: Signal<{ width: number; height: number }>,
+		) {
+			return new Renderer({
+				canvas: canvas as unknown as HTMLCanvasElement,
+				frame: source,
+				display,
+				backend: "2d",
+			});
+		}
+
+		it("counts a frame once it is painted, not when it is handed over", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				expect(renderer.out.painted.peek()).toBe(0);
+				paint();
+				expect(renderer.out.painted.peek()).toBe(1);
+
+				source.set(frame(2_000));
+				await settle();
+				expect(renderer.out.painted.peek()).toBe(1);
+				paint();
+				expect(renderer.out.painted.peek()).toBe(2);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("counts each frame once however often it is repainted", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const display = new Signal({ width: 640, height: 360 });
+			const renderer = create2d(canvas, source, display);
+			try {
+				await settle();
+				paint();
+				display.set({ width: 320, height: 180 });
+				await settle();
+				paint();
+				expect(canvas.draws).toHaveLength(2);
+				expect(renderer.out.painted.peek()).toBe(1);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("counts frames that land within one refresh as the one painted", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				paint();
+				source.set(frame(2_000));
+				source.set(frame(3_000));
+				await settle();
+				expect(paint()).toBe(1);
+				expect(renderer.out.painted.peek()).toBe(2);
+				expect(renderer.out.frame.peek()?.timestamp).toBe(3_000);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("paints and counts nothing while the 2d context is lost, and repaints once it is restored", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				canvas.lost = true;
+				paint();
+				expect(canvas.draws).toHaveLength(0);
+				expect(renderer.out.painted.peek()).toBe(0);
+
+				canvas.lost = false;
+				canvas.dispatchEvent(new Event("contextrestored"));
+				await settle();
+				paint();
+				expect(canvas.draws).toHaveLength(1);
+				expect(renderer.out.painted.peek()).toBe(1);
+			} finally {
+				renderer.close();
+			}
+		});
+	});
 
 	it("picks WebGPU where it can import a VideoFrame", async () => {
 		gpu.adapters = [{}];
@@ -374,5 +520,239 @@ describe("Renderer", () => {
 		} finally {
 			renderer.close();
 		}
+	});
+
+	describe("hdr", () => {
+		let display: FakeQuery;
+
+		function setup(
+			options: { calibration?: number[]; display?: boolean; extended?: boolean; element?: boolean } = {},
+		) {
+			gpu.adapters = [{ device: { calibration: options.calibration ?? SIGNAL } }];
+			display = new FakeQuery(options.display ?? true);
+			stub(globalThis, "matchMedia", () => display);
+			const extended = options.extended ?? true;
+			stub(
+				globalThis,
+				"OffscreenCanvas",
+				class {
+					getContext() {
+						let config: GPUCanvasConfiguration | undefined;
+						return {
+							configure: (next: GPUCanvasConfiguration) => {
+								config = next;
+							},
+							getConfiguration: () =>
+								extended ? config : { ...config, toneMapping: { mode: "standard" } },
+							unconfigure: () => {},
+						};
+					}
+				},
+			);
+			if (options.element ?? true) stub(globalThis, "HTMLCanvasElement", FakeCanvas);
+		}
+
+		function render(canvas: FakeCanvas, source: VideoFrame, hdr: boolean | Signal<boolean> = true) {
+			return new Renderer({ canvas: canvas as unknown as HTMLCanvasElement, frame: source, hdr });
+		}
+
+		function tone(): number | undefined {
+			return gpu.devices[0].writes.at(-1)?.[8];
+		}
+
+		it("presents PQ video in HDR on an HDR display", async () => {
+			setup();
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "rgba16float",
+					colorSpace: "srgb",
+					toneMapping: { mode: "extended" },
+				});
+				expect(tone()).toBe(1);
+				expect(renderer.out.hdr.peek()).toBe(true);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("rolls PQ highlights off into SDR on an SDR display", async () => {
+			setup({ display: false });
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "bgra8unorm",
+					toneMapping: { mode: "standard" },
+				});
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("follows the display out of HDR and back", async () => {
+			setup();
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				paint();
+				expect(renderer.out.hdr.peek()).toBe(true);
+
+				display.change(false);
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "bgra8unorm",
+					toneMapping: { mode: "standard" },
+				});
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+
+				display.change(true);
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "rgba16float",
+					toneMapping: { mode: "extended" },
+				});
+				expect(tone()).toBe(1);
+				expect(renderer.out.hdr.peek()).toBe(true);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("keeps SDR video as it is on an HDR display", async () => {
+			setup();
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, frame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "bgra8unorm",
+					toneMapping: { mode: "standard" },
+				});
+				expect(tone()).toBe(0);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("keeps PQ in SDR while hdr is off, and presents it once hdr is on", async () => {
+			setup();
+			const canvas = new FakeCanvas();
+			const hdr = new Signal(false);
+			const renderer = render(canvas, pqFrame(), hdr);
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+
+				hdr.set(true);
+				await settle();
+				expect(paint()).toBe(1);
+				expect(tone()).toBe(1);
+				expect(renderer.out.hdr.peek()).toBe(true);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("passes PQ through untouched when the import model cannot be measured", async () => {
+			setup({ calibration: [0.1, 0.1] });
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "bgra8unorm",
+					toneMapping: { mode: "standard" },
+				});
+				expect(tone()).toBe(0);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("uses the browser's own PQ conversion when it applies one", async () => {
+			setup({ calibration: NATIVE });
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "rgba16float",
+					toneMapping: { mode: "extended" },
+				});
+				expect(tone()).toBe(0);
+				expect(renderer.out.hdr.peek()).toBe(true);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("rolls off instead of presenting HDR where extended tone mapping is unavailable", async () => {
+			setup({ extended: false });
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({ format: "bgra8unorm" });
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("never presents HDR on a canvas outside the document", async () => {
+			setup({ element: false });
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({ format: "bgra8unorm" });
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("measures the import again on a replacement device", async () => {
+			setup();
+			gpu.adapters = [{ device: { calibration: SIGNAL } }, { device: { calibration: [0.1, 0.1] } }];
+			const canvas = new FakeCanvas();
+			const renderer = render(canvas, pqFrame());
+			try {
+				await settle();
+				paint();
+				expect(renderer.out.hdr.peek()).toBe(true);
+
+				gpu.devices[0].lose();
+				await settle();
+				expect(paint()).toBe(1);
+				expect(gpu.devices[1].writes.at(-1)?.[8]).toBe(0);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
 	});
 });

@@ -27,6 +27,9 @@ export type EmitterProps = Inputs<EmitterInput> & {
 type EmitterOutput = {
 	// Whether audio should be downloaded. Wired into the decoder's `enabled` input by the owner.
 	enabled: Signal<boolean>;
+
+	// Output audio level (RMS, 0..1), tapped from the gain node for a stats meter.
+	level: Signal<number>;
 };
 
 // A helper that emits audio directly to the speakers.
@@ -40,6 +43,7 @@ export class Emitter {
 
 	readonly #out: EmitterOutput = {
 		enabled: new Signal<boolean>(false),
+		level: new Signal<number>(0),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -74,6 +78,23 @@ export class Emitter {
 
 			effect.set(this.#gain, gain);
 
+			// Tap the post-gain signal with an analyser and poll its RMS so embedders
+			// can show an output-level meter. The analyser is a dead-end (not routed to
+			// the speakers), so it only measures, never doubles the audio.
+			const analyser = new AnalyserNode(root.context, { fftSize: 256, smoothingTimeConstant: 0.5 });
+			gain.connect(analyser);
+			const samples = new Float32Array(analyser.fftSize);
+			effect.interval(() => {
+				analyser.getFloatTimeDomainData(samples);
+				let sum = 0;
+				for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+				this.#out.level.set(Math.sqrt(sum / samples.length));
+			}, 100);
+			effect.cleanup(() => {
+				gain.disconnect(analyser);
+				this.#out.level.set(0);
+			});
+
 			effect.run((inner) => {
 				// We only connect/disconnect when enabled to save power.
 				// Otherwise the worklet keeps running in the background returning 0s.
@@ -81,7 +102,7 @@ export class Emitter {
 				if (!enabled) return;
 
 				gain.connect(root.context.destination); // speakers
-				inner.cleanup(() => gain.disconnect());
+				inner.cleanup(() => gain.disconnect(root.context.destination));
 			});
 		});
 

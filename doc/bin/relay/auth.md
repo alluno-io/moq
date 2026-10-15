@@ -337,6 +337,20 @@ scoped session as a native connection. See
 [docs.rs/moq-relay](https://docs.rs/moq-relay) and
 [moq-auth](/lib/rs/moq-auth).
 
+### Shared secret
+
+`--auth-secret` (`[auth] secret`) runs the same policy inside the relay with no
+server: a `jwt` is verified against the raw secret, whose bytes are the HS256
+HMAC key (no `kid`, no JWK wrapper), and a session without one gets the
+`--auth-public` patterns. It excludes `--auth-url`. A token's `exp` closes its
+session; an anonymous session is not cut off.
+
+```toml
+[auth]
+secret = "your-shared-secret"
+public = "anon/**"
+```
+
 ## Stream listeners
 
 The plaintext TCP and Unix-socket listeners are admitted exactly like QUIC:

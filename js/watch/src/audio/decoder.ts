@@ -34,6 +34,12 @@ const LEGACY_WARMUP_CALLBACKS = 3;
 export type DecoderInput = {
 	// Whether to download the audio track. Defaults to true.
 	enabled: Getter<boolean>;
+
+	/**
+	 * Unseals each frame payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
+	 * A change rebuilds the subscription. Undefined for cleartext.
+	 */
+	decrypt: Getter<Container.FrameDecrypt | undefined>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -150,6 +156,7 @@ export class Decoder {
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
+			decrypt: getter(props?.decrypt),
 		};
 
 		this.source = props.source;
@@ -387,6 +394,7 @@ export class Decoder {
 		// of tail beyond them. Drop that once the replacement's first frame says where it starts.
 		this.#handover.opened();
 
+		const decrypt = effect.get(this.in.decrypt);
 		effect.run((run) => {
 			attempt = run;
 			const sub = subscribeMedia(run, {
@@ -398,9 +406,9 @@ export class Decoder {
 			if (!sub) return;
 
 			if (config.container.kind === "cmaf") {
-				this.#runCmafDecoder(run, sub, { config, failure });
+				this.#runCmafDecoder(run, sub, { config, failure, decrypt });
 			} else {
-				this.#runLegacyDecoder(run, sub, { config, failure });
+				this.#runLegacyDecoder(run, sub, { config, failure, decrypt });
 			}
 		});
 	}
@@ -408,7 +416,7 @@ export class Decoder {
 	#runLegacyDecoder(
 		effect: Effect,
 		sub: Moq.Track.Subscriber,
-		{ config, failure }: { config: DecoderConfig; failure: Signal<Error | undefined> },
+		{ config, failure, decrypt }: { config: DecoderConfig; failure: Signal<Error | undefined>; decrypt: Container.FrameDecrypt | undefined },
 	): void {
 		const preSkip =
 			config.codec === "opus" && config.description ? Util.Opus.preSkip(Util.Hex.toBytes(config.description)) : 0;
@@ -420,6 +428,7 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxDelay: this.sync.out.maxDelay,
+			decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -521,7 +530,7 @@ export class Decoder {
 	#runCmafDecoder(
 		effect: Effect,
 		sub: Moq.Track.Subscriber,
-		{ config, failure }: { config: DecoderConfig; failure: Signal<Error | undefined> },
+		{ config, failure, decrypt }: { config: DecoderConfig; failure: Signal<Error | undefined>; decrypt: Container.FrameDecrypt | undefined },
 	): void {
 		if (config.container.kind !== "cmaf") return; // just to help typescript
 
@@ -542,6 +551,7 @@ export class Decoder {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxDelay: this.sync.out.maxDelay,
+			decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 

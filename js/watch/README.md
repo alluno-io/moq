@@ -75,6 +75,8 @@ The simplest way to watch a stream:
 | `buffer`         | duration                   | `0ms`         | Future-dated media held before playback skips ahead. |
 | `captions`       | string                     | off           | Text rendition to render. |
 | `catalog-format` | hang, hangz, msf, manual   | auto-detected | The catalog format; detected from the name suffix unless set. `hangz` (compressed) is opt-in. |
+| `hardware-acceleration` | no-preference, prefer-hardware, prefer-software | `no-preference` | WebCodecs decode preference. `prefer-hardware` has no software fallback. |
+| `hdr`            | boolean                    | true          | Present PQ (HDR10) video in HDR when the canvas sits on an HDR display and the browser can paint it through WebGPU on the main thread (Chromium). Elsewhere the 2D canvas worker tone-maps to SDR. Read when the canvas is attached. |
 
 The `visible` attribute controls when the video track is downloaded, based on the canvas
 position relative to the viewport:

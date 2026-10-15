@@ -1,0 +1,51 @@
+name: Relay (GHCR)
+
+# Manual only: rebuild moq-relay from this fork and push it to GHCR as :latest.
+# alluno-desktop (git dep on this fork) and the swarm relay track this fork, so
+# run this after pushing fork changes to roll the relay image forward.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Relay node architecture
+        type: choice
+        default: linux/amd64
+        options:
+          - linux/amd64
+          - linux/arm64
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/moq-relay
+
+jobs:
+  build:
+    name: Build & push moq-relay
+    # Match the runner arch to the target so the Nix build runs natively (no QEMU).
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The root Dockerfile runs `nix build .#${package}` and sets the relay entrypoint.
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-args: |
+            package=moq-relay
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}

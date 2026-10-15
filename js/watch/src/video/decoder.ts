@@ -32,9 +32,45 @@ import type { Source } from "./source";
 // The amount of time to wait before considering the video to be buffering.
 const BUFFERING = Time.Milli(500);
 
+// Bounded in-place recovery for video decode errors: instead of tearing the track
+// down on the first error (a permanent freeze), the decoder reconfigures and
+// resubscribes, resuming at the next keyframe group. Gives up after the `recover`
+// input's count of errors within RECOVER_WINDOW_MS so a persistently broken stream
+// doesn't hot-loop.
+const RECOVER_WINDOW_MS = 8000;
+
+/**
+ * WebCodecs hardware-acceleration preference (the `HardwarePreference` enum from
+ * `VideoDecoder.configure`). Declared locally because the WebCodecs DOM lib types
+ * aren't guaranteed to be present in every consumer's `tsconfig`.
+ */
+export type HardwareAcceleration = "no-preference" | "prefer-hardware" | "prefer-software";
+
 export type DecoderInput = {
 	/** Whether to download the video track. Defaults to true; the parent may wire it from the renderer's output. */
 	enabled: Getter<boolean>;
+
+	/**
+	 * WebCodecs hardware-acceleration preference passed to `VideoDecoder.configure`.
+	 * Defaults to `"no-preference"`, which uses a hardware decoder when one is available
+	 * and falls back to software otherwise (the best-available path). `"prefer-hardware"`
+	 * does NOT fall back: on a software SwiftShader GPU (blocklisted, accel disabled, RDP,
+	 * bad driver) it fails to produce frames, so video stalls while audio keeps playing.
+	 * `"prefer-software"` forces software decode.
+	 */
+	hardwareAcceleration: Getter<HardwareAcceleration>;
+
+	/**
+	 * How many decode errors within {@link RECOVER_WINDOW_MS} are recovered in place, by a fresh
+	 * decoder resubscribing from the next keyframe, before the failure is reported. Defaults to 0.
+	 */
+	recover: Getter<number>;
+
+	/**
+	 * Unseals each frame payload for end-to-end encryption; see {@link Container.FrameDecrypt}.
+	 * A change rebuilds the subscription. Undefined for cleartext.
+	 */
+	decrypt: Getter<Container.FrameDecrypt | undefined>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -52,6 +88,9 @@ export interface Stats {
 
 	/** Number of encoded bytes received. */
 	bytesReceived: number;
+
+	/** Number of decoded frames dropped as late or stale instead of rendered. */
+	droppedCount?: number;
 }
 
 type DecoderOutput = {
@@ -125,6 +164,9 @@ export class Decoder {
 	constructor(props: DecoderProps) {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
+			hardwareAcceleration: getter(props?.hardwareAcceleration ?? "no-preference"),
+			recover: getter(props?.recover ?? 0),
+			decrypt: getter(props?.decrypt),
 		};
 
 		this.source = props.source;
@@ -207,6 +249,9 @@ export class Decoder {
 			}
 			return;
 		}
+		const hardwareAcceleration = effect.get(this.in.hardwareAcceleration);
+		const recover = effect.get(this.in.recover);
+		const decrypt = effect.get(this.in.decrypt);
 
 		if (!active || !key) {
 			// Going offline should clear the last rendered frame.
@@ -238,6 +283,9 @@ export class Decoder {
 			identity: key,
 			stats: this.#out.stats,
 			catalog: broadcast.out.catalog,
+			hardwareAcceleration,
+			recover,
+			decrypt,
 		});
 		this.#selected = pending;
 		effect.run((inner) => {
@@ -401,6 +449,9 @@ interface DecoderTrackProps {
 	catalog: Getter<Catalog.Root | undefined>;
 
 	stats: Signal<Stats | undefined>;
+	hardwareAcceleration: HardwareAcceleration;
+	recover: number;
+	decrypt?: Container.FrameDecrypt;
 }
 
 class DecoderTrack {
@@ -434,6 +485,16 @@ class DecoderTrack {
 	// The playhead moved and the next decoded frame decides whether the decoder resets.
 	#resetPending = false;
 
+	#hardwareAcceleration: HardwareAcceleration;
+	#decrypt?: Container.FrameDecrypt;
+
+	// In-place recovery state for decode errors. Bumping #recover re-runs #run
+	// (fresh decoder + resubscribe); the counters bound how often that can happen.
+	#recover = new Signal<number>(0);
+	#recoverMax: number;
+	#recoverAttempts = 0;
+	#recoverAt = 0;
+
 	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
@@ -445,11 +506,24 @@ class DecoderTrack {
 		this.identity = props.identity;
 		this.catalog = props.catalog;
 		this.stats = props.stats;
+		this.#hardwareAcceleration = props.hardwareAcceleration;
+		this.#recoverMax = props.recover;
+		this.#decrypt = props.decrypt;
 
 		this.#signals.run(this.#run.bind(this));
 	}
 
+	#markDropped(): void {
+		this.stats.update((current) => ({
+			frameCount: current?.frameCount ?? 0,
+			bytesReceived: current?.bytesReceived ?? 0,
+			droppedCount: (current?.droppedCount ?? 0) + 1,
+		}));
+	}
+
 	#run(effect: Effect): void {
+		effect.get(this.#recover);
+
 		const sub = subscribeMedia(effect, {
 			broadcast: this.broadcast,
 			track: this.name,
@@ -469,6 +543,7 @@ class DecoderTrack {
 					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
+						this.#markDropped();
 						return;
 					}
 
@@ -488,15 +563,22 @@ class DecoderTrack {
 					const signal = effect.abort;
 					await this.sync.wait(timestamp, signal);
 					if (signal.aborted) return;
-					if (epoch !== this.sync.epoch) return;
+					if (epoch !== this.sync.epoch) {
+						this.#markDropped();
+						return;
+					}
 
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
 						// NOTE: This can happen when the ref is updated, such as on playback start.
+						this.#markDropped();
 						return;
 					}
 
 					this.timestamp.set(timestamp);
+
+					// A rendered frame means decoding is healthy again.
+					this.#recoverAttempts = 0;
 
 					// Trim the decode buffer as frames are rendered
 					this.#trimBuffered(timestamp);
@@ -510,8 +592,20 @@ class DecoderTrack {
 				}
 			},
 			error: (error) => {
-				this.error.set(error);
-				effect.close();
+				const now = performance.now();
+				if (now - this.#recoverAt > RECOVER_WINDOW_MS) this.#recoverAttempts = 0;
+				this.#recoverAt = now;
+
+				if (this.#recoverAttempts >= this.#recoverMax) {
+					this.error.set(error);
+					effect.close();
+					return;
+				}
+
+				this.#recoverAttempts += 1;
+				// Recover in place: #run tears down the dead decoder and resubscribes,
+				// which the relay serves from the next keyframe group.
+				this.#recover.update((n) => n + 1);
 			},
 		});
 		effect.cleanup(() => {
@@ -535,6 +629,7 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format,
 			maxDelay: this.sync.out.maxDelay,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -576,6 +671,7 @@ class DecoderTrack {
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
 					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+					droppedCount: current?.droppedCount ?? 0,
 				}));
 				if (stale) continue;
 
@@ -619,6 +715,7 @@ class DecoderTrack {
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
 			maxDelay: this.sync.out.maxDelay,
+			decrypt: this.#decrypt,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -660,6 +757,7 @@ class DecoderTrack {
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + (stale ? 0 : 1),
 					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
+					droppedCount: current?.droppedCount ?? 0,
 				}));
 				if (stale) continue;
 
@@ -723,6 +821,7 @@ class DecoderTrack {
 			displayAspectWidth: this.config.displayAspectWidth,
 			displayAspectHeight: this.config.displayAspectHeight,
 			optimizeForLatency: this.config.optimizeForLatency,
+			hardwareAcceleration: this.#hardwareAcceleration,
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
 		});

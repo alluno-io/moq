@@ -246,6 +246,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// The minimum flush lateness across this catalog's renditions, which each rendition's
 	/// advertised `delay` is measured against.
 	baseline: super::estimate::Baseline,
+	/// Seals every media producer this catalog builds, for end-to-end encryption. `None`
+	/// leaves media in the clear. See [`Config::with_media_transform`].
+	transform: Option<Arc<dyn crate::container::FrameTransform>>,
 }
 
 // Manual Clone so a producer is cheaply clonable regardless of whether `E` is.
@@ -259,6 +262,7 @@ impl<E: CatalogExt> Clone for Producer<E> {
 			max_age: self.max_age,
 			bandwidth: self.bandwidth.clone(),
 			baseline: self.baseline.clone(),
+			transform: self.transform.clone(),
 		}
 	}
 }
@@ -277,6 +281,7 @@ pub struct Config<E: CatalogExt = ()> {
 	bandwidth: moq_net::bandwidth::Allocator,
 	clock: Option<crate::Clock>,
 	timeline: crate::timeline::Config,
+	transform: Option<Arc<dyn crate::container::FrameTransform>>,
 }
 
 impl Default for Config<()> {
@@ -287,6 +292,7 @@ impl Default for Config<()> {
 			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 			clock: None,
 			timeline: crate::timeline::Config::default(),
+			transform: None,
 		}
 	}
 }
@@ -303,6 +309,7 @@ impl<E: CatalogExt> Config<E> {
 			bandwidth: self.bandwidth,
 			clock: self.clock,
 			timeline: self.timeline,
+			transform: self.transform,
 		}
 	}
 
@@ -352,6 +359,16 @@ impl<E: CatalogExt> Config<E> {
 	/// Cut each media track's timeline with `timeline`; the catalog's own always uses a zero minimum.
 	pub fn with_timeline(mut self, timeline: crate::timeline::Config) -> Self {
 		self.timeline = timeline;
+		self
+	}
+
+	/// Seal every media producer this catalog builds through `transform`, for end-to-end
+	/// encryption. Video and audio share the one transform, so they share its sealing
+	/// counter, which a shared key requires. The catalog's own JSON manifest stays in the
+	/// clear (it is metadata the relay routes on). See
+	/// [`FrameTransform`](crate::container::FrameTransform).
+	pub fn with_media_transform(mut self, transform: Arc<dyn crate::container::FrameTransform>) -> Self {
+		self.transform = Some(transform);
 		self
 	}
 }
@@ -425,6 +442,7 @@ impl<E: CatalogExt> Producer<E> {
 			max_age: config.max_age,
 			bandwidth: config.bandwidth,
 			baseline: Default::default(),
+			transform: config.transform,
 		})
 	}
 
@@ -748,9 +766,11 @@ impl<E: CatalogExt> Producer<E> {
 	{
 		let mut catalog = self.clone();
 		let recorder = catalog.enroll(track.name())?;
-		let mut producer = crate::container::Producer::with_rendition(track, container, rendition)
-			.with_recorder(recorder)
-			.with_bandwidth(self.bandwidth.clone());
+		let mut producer = self.sealed(
+			crate::container::Producer::with_rendition(track, container, rendition)
+				.with_recorder(recorder)
+				.with_bandwidth(self.bandwidth.clone()),
+		);
 		if let Some(config) = config {
 			producer.set(config)?;
 		}
@@ -769,9 +789,24 @@ impl<E: CatalogExt> Producer<E> {
 	{
 		let mut catalog = self.clone();
 		let recorder = catalog.enroll(track.name())?;
-		Ok(crate::container::Producer::new(track, container)
-			.with_recorder(recorder)
-			.with_bandwidth(self.bandwidth.clone()))
+		Ok(self.sealed(
+			crate::container::Producer::new(track, container)
+				.with_recorder(recorder)
+				.with_bandwidth(self.bandwidth.clone()),
+		))
+	}
+
+	fn sealed<C: crate::container::Container, R: Clone + Send + 'static>(
+		&self,
+		producer: crate::container::Producer<C, R>,
+	) -> crate::container::Producer<C, R>
+	where
+		crate::Error: From<C::Error>,
+	{
+		match &self.transform {
+			Some(transform) => producer.with_transform(transform.clone()),
+			None => producer,
+		}
 	}
 
 	/// A fresh estimator whose `delay` is measured against this catalog's other renditions.

@@ -1,7 +1,7 @@
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { Canvas2D } from "./canvas2d";
 import type { Dimensions, Presentation } from "./presentation";
-import { Gpu, probe } from "./webgpu";
+import { Gpu, hdrSupport, probe } from "./webgpu";
 
 /**
  * Which graphics API draws the frames.
@@ -36,6 +36,8 @@ export type RendererInput = {
 	presentation: Getter<Presentation | undefined>;
 	/** Which graphics API to draw with. Defaults to `"auto"`. */
 	backend: Getter<Backend>;
+	/** Whether PQ video may be presented in HDR on an HDR display. Defaults to true. */
+	hdr: Getter<boolean>;
 };
 
 /** Constructor options for {@link Renderer}. */
@@ -47,6 +49,10 @@ export type RendererOutput = {
 	frame: Signal<VideoFrame | undefined>;
 	/** Why drawing stopped, or undefined while healthy. */
 	error: Signal<RendererError | undefined>;
+	/** How many distinct frames have reached the canvas, each counted on its first paint. */
+	painted: Signal<number>;
+	/** Whether the painted frame is presented in HDR. */
+	hdr: Signal<boolean>;
 };
 
 type Surface = Gpu | Canvas2D;
@@ -65,11 +71,16 @@ export class Renderer {
 	readonly #out: RendererOutput = {
 		frame: new Signal<VideoFrame | undefined>(undefined),
 		error: new Signal<RendererError | undefined>(undefined),
+		painted: new Signal<number>(0),
+		hdr: new Signal<boolean>(false),
 	};
 	/** The painted frame and error state. */
 	readonly out = readonlys(this.#out);
 
 	#surface = new Signal<Surface | undefined>(undefined);
+	#restored = new Signal<number>(0);
+	#displayHdr = new Signal<boolean>(false);
+	#counted?: VideoFrame;
 	#signals = new Effect();
 
 	constructor(props?: RendererProps) {
@@ -79,11 +90,19 @@ export class Renderer {
 			display: getter(props?.display),
 			presentation: getter(props?.presentation),
 			backend: getter(props?.backend ?? "auto"),
+			hdr: getter(props?.hdr ?? true),
 		};
 
 		this.#signals.run(this.#runSurface.bind(this));
 		this.#signals.run(this.#runResize.bind(this));
 		this.#signals.run(this.#runRender.bind(this));
+
+		if (typeof matchMedia === "function") {
+			const query = matchMedia("(dynamic-range: high)");
+			const update = () => this.#displayHdr.set(query.matches);
+			update();
+			this.#signals.event(query, "change", update);
+		}
 	}
 
 	#runSurface(effect: Effect): void {
@@ -134,7 +153,7 @@ export class Renderer {
 			}
 
 			console.debug("[video] rendering with WebGPU");
-			await this.#useGpu(effect, context, device);
+			await this.#useGpu(effect, context, device, presentable(canvas));
 		});
 	}
 
@@ -146,10 +165,11 @@ export class Renderer {
 		}
 
 		effect.set(this.#surface, new Canvas2D(ctx), undefined);
+		effect.event(canvas, "contextrestored", () => this.#restored.update((count) => count + 1));
 	}
 
 	// Keep drawing through `device`, replacing it whenever it is lost, until the run ends.
-	async #useGpu(effect: Effect, context: GPUCanvasContext, device: GPUDevice): Promise<void> {
+	async #useGpu(effect: Effect, context: GPUCanvasContext, device: GPUDevice, hdr: boolean): Promise<void> {
 		let current = device;
 		let surface: Gpu | undefined;
 
@@ -160,7 +180,10 @@ export class Renderer {
 		});
 
 		for (;;) {
-			surface = new Gpu(context, current);
+			const support = await hdrSupport(current);
+			if (effect.abort.aborted) return;
+
+			surface = new Gpu(context, current, { model: support.model, extended: hdr && support.extended });
 			this.#surface.set(surface);
 
 			const lost = await effect.race(current.lost);
@@ -203,23 +226,35 @@ export class Renderer {
 
 	#runRender(effect: Effect): void {
 		const surface = effect.get(this.#surface);
-		if (!surface) return;
+		if (!surface) {
+			this.#out.hdr.set(false);
+			return;
+		}
 
 		const frame = effect.get(this.in.frame);
 		const presentation = effect.get(this.in.presentation);
+		const hdr = effect.get(this.in.hdr) && effect.get(this.#displayHdr);
 
 		// A resize clears the canvas, so paint again afterwards.
 		effect.get(this.in.display);
+		effect.get(this.#restored);
 
 		// Draw at the display's refresh rate. Always draw, even when paused, to show the last frame.
 		let animate: number | undefined = requestAnimationFrame(() => {
 			animate = undefined;
-			surface.draw(frame, presentation);
+			const drawn =
+				surface instanceof Gpu ? surface.draw(frame, presentation, hdr) : surface.draw(frame, presentation);
+			if (!drawn) return;
+			this.#out.hdr.set(surface instanceof Gpu && surface.hdr);
 
 			this.#out.frame.update((current) => {
 				current?.close();
 				return frame?.clone();
 			});
+			if (frame && frame !== this.#counted) {
+				this.#counted = frame;
+				this.#out.painted.update((count) => count + 1);
+			}
 		});
 
 		effect.cleanup(() => {
@@ -229,10 +264,15 @@ export class Renderer {
 
 	/** Stop drawing and release the canvas context, the GPU device, and the painted frame. */
 	close(): void {
+		this.#out.hdr.set(false);
 		this.#signals.close();
 		this.#out.frame.update((current) => {
 			current?.close();
 			return undefined;
 		});
 	}
+}
+
+function presentable(canvas: Canvas): boolean {
+	return typeof HTMLCanvasElement !== "undefined" && canvas instanceof HTMLCanvasElement;
 }

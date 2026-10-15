@@ -26,6 +26,9 @@ export type RendererInput = {
 
 	// Which graphics API draws the frames. See {@link Video.Backend}. Defaults to "auto".
 	backend: Getter<Video.Backend>;
+
+	// Whether PQ video may be presented in HDR on an HDR display. Defaults to true.
+	hdr: Getter<boolean>;
 };
 
 /** Constructor properties for {@link Renderer}. */
@@ -55,6 +58,10 @@ export class Renderer {
 		visible: Getter<boolean>;
 		// Why drawing stopped, or undefined while healthy. See {@link Video.RendererError}.
 		error: Getter<Video.RendererError | undefined>;
+		// How many distinct frames have reached the canvas, each counted on its first paint.
+		painted: Getter<number>;
+		// Whether the painted frame is presented in HDR.
+		hdr: Getter<boolean>;
 	}>;
 
 	#signals = new Effect();
@@ -65,6 +72,7 @@ export class Renderer {
 			canvas: getter(props?.canvas),
 			visible: getter(props?.visible ?? "20%"),
 			backend: getter(props?.backend ?? "auto"),
+			hdr: getter(props?.hdr ?? true),
 		};
 
 		this.#video = new Video.Renderer({
@@ -73,6 +81,7 @@ export class Renderer {
 			display: this.decoder.out.display,
 			presentation: this.decoder.source.out.catalog,
 			backend: this.in.backend,
+			hdr: this.in.hdr,
 		});
 		this.#signals.cleanup(() => this.#video.close());
 
@@ -84,6 +93,8 @@ export class Renderer {
 			),
 			visible: this.#visible,
 			error: this.#video.out.error,
+			painted: this.#video.out.painted,
+			hdr: this.#video.out.hdr,
 		});
 
 		this.#signals.run(this.#runVisible.bind(this));

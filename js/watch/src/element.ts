@@ -6,6 +6,7 @@
  * @module
  */
 import type * as Catalog from "@moq/hang/catalog";
+import type * as Container from "@moq/hang/container";
 import type { Time } from "@moq/net";
 import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -53,6 +54,9 @@ const OBSERVED = [
 	"jitter",
 	"catalog-format",
 	"captions",
+	"hardware-acceleration",
+	"hdr",
+	"recover",
 ] as const;
 type Observed = (typeof OBSERVED)[number];
 
@@ -97,6 +101,30 @@ function parseBuffer(value: string | null): Time.Milli {
 	if (parsed !== undefined) return parsed;
 	console.warn(`moq-watch: invalid buffer="${value}", expected a duration like "30s"`);
 	return Moq.Time.Milli.zero;
+}
+
+// Parse the `recover` attribute, a count of decode errors recovered in place, falling back to 0.
+function parseRecover(value: string | null): number {
+	const trimmed = value?.trim();
+	if (!trimmed) return 0;
+	const count = Number(trimmed);
+	if (Number.isInteger(count) && count >= 0) return count;
+	console.warn(`moq-watch: invalid recover="${value}", expected a non-negative integer`);
+	return 0;
+}
+
+// Parse the `hardware-acceleration` attribute, falling back to "no-preference".
+function parseHardwareAcceleration(value: string | null): Video.HardwareAcceleration {
+	const trimmed = value?.trim();
+	if (trimmed === "prefer-hardware" || trimmed === "prefer-software" || trimmed === "no-preference") {
+		return trimmed;
+	}
+	if (trimmed) {
+		console.warn(
+			`moq-watch: invalid hardware-acceleration="${value}", expected "no-preference", "prefer-hardware", or "prefer-software"`,
+		);
+	}
+	return "no-preference";
 }
 
 /** Parse the element's catalog-format attribute. */
@@ -182,7 +210,16 @@ export default class MoqWatch extends HTMLElement {
 		target: new Signal<Video.Target | undefined>(undefined),
 		// The selected caption track name, or undefined for off (the default; captions are opt-in).
 		captions: new Signal<string | undefined>(undefined),
+		// WebCodecs hardware-acceleration preference for video decode.
+		hardwareAcceleration: new Signal<Video.HardwareAcceleration>("no-preference"),
+		// Present PQ video in HDR on an HDR display when the browser can.
+		hdr: new Signal(true),
+		// Video decode errors recovered in place before the failure is reported.
+		recover: new Signal<number>(0),
 	};
+
+	// Unseals each media frame for end-to-end encryption; set through the `decrypt` property.
+	#decrypt = new Signal<Container.FrameDecrypt | undefined>(undefined);
 
 	// Broadcast configuration owned here and wired into `broadcast` as inputs.
 	#name = new Signal<Moq.Path.Valid>(Moq.Path.empty());
@@ -232,6 +269,7 @@ export default class MoqWatch extends HTMLElement {
 			catalog: this.#catalog,
 			canvas: this.#canvas,
 			container: this.#captionsOverlay,
+			decrypt: this.#decrypt,
 			...this.controls,
 		});
 		this.signals.cleanup(() => this.player.close());
@@ -436,6 +474,12 @@ export default class MoqWatch extends HTMLElement {
 		} else if (name === "captions") {
 			// The selected caption track name; absent or empty turns captions off.
 			this.controls.captions.set(newValue || undefined);
+		} else if (name === "hardware-acceleration") {
+			this.controls.hardwareAcceleration.set(parseHardwareAcceleration(newValue));
+		} else if (name === "hdr") {
+			this.controls.hdr.set(parseBoolean(newValue, true));
+		} else if (name === "recover") {
+			this.controls.recover.set(parseRecover(newValue));
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
@@ -444,6 +488,50 @@ export default class MoqWatch extends HTMLElement {
 
 	get url(): URL | undefined {
 		return this.connection.url.peek();
+	}
+
+	/**
+	 * WebCodecs hardware-acceleration preference for video decode. `"no-preference"` (default)
+	 * uses a hardware decoder when available and falls back to software. `"prefer-hardware"`
+	 * requires a hardware decoder (no software fallback) and `"prefer-software"` forces software.
+	 */
+	get hardwareAcceleration(): Video.HardwareAcceleration {
+		return this.controls.hardwareAcceleration.peek();
+	}
+
+	set hardwareAcceleration(value: Video.HardwareAcceleration) {
+		this.controls.hardwareAcceleration.set(value);
+	}
+
+	/** Present PQ (HDR10) video in HDR when the display and browser allow; read when the canvas is attached. */
+	/** Video decode errors recovered in place, by a fresh decoder from the next keyframe, before the failure is reported. */
+	get recover(): number {
+		return this.controls.recover.peek();
+	}
+
+	set recover(value: number) {
+		this.controls.recover.set(value);
+	}
+
+	get hdr(): boolean {
+		return this.controls.hdr.peek();
+	}
+
+	set hdr(value: boolean) {
+		this.controls.hdr.set(value);
+	}
+
+	/**
+	 * Unseals each media frame's payload for end-to-end encryption. A JS property, not an
+	 * attribute (it is a function); setting it rebuilds the media subscriptions, so set it
+	 * before playback starts. See {@link Container.FrameDecrypt}.
+	 */
+	get decrypt(): Container.FrameDecrypt | undefined {
+		return this.#decrypt.peek();
+	}
+
+	set decrypt(value: Container.FrameDecrypt | undefined) {
+		this.#decrypt.set(value);
 	}
 
 	set url(value: string | URL | undefined) {
