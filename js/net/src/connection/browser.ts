@@ -18,9 +18,6 @@ export function parseUserAgent(userAgent: string) {
 /** Returns whether a browser user agent has a usable WebTransport implementation. */
 export function isWebTransportUserAgentSupported(userAgent: string): boolean {
 	const browser = parseUserAgent(userAgent);
-	// WebKit stalls long sessions (bugs.webkit.org/show_bug.cgi?id=319818).
-	// iOS browsers use WebKit too, including iPadOS Safari's desktop user agent.
-	if (browser.webkit || browser.ios) return false;
 	// Firefox fixed its two concurrent incoming stream limit in version 153.
 	return browser.firefox === undefined || Number(browser.firefox) >= 153;
 }

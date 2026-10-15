@@ -1,7 +1,23 @@
 import { expect, test } from "bun:test";
 import { isWebTransportUserAgentSupported, parseUserAgent } from "./browser.ts";
 
+test.each([["Firefox 151", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0"]])(
+	"disables WebTransport on %s",
+	(_browser, userAgent) => {
+		expect(isWebTransportUserAgentSupported(userAgent)).toBeFalse();
+	},
+);
+
 test.each([
+	[
+		"Chrome",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+	],
+	[
+		"Chrome on Android",
+		"Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36",
+	],
+	["Firefox 153", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"],
 	[
 		"Safari on macOS",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
@@ -22,21 +38,6 @@ test.each([
 		"Edge on iOS",
 		"Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) EdgiOS/126.0.2592.56 Version/18.0 Mobile/15E148 Safari/604.1",
 	],
-	["Firefox 151", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0"],
-])("disables WebTransport on %s", (_browser, userAgent) => {
-	expect(isWebTransportUserAgentSupported(userAgent)).toBeFalse();
-});
-
-test.each([
-	[
-		"Chrome",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-	],
-	[
-		"Chrome on Android",
-		"Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36",
-	],
-	["Firefox 153", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"],
 ])("enables WebTransport on %s", (_browser, userAgent) => {
 	expect(isWebTransportUserAgentSupported(userAgent)).toBeTrue();
 });
@@ -44,7 +45,7 @@ test.each([
 test("iPadOS desktop Safari is WebKit and exposes its Safari version", () => {
 	const ua =
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1";
-	expect(isWebTransportUserAgentSupported(ua)).toBeFalse();
+	expect(isWebTransportUserAgentSupported(ua)).toBeTrue();
 	expect(parseUserAgent(ua)).toMatchObject({ webkit: true, ios: "unknown", safari: "18.5" });
 });
 test("desktop Edge's AppleWebKit token is Chromium", () => {
