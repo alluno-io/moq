@@ -393,7 +393,10 @@ mod tests {
 		nvenc.extend_from_slice(fixtures::SPS_NVENC);
 		let config = config(&nvenc).unwrap();
 		assert_eq!((config.coded_width, config.coded_height), (Some(1280), Some(720)));
-		assert_eq!((config.display_aspect_width, config.display_aspect_height), (None, None));
+		assert_eq!(
+			(config.display_aspect_width, config.display_aspect_height),
+			(None, None)
+		);
 	}
 
 	/// Non-square samples resolve to the whole picture's aspect: 1440x1080 at 4:3 is shown 16:9.
@@ -403,7 +406,10 @@ mod tests {
 		anamorphic.extend_from_slice(fixtures::SPS_ANAMORPHIC);
 		let config = config(&anamorphic).unwrap();
 		assert_eq!((config.coded_width, config.coded_height), (Some(1440), Some(1080)));
-		assert_eq!((config.display_aspect_width, config.display_aspect_height), (Some(16), Some(9)));
+		assert_eq!(
+			(config.display_aspect_width, config.display_aspect_height),
+			(Some(16), Some(9))
+		);
 	}
 
 	/// An hvcC initializer resolves a config with the hvcC stored as `description`.
