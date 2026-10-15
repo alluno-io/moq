@@ -15,7 +15,7 @@ operational ones that must stay private.
 | `GET /announced/<prefix>` | Broadcasts announced under the prefix, named relative to it. |
 | `GET /fetch/<broadcast>/<track>?group=N` | One group from the cache, the latest by default, or `404` if the track has no such group. Useful for catch-up and debugging. |
 | `GET /certificate.sha256` | The fingerprint of the first configured TLS certificate, for pinning a self-signed dev certificate. |
-| `GET /health` | `200 ok`, unauthenticated, for load balancers. |
+| `GET /health` | `200 ok`, unauthenticated, for load balancers. `moq-relay --probe [url]` asks it from inside a container (default `https://127.0.0.1/health`, any certificate) and exits non-zero without a success status. |
 
 ```bash
 curl http://localhost:4443/announced/demo

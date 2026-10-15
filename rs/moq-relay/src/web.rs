@@ -797,6 +797,19 @@ async fn serve_health() -> Response {
 	(StatusCode::OK, "ok\n").into_response()
 }
 
+/// Ask the web server at `url` for a success status, accepting any certificate, for a container healthcheck.
+pub async fn probe(url: &str) -> anyhow::Result<()> {
+	reqwest::Client::builder()
+		.danger_accept_invalid_certs(true)
+		.timeout(std::time::Duration::from_secs(5))
+		.build()?
+		.get(url)
+		.send()
+		.await?
+		.error_for_status()?;
+	Ok(())
+}
+
 async fn serve_fingerprint(State(state): State<Arc<WebState>>) -> Response {
 	// The first certificate in configuration order, deliberately. The endpoint
 	// exists so an `http://` client can pin a self-signed development
@@ -1448,6 +1461,37 @@ mod tests {
 		);
 
 		serving.abort();
+	}
+
+	#[tokio::test]
+	async fn probe_passes_on_a_serving_relay_and_fails_without_one() {
+		let dir = TempDir::new().unwrap();
+		let (_ca, cert, key) = make_certs(&dir);
+		let mut config = Config::default();
+		config.https.listen = Some("127.0.0.1:0".parse().unwrap());
+		config.https.cert = vec![cert.clone()];
+		config.https.key = vec![key];
+		let auth = crate::auth::Config {
+			public_subscribe: vec![moq_auth::Pattern::all()],
+			..Default::default()
+		}
+		.init("test", &moq_tokio::tls::Connect::default(), false)
+		.unwrap();
+		let cluster = cluster::Cluster::new(crate::cluster::Options::default()).unwrap();
+		let certificates = moq_tokio::tls::Certificates::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
+		let web = Web::new(auth, cluster, certificates, config).bind().unwrap();
+		let https = web.addrs().https.expect("the HTTPS listener is configured");
+		let routes = web.routes();
+		let serving = tokio::spawn(web.serve(routes));
+
+		probe(&format!("https://{https}/health")).await.unwrap();
+		serving.abort();
+
+		let closed = std::net::TcpListener::bind("127.0.0.1:0")
+			.unwrap()
+			.local_addr()
+			.unwrap();
+		assert!(probe(&format!("https://{closed}/health")).await.is_err());
 	}
 
 	/// HTTPS settings without the HTTPS listener that would read them are refused,

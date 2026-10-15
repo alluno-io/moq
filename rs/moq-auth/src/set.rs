@@ -148,6 +148,7 @@ mod tests {
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 			not_before: None,
+			peer: false,
 		}
 	}
 

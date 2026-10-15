@@ -246,5 +246,9 @@ as `--mtls-peer` does; otherwise what it announces counts as ingest here, like
 a client's. Dials retry forever with capped backoff, so a rejected peer is loud
 in the logs rather than fatal. See [Authentication](/bin/relay/auth#mtls).
 
+Relays that verify tokens with a [shared secret](/bin/relay/auth#shared-secret)
+need no auth server: a `cluster.token` signed with that secret and carrying
+`"peer": true` is granted as a peer.
+
 The `/nodes` [internal endpoint](/bin/relay/http#get-nodes) lists the peers
 this relay dialed and holds a session with.

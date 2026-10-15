@@ -326,8 +326,11 @@ impl Config {
 		let publish: Patterns = self.public.iter().chain(&self.public_publish).cloned().collect();
 		let subscribe: Patterns = self.public.iter().chain(&self.public_subscribe).cloned().collect();
 		let mut policy = moq_auth::serve::Policy::default();
-		policy.keys = Some(moq_auth::serve::Keys::Secret(Box::new(moq_auth::Key::from_secret(secret.into_bytes()))));
+		policy.keys = Some(moq_auth::serve::Keys::Secret(Box::new(moq_auth::Key::from_secret(
+			secret.into_bytes(),
+		))));
 		policy.public = moq_auth::Permissions::new(publish, subscribe);
+		policy.jwt_peer = true;
 		policy
 	}
 }
@@ -1054,6 +1057,37 @@ mod tests {
 		let mut empty = auth.request(moq_auth::Transport::WebSocket, "/");
 		empty.query = Some("jwt=&b=2".into());
 		assert!(auth.admit(empty).await.is_ok());
+	}
+
+	#[tokio::test]
+	async fn a_secret_admits_only_a_peer_token_as_a_cluster_peer() {
+		let secret = "cluster-test-secret";
+		let auth = Config {
+			secret: Some(secret.into()),
+			public: ["anon/**".parse().unwrap()].into_iter().collect(),
+			..Default::default()
+		}
+		.init("relay-1", &moq_tokio::tls::Connect::default(), false)
+		.unwrap();
+		let key = moq_auth::Key::from_secret(secret.as_bytes().to_vec());
+		let all = patterns(&["**"]);
+		let grant = moq_auth::Claims::default()
+			.with_publish(all.clone())
+			.with_subscribe(all);
+		let peer = key.sign(&grant.clone().with_peer(true)).unwrap();
+		let client = key.sign(&grant).unwrap();
+
+		for (jwt, expected) in [(peer, true), (client, false)] {
+			let mut request = auth.request(moq_auth::Transport::Quic, "/");
+			request.query = Some(format!("jwt={jwt}"));
+			let lease = auth.admit(request).await.unwrap();
+			assert_eq!(lease.token().peer, expected);
+		}
+		let anonymous = auth
+			.admit(auth.request(moq_auth::Transport::Quic, "/anon"))
+			.await
+			.unwrap();
+		assert!(!anonymous.token().peer);
 	}
 
 	/// A certificate is a fact the public rules ignore: it gets exactly what anyone does.

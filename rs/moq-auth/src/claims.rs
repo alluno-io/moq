@@ -133,6 +133,10 @@ pub struct Claims {
 	/// The time before which the token is refused, as a unix timestamp (`nbf`).
 	/// Enforced by [`Key::verify`](crate::Key::verify).
 	pub not_before: Option<std::time::SystemTime>,
+
+	/// The bearer is a cluster peer (another relay), honored only by a verifier that
+	/// opts in with [`Policy::jwt_peer`](crate::serve::Policy::jwt_peer).
+	pub peer: bool,
 }
 
 impl Claims {
@@ -167,6 +171,12 @@ impl Claims {
 	/// Accepts an `Option` so a caller can pass one through without unwrapping it.
 	pub fn with_issued(mut self, at: impl Into<Option<std::time::SystemTime>>) -> Self {
 		self.issued = at.into();
+		self
+	}
+
+	/// Mark the bearer as a cluster peer.
+	pub fn with_peer(mut self, peer: bool) -> Self {
+		self.peer = peer;
 		self
 	}
 
@@ -253,6 +263,7 @@ mod tests {
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 			not_before: None,
+			peer: false,
 		}
 	}
 
@@ -501,6 +512,18 @@ mod tests {
 			serde_json::to_string(&claims).unwrap(),
 			r#"{"root":"live","publish":["camera1"],"subscribe":["camera1","camera2"]}"#
 		);
+	}
+
+	#[test]
+	fn test_claims_peer_is_written_only_when_set() {
+		let peer = Claims::default().with_publish(patterns(&["**"])).with_peer(true);
+		let json = serde_json::to_string(&peer).unwrap();
+		assert_eq!(json, r#"{"put":[""],"peer":true}"#);
+		assert!(serde_json::from_str::<Claims>(&json).unwrap().peer);
+
+		let client = Claims::default().with_publish(patterns(&["**"]));
+		assert_eq!(serde_json::to_string(&client).unwrap(), r#"{"put":[""]}"#);
+		assert!(!serde_json::from_str::<Claims>(r#"{"put":[""]}"#).unwrap().peer);
 	}
 
 	#[test]

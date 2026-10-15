@@ -155,6 +155,7 @@ outage still closes.
 | `publish` | Patterns the bearer may publish under `root`. `**` means everything; omitted means no publishing. |
 | `subscribe` | Patterns the bearer may subscribe to under `root`. Same rules. |
 | `exp`, `iat`, `nbf` | Expiry, issue time, and not-before. `exp` ends that credential's grant, including after connect; another accepted token can keep the session alive. A token is refused from its `exp` on and before its `nbf`. |
+| `peer` | `true` marks the bearer as a cluster peer where the relay verifies tokens with `--auth-secret`; see [Shared secret](#shared-secret). Ignored elsewhere. |
 | `iss`, `sub`, `jti` | Read and ignored. |
 
 Any other claim refuses the token with its name, `aud` included: an unknown
@@ -350,6 +351,11 @@ session; an anonymous session is not cut off.
 secret = "your-shared-secret"
 public = "anon/**"
 ```
+
+A token signed with the secret that carries `"peer": true` admits its bearer as a
+[cluster](/bin/relay/cluster#authentication) peer, so relays sharing the secret
+mesh with one token in `cluster.token` and no auth server. Mint it only for
+relays: a peer's announcements route as the cluster's, not as a client's.
 
 ## Stream listeners
 

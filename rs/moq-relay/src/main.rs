@@ -8,6 +8,12 @@ static ALLOC: moq_tokio::jemalloc::tikv_jemallocator::Jemalloc = moq_tokio::jema
 async fn main() -> anyhow::Result<()> {
 	moq_tokio::crypto::install_default().expect("failed to install default crypto provider");
 
+	let mut args = std::env::args().skip(1);
+	if args.next().as_deref() == Some("--probe") {
+		let url = args.next().unwrap_or_else(|| "https://127.0.0.1/health".to_string());
+		return moq_relay::web::probe(&url).await;
+	}
+
 	// The whole startup sequence lives in `Relay::load` rather than here, so an
 	// embedder gets it by calling one function instead of copying this file.
 	// Extra routes and cloned handles go on the returned `Relay`; `run` keeps

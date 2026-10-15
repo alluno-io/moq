@@ -33,6 +33,8 @@ pub(crate) struct Claims {
 	iat: Option<std::time::SystemTime>,
 	#[serde_as(as = "Option<TimestampSeconds<i64>>")]
 	nbf: Option<std::time::SystemTime>,
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	peer: bool,
 	// Registered claims that narrow nothing: an issuer's bookkeeping, read and dropped.
 	// Every other claim is refused, since an unknown one may narrow the grant, and a
 	// misspelled `root` would otherwise widen it to everything.
@@ -56,6 +58,7 @@ impl From<crate::Claims> for Claims {
 			exp: claims.expires,
 			iat: claims.issued,
 			nbf: claims.not_before,
+			peer: claims.peer,
 			iss: None,
 			sub: None,
 			jti: None,
@@ -81,6 +84,7 @@ impl TryFrom<Claims> for crate::Claims {
 			expires: wire.exp,
 			issued: wire.iat,
 			not_before: wire.nbf,
+			peer: wire.peer,
 		})
 	}
 }

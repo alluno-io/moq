@@ -718,6 +718,7 @@ mod tests {
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 			not_before: None,
+			peer: false,
 		}
 	}
 
@@ -965,6 +966,7 @@ mod tests {
 			expires: None,
 			issued: None,
 			not_before: None,
+			peer: false,
 		};
 
 		let result = key.sign(&invalid_claims);
@@ -1131,6 +1133,7 @@ mod tests {
 			expires: None,
 			issued: None,
 			not_before: None,
+			peer: false,
 		};
 		let token = key.sign(&claims).unwrap();
 
@@ -1151,6 +1154,7 @@ mod tests {
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 			not_before: None,
+			peer: false,
 		};
 
 		let token = key.sign(&original_claims).unwrap();
