@@ -10,7 +10,10 @@ struct SealSpy(Arc<Mutex<Vec<(String, u64, u64)>>>);
 
 impl FrameTransform for SealSpy {
 	fn transform(&self, ctx: FrameContext<'_>, payload: Bytes) -> Bytes {
-		self.0.lock().unwrap().push((ctx.track.to_string(), ctx.group, ctx.object));
+		self.0
+			.lock()
+			.unwrap()
+			.push((ctx.track.to_string(), ctx.group, ctx.object));
 		let mut sealed = vec![0x53];
 		sealed.extend_from_slice(&payload);
 		Bytes::from(sealed)
