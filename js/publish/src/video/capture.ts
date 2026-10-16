@@ -124,7 +124,7 @@ class Frames extends Fanout<VideoFrame> {
 		// Re-stamped to now. The held frame may be minutes old, and publishing it at its capture time
 		// would deliver it that late, a delay the jitter estimate keeps for the life of the stream.
 		const at = Time.Micro.fromMilli(performance.now() as Time.Milli);
-		let first: VideoFrame | undefined = new VideoFrame(held, { timestamp: at });
+		let first: VideoFrame | undefined = held.clone();
 		this.#unread.add(first);
 		const release = () => {
 			if (first && this.#unread.delete(first)) first.close();
@@ -140,7 +140,13 @@ class Frames extends Fanout<VideoFrame> {
 					first = undefined;
 					// Already released if the capture closed first.
 					if (copy && this.#unread.delete(copy)) {
-						controller.enqueue(copy);
+						const frame = await restamp(copy, at).finally(() => copy.close());
+						try {
+							controller.enqueue(frame);
+						} catch (error) {
+							frame.close();
+							throw error;
+						}
 						return;
 					}
 
@@ -182,3 +188,21 @@ class Frames extends Fanout<VideoFrame> {
 }
 
 type Held = { frame?: VideoFrame; closed: boolean };
+
+async function restamp(frame: VideoFrame, timestamp: number): Promise<VideoFrame> {
+	const format = frame.format;
+	if (!format) return new VideoFrame(frame, { timestamp });
+
+	const data = new Uint8Array(frame.allocationSize());
+	const layout = await frame.copyTo(data);
+	return new VideoFrame(data, {
+		format,
+		codedWidth: frame.visibleRect?.width ?? frame.codedWidth,
+		codedHeight: frame.visibleRect?.height ?? frame.codedHeight,
+		displayWidth: frame.displayWidth,
+		displayHeight: frame.displayHeight,
+		colorSpace: frame.colorSpace,
+		layout,
+		timestamp,
+	});
+}

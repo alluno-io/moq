@@ -14,12 +14,31 @@ class Frame {
 
 	codedWidth = 1920;
 	codedHeight = 1080;
+	displayWidth = 1920;
+	displayHeight = 1080;
+	visibleRect = { width: 1920, height: 1080 };
+	format = "NV12";
+	colorSpace = {};
 	timestamp: number;
+	restamps: number;
 	closed = false;
 
-	constructor(source?: Frame, init?: { timestamp: number }) {
-		this.timestamp = init?.timestamp ?? source?.timestamp ?? 0;
+	constructor(source?: Frame | BufferSource, init?: { timestamp: number }) {
+		const parent = source instanceof Frame ? source : undefined;
+		this.timestamp = init?.timestamp ?? parent?.timestamp ?? 0;
+		this.restamps = parent ? parent.restamps + (init ? 1 : 0) : 0;
 		Frame.all.push(this);
+	}
+
+	allocationSize(): number {
+		return (this.codedWidth * this.codedHeight * 3) / 2;
+	}
+
+	async copyTo(): Promise<PlaneLayout[]> {
+		return [
+			{ offset: 0, stride: this.codedWidth },
+			{ offset: this.codedWidth * this.codedHeight, stride: this.codedWidth },
+		];
 	}
 
 	clone(): Frame {
@@ -89,6 +108,11 @@ function frameSource() {
 	return {
 		source: { frames, frameRate: 30 },
 		push: (timestamp: number) => controller.enqueue(new Frame(undefined, { timestamp }) as unknown as VideoFrame),
+		pushRestamped: (timestamp: number) => {
+			const captured = new Frame();
+			controller.enqueue(new Frame(captured, { timestamp }) as unknown as VideoFrame);
+			captured.close();
+		},
 		[Symbol.dispose]() {
 			if (original) Object.defineProperty(globalThis, "VideoFrame", original);
 			else Reflect.deleteProperty(globalThis, "VideoFrame");
@@ -128,6 +152,33 @@ test("a reader attaching to a still source starts with the current picture, stam
 		const next = (await reader.read()).value as unknown as Frame;
 		expect(next.timestamp).toBe(91_033_000);
 		next.close();
+	} finally {
+		effect.close();
+		capture.close();
+		clock.mockRestore();
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("a reader starts with a copy drawn from the picture, never a re-stamp of a re-stamped frame", async () => {
+	using input = frameSource();
+	const clock = spyOn(performance, "now").mockReturnValue(1_000);
+	const capture = new Capture({ source: input.source });
+	const effect = new Effect();
+
+	try {
+		input.pushRestamped(1_000_000);
+		await flush();
+
+		clock.mockReturnValue(5_000);
+		const reader = capture.out.frames.peek()?.subscribe(effect).getReader();
+		if (!reader) throw new Error("no fanout");
+
+		const first = (await reader.read()).value as unknown as Frame;
+		expect(first.timestamp).toBe(5_000_000);
+		expect(first.restamps).toBeLessThan(2);
+		first.close();
 	} finally {
 		effect.close();
 		capture.close();
