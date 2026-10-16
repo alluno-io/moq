@@ -551,6 +551,14 @@ where
 		self.estimator.cut(end);
 		self.claim();
 
+		let aborted = self
+			.group
+			.as_ref()
+			.is_some_and(|group| group.poll_closed(&kio::Waiter::noop()).is_ready());
+		if aborted {
+			self.buffer.clear();
+		}
+
 		let tail_end = marker_at.filter(|_| !self.reordered);
 		self.flush_buffer(tail_end)?;
 
@@ -563,11 +571,15 @@ where
 		{
 			recorder.end(end);
 		}
-		if let Some(group) = self.group.as_mut() {
+		if let Some(group) = self.group.as_mut()
+			&& !aborted
+		{
 			self.container.finish_group(group, tail_end)?;
 		}
 		if let Some(group) = self.group.take() {
-			group.finish()?;
+			if !aborted {
+				group.finish()?;
+			}
 			if let Some(recorder) = self.recorder.as_mut() {
 				recorder.finish_group(group.sequence);
 			}
@@ -1347,6 +1359,33 @@ mod tests {
 		producer.finish().unwrap();
 
 		assert_eq!(collect_groups(consumer).await, vec![2, 1]);
+	}
+
+	/// A group moq-net aborted for outgrowing its budget is dead, so the next keyframe opens a new
+	/// group instead of failing to finish the old one. Regression guard for a video track that
+	/// refused every frame for good once one group hit `MAX_GROUP_FRAMES`.
+	#[tokio::test]
+	async fn a_keyframe_after_an_oversized_group_opens_the_next_group() {
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let consumer = track.subscribe(replay());
+		let mut producer = Producer::new(track, Container::Legacy(crate::container::Kind::Video));
+
+		let budget = moq_net::group::MAX_GROUP_FRAMES as u64;
+		producer.write(frame(0, true)).unwrap();
+		for index in 1..budget {
+			producer.write(frame(index * 1_000, false)).unwrap();
+		}
+		let err = producer.write(frame(budget * 1_000, false)).unwrap_err();
+		assert!(matches!(
+			err,
+			crate::Error::Hang(hang::Error::Moq(moq_net::Error::GroupTooLarge))
+		));
+
+		producer.write(frame((budget + 1) * 1_000, true)).unwrap();
+		producer.write(frame((budget + 2) * 1_000, false)).unwrap();
+		producer.finish().unwrap();
+
+		assert_eq!(collect_sequences(consumer).await, vec![1]);
 	}
 
 	/// Writing a non-keyframe with no open group returns MissingKeyframe.
