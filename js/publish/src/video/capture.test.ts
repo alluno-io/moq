@@ -15,10 +15,16 @@ class Frame {
 	codedWidth = 1920;
 	codedHeight = 1080;
 	timestamp: number;
+	restamps: number;
+	rotation: number;
+	flip: boolean;
 	closed = false;
 
-	constructor(source?: Frame, init?: { timestamp: number }) {
+	constructor(source?: Frame, init?: { timestamp: number; rotation?: number; flip?: boolean }) {
 		this.timestamp = init?.timestamp ?? source?.timestamp ?? 0;
+		this.restamps = source ? source.restamps + (init ? 1 : 0) : 0;
+		this.rotation = source?.rotation ?? init?.rotation ?? 0;
+		this.flip = source?.flip ?? init?.flip ?? false;
 		Frame.all.push(this);
 	}
 
@@ -88,7 +94,8 @@ function frameSource() {
 
 	return {
 		source: { frames, frameRate: 30 },
-		push: (timestamp: number) => controller.enqueue(new Frame(undefined, { timestamp }) as unknown as VideoFrame),
+		push: (timestamp: number, orientation?: { rotation?: number; flip?: boolean }) =>
+			controller.enqueue(new Frame(undefined, { timestamp, ...orientation }) as unknown as VideoFrame),
 		[Symbol.dispose]() {
 			if (original) Object.defineProperty(globalThis, "VideoFrame", original);
 			else Reflect.deleteProperty(globalThis, "VideoFrame");
@@ -132,6 +139,99 @@ test("a reader attaching to a still source starts with the current picture, stam
 		effect.close();
 		capture.close();
 		clock.mockRestore();
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("a camera frame is stamped once, live or replayed to a late reader", async () => {
+	const processor = Object.getOwnPropertyDescriptor(globalThis, "MediaStreamTrackProcessor");
+	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const readable = new ReadableStream<VideoFrame>({
+		start: (value) => {
+			controller = value;
+		},
+	});
+	Object.defineProperty(globalThis, "MediaStreamTrackProcessor", {
+		configurable: true,
+		value: class {
+			readonly readable = readable;
+		},
+	});
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: Frame });
+	Frame.all = [];
+
+	const capture = new Capture({ source: {} as StreamTrack });
+	const early = new Effect();
+	const late = new Effect();
+
+	try {
+		await flush();
+		const reader = capture.out.frames.peek()?.subscribe(early).getReader();
+		if (!reader) throw new Error("no fanout");
+		controller.enqueue(new Frame(undefined, { timestamp: 5_000_000 }) as unknown as VideoFrame);
+		const live = (await reader.read()).value as unknown as Frame;
+		expect(live.restamps).toBe(1);
+		live.close();
+
+		const resumed = capture.out.frames.peek()?.subscribe(late).getReader();
+		if (!resumed) throw new Error("no fanout");
+		const first = (await resumed.read()).value as unknown as Frame;
+		expect(first.restamps).toBe(1);
+		first.close();
+	} finally {
+		late.close();
+		early.close();
+		capture.close();
+		if (processor) Object.defineProperty(globalThis, "MediaStreamTrackProcessor", processor);
+		else Reflect.deleteProperty(globalThis, "MediaStreamTrackProcessor");
+		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
+		else Reflect.deleteProperty(globalThis, "VideoFrame");
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("a reader starts with the current picture, keeping its rotation and flip", async () => {
+	using input = frameSource();
+	const capture = new Capture({ source: input.source });
+	const effect = new Effect();
+
+	try {
+		input.push(1_000_000, { rotation: 90, flip: true });
+		await flush();
+
+		const reader = capture.out.frames.peek()?.subscribe(effect).getReader();
+		if (!reader) throw new Error("no fanout");
+
+		const first = (await reader.read()).value as unknown as Frame;
+		expect(first.rotation).toBe(90);
+		expect(first.flip).toBe(true);
+		first.close();
+	} finally {
+		effect.close();
+		capture.close();
+	}
+
+	expect(open()).toEqual([]);
+});
+
+test("the display carries the turn each frame reports", async () => {
+	using input = frameSource();
+	const capture = new Capture({ source: input.source });
+
+	try {
+		let changed = capture.out.display.changed();
+		input.push(1_000, { rotation: 90 });
+		expect(await changed).toEqual({ width: 1920, height: 1080, rotation: 90 });
+
+		changed = capture.out.display.changed();
+		input.push(2_000);
+		expect(await changed).toEqual({ width: 1920, height: 1080 });
+		await flush();
+	} finally {
+		capture.close();
 	}
 
 	expect(open()).toEqual([]);

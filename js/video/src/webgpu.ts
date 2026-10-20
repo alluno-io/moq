@@ -1,9 +1,15 @@
 import { CALIBRATION_TOLERANCE, classifyImport, type ImportModel, PQ_CALIBRATION, PQ_REFERENCE_WHITE } from "./hdr";
-import { type Presentation, texturePresentationTransform } from "./presentation";
+import {
+	magnifies,
+	type Presentation,
+	type Rect,
+	texturePresentationTransform,
+	viewPresentationTransform,
+} from "./presentation";
+import { TONE, VERTEX } from "./wgsl";
+import { Zoom } from "./zoom";
 
-// One oversized triangle covers the viewport, so there is no vertex buffer and no diagonal seam.
-// The vertex stage maps each canvas coordinate to the frame coordinate it shows, which handles
-// rotation and flip; the interpolation is exact because the map is affine.
+// `tone.z` set means the frame fills only part of the canvas, and the rest stays black.
 const SHADER = /* wgsl */ `
 struct Params {
 	x: vec4<f32>,
@@ -14,79 +20,14 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var frame: texture_external;
-
-struct Vertex {
-	@builtin(position) position: vec4<f32>,
-	@location(0) uv: vec2<f32>,
-}
-
-@vertex
-fn vertex(@builtin(vertex_index) index: u32) -> Vertex {
-	let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
-	let p = vec3<f32>(uv, 1.0);
-	var out: Vertex;
-	out.position = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
-	out.uv = vec2<f32>(dot(params.x.xyz, p), dot(params.y.xyz, p));
-	return out;
-}
-
-const BT709_TO_BT2020 = mat3x3<f32>(
-	vec3<f32>(0.627402, 0.069095, 0.016394),
-	vec3<f32>(0.329292, 0.919544, 0.088028),
-	vec3<f32>(0.043306, 0.011360, 0.895578));
-const BT2020_TO_BT709 = mat3x3<f32>(
-	vec3<f32>(1.660491, -0.124550, -0.018151),
-	vec3<f32>(-0.587641, 1.132900, -0.100579),
-	vec3<f32>(-0.072850, -0.008349, 1.118730));
-
-fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
-	let a = abs(c);
-	let lo = a / 12.92;
-	let hi = pow((a + 0.055) / 1.055, vec3<f32>(2.4));
-	return sign(c) * select(hi, lo, a <= vec3<f32>(0.04045));
-}
-
-fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
-	let a = abs(c);
-	let lo = a * 12.92;
-	let hi = 1.055 * pow(a, vec3<f32>(1.0 / 2.4)) - 0.055;
-	return sign(c) * select(hi, lo, a <= vec3<f32>(0.0031308));
-}
-
-fn pq_eotf(e: vec3<f32>) -> vec3<f32> {
-	let m1 = 0.1593017578125;
-	let m2 = 78.84375;
-	let c1 = 0.8359375;
-	let c2 = 18.8515625;
-	let c3 = 18.6875;
-	let ep = pow(clamp(e, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / m2));
-	let num = max(ep - c1, vec3<f32>(0.0));
-	let den = c2 - c3 * ep;
-	return pow(num / den, vec3<f32>(1.0 / m1)) * 10000.0;
-}
-
-fn roll_off(c: vec3<f32>) -> vec3<f32> {
-	let y = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-	let knee = 0.8;
-	if (y <= knee) {
-		return c;
-	}
-	let t = (y - knee) / (1.0 - knee);
-	let yn = knee + (1.0 - knee) * (1.0 - exp(-t));
-	return c * (yn / y);
-}
-
+${VERTEX}
+${TONE}
 @fragment
 fn fragment(in: Vertex) -> @location(0) vec4<f32> {
-	let rgb = textureSampleBaseClampToEdge(frame, samp, in.uv).rgb;
-	if (params.tone.x < 0.5) {
-		return vec4<f32>(rgb, 1.0);
+	if (params.tone.z > 0.5 && (any(in.uv < vec2<f32>(0.0)) || any(in.uv > vec2<f32>(1.0)))) {
+		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 	}
-	var light = BT2020_TO_BT709 * (pq_eotf(BT709_TO_BT2020 * srgb_decode(rgb)) / params.tone.y);
-	if (params.tone.x > 1.5) {
-		light = clamp(roll_off(max(light, vec3<f32>(0.0))), vec3<f32>(0.0), vec3<f32>(1.0));
-	}
-	return vec4<f32>(srgb_encode(light), 1.0);
+	return present(textureSampleBaseClampToEdge(frame, samp, in.uv).rgb, params.tone);
 }
 `;
 
@@ -298,6 +239,7 @@ export class Gpu {
 	#pipelines = new Map<GPUTextureFormat, GPURenderPipeline>();
 	#sampler: GPUSampler;
 	#params: GPUBuffer;
+	#zoom?: Zoom;
 
 	constructor(context: GPUCanvasContext, device: GPUDevice, support: HdrSupport = { extended: false }) {
 		this.#context = context;
@@ -342,11 +284,13 @@ export class Gpu {
 
 	/**
 	 * Draw `frame`, or clear to black without one; `hdr` allows PQ video to be presented in HDR.
+	 * With a `view`, the frame fills that rect of the canvas instead of all of it, and a frame it
+	 * magnifies is upscaled and sharpened.
 	 *
 	 * Import, bind, encode, and submit happen with no `await` in between: the external texture
 	 * expires once the frame is closed or the task ends.
 	 */
-	draw(frame: VideoFrame | undefined, presentation: Presentation | undefined, hdr = false): boolean {
+	draw(frame: VideoFrame | undefined, presentation: Presentation | undefined, hdr = false, view?: Rect): boolean {
 		let tone = PASSTHROUGH;
 		let extended = false;
 
@@ -362,11 +306,33 @@ export class Gpu {
 		}
 		this.#hdr = extended;
 
+		const canvas = this.#context.canvas;
+		const output = { width: canvas.width, height: canvas.height };
+		const target = this.#context.getCurrentTexture().createView();
+		const format = this.#format ?? this.#preferred;
 		const encoder = this.#device.createCommandEncoder();
+
+		const frameSize = frame && { width: frame.displayWidth, height: frame.displayHeight };
+		if (frame && frameSize && view && magnifies(frameSize, view, presentation)) {
+			this.#zoom ??= new Zoom(this.#device);
+			this.#zoom.encode(encoder, {
+				frame: this.#device.importExternalTexture({ source: frame, colorSpace: this.#colorSpace }),
+				frameSize,
+				target,
+				format,
+				size: output,
+				rows: viewPresentationTransform(output, view, presentation),
+				tone,
+				white: PQ_REFERENCE_WHITE,
+			});
+			this.#device.queue.submit([encoder.finish()]);
+			return true;
+		}
+
 		const pass = encoder.beginRenderPass({
 			colorAttachments: [
 				{
-					view: this.#context.getCurrentTexture().createView(),
+					view: target,
 					clearValue: { r: 0, g: 0, b: 0, a: 1 },
 					loadOp: "clear",
 					storeOp: "store",
@@ -375,15 +341,16 @@ export class Gpu {
 		});
 
 		if (frame) {
-			const canvas = this.#context.canvas;
-			const { x, y } = texturePresentationTransform({ width: canvas.width, height: canvas.height }, presentation);
+			const { x, y } = view
+				? viewPresentationTransform(output, view, presentation)
+				: texturePresentationTransform(output, presentation);
 			this.#device.queue.writeBuffer(
 				this.#params,
 				0,
-				new Float32Array([...x, 0, ...y, 0, tone, PQ_REFERENCE_WHITE, 0, 0]),
+				new Float32Array([...x, 0, ...y, 0, tone, PQ_REFERENCE_WHITE, view ? 1 : 0, 0]),
 			);
 
-			const pipeline = this.#pipeline(this.#format ?? this.#preferred);
+			const pipeline = this.#pipeline(format);
 			const texture = this.#device.importExternalTexture({ source: frame, colorSpace: this.#colorSpace });
 			const group = this.#device.createBindGroup({
 				layout: pipeline.getBindGroupLayout(0),
@@ -407,6 +374,7 @@ export class Gpu {
 	/** Release the GPU resources this surface created. The caller owns the device. */
 	close() {
 		this.#params.destroy();
+		this.#zoom?.close();
 		this.#context.unconfigure();
 	}
 }

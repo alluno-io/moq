@@ -1,6 +1,6 @@
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { Canvas2D } from "./canvas2d";
-import type { Dimensions, Presentation } from "./presentation";
+import type { Dimensions, Presentation, Rect } from "./presentation";
 import { Gpu, hdrSupport, probe } from "./webgpu";
 
 /**
@@ -34,6 +34,12 @@ export type RendererInput = {
 	display: Getter<Dimensions | undefined>;
 	/** The rotation and flip to draw the frame with. */
 	presentation: Getter<Presentation | undefined>;
+	/**
+	 * Where the frame lands on the canvas, in canvas pixels; undefined fills the canvas. It may reach
+	 * past the canvas edges to show part of the frame, and WebGPU upscales and sharpens a frame it
+	 * magnifies.
+	 */
+	view: Getter<Rect | undefined>;
 	/** Which graphics API to draw with. Defaults to `"auto"`. */
 	backend: Getter<Backend>;
 	/** Whether PQ video may be presented in HDR on an HDR display. Defaults to true. */
@@ -89,6 +95,7 @@ export class Renderer {
 			frame: getter(props?.frame),
 			display: getter(props?.display),
 			presentation: getter(props?.presentation),
+			view: getter(props?.view),
 			backend: getter(props?.backend ?? "auto"),
 			hdr: getter(props?.hdr ?? true),
 		};
@@ -233,6 +240,7 @@ export class Renderer {
 
 		const frame = effect.get(this.in.frame);
 		const presentation = effect.get(this.in.presentation);
+		const view = effect.get(this.in.view);
 		const hdr = effect.get(this.in.hdr) && effect.get(this.#displayHdr);
 
 		// A resize clears the canvas, so paint again afterwards.
@@ -243,7 +251,9 @@ export class Renderer {
 		let animate: number | undefined = requestAnimationFrame(() => {
 			animate = undefined;
 			const drawn =
-				surface instanceof Gpu ? surface.draw(frame, presentation, hdr) : surface.draw(frame, presentation);
+				surface instanceof Gpu
+					? surface.draw(frame, presentation, hdr, view)
+					: surface.draw(frame, presentation, view);
 			if (!drawn) return;
 			this.#out.hdr.set(surface instanceof Gpu && surface.hdr);
 

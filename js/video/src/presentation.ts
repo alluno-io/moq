@@ -12,6 +12,14 @@ export type Dimensions = {
 	height: number;
 };
 
+/** A rectangle in pixels, its origin at the top left. */
+export type Rect = {
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+};
+
 type Rotation = 0 | 90 | 180 | 270;
 type Matrix = [number, number, number, number, number, number];
 
@@ -96,4 +104,31 @@ export function texturePresentationTransform(
 		x: [clean((d * output.width) / sx), clean((-c * output.height) / sx), clean((c * f - d * e) / sx)],
 		y: [clean((-b * output.width) / sy), clean((a * output.height) / sy), clean((b * e - a * f) / sy)],
 	};
+}
+
+/**
+ * Return {@link texturePresentationTransform} for a frame presented into `view` of an `output` canvas.
+ *
+ * `view` may reach past the canvas edges; canvas coordinates outside it map outside 0..1.
+ */
+export function viewPresentationTransform(
+	output: Dimensions,
+	view: Rect,
+	presentation?: Presentation,
+): { x: [number, number, number]; y: [number, number, number] } {
+	const { x, y } = texturePresentationTransform({ width: view.width, height: view.height }, presentation);
+	const su = output.width / view.width;
+	const sv = output.height / view.height;
+	const ou = view.x / view.width;
+	const ov = view.y / view.height;
+	return {
+		x: [clean(x[0] * su), clean(x[1] * sv), clean(x[2] - x[0] * ou - x[1] * ov)],
+		y: [clean(y[0] * su), clean(y[1] * sv), clean(y[2] - y[0] * ou - y[1] * ov)],
+	};
+}
+
+/** Whether `view` spreads a frame of `frame` display pixels over more canvas pixels than it has. */
+export function magnifies(frame: Dimensions, view: Rect, presentation?: Presentation): boolean {
+	const shown = rotateVideoDimensions(frame, presentation?.rotation);
+	return Math.min(view.width / shown.width, view.height / shown.height) > 1;
 }

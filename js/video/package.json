@@ -1,7 +1,7 @@
 {
 	"name": "@moq/video",
 	"type": "module",
-	"version": "0.1.0-alluno.1",
+	"version": "0.1.0-alluno.2",
 	"description": "Render Media over QUIC video frames to a canvas through WebGPU or Canvas2D",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": {

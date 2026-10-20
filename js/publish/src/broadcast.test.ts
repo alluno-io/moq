@@ -47,6 +47,38 @@ test("folds video and audio renditions into the catalog by full track name", asy
 	broadcast.close();
 });
 
+test("a turned picture is advertised with its rotation and its turned size", async () => {
+	const display = new Signal<{ width: number; height: number; rotation?: number } | undefined>({
+		width: 1280,
+		height: 720,
+		rotation: 90,
+	});
+	const broadcast = new Broadcast({ enabled: true, display });
+	broadcast.video("video/hd").config.set(videoConfig);
+	await settle();
+
+	let catalog = await readCatalog(broadcast);
+	expect(Number(catalog?.video?.display?.width)).toBe(720);
+	expect(Number(catalog?.video?.display?.height)).toBe(1280);
+	expect(catalog?.video?.rotation).toBe(90);
+
+	display.set({ width: 1280, height: 720, rotation: 180 });
+	await settle();
+	catalog = await readCatalog(broadcast);
+	expect(Number(catalog?.video?.display?.width)).toBe(1280);
+	expect(Number(catalog?.video?.display?.height)).toBe(720);
+	expect(catalog?.video?.rotation).toBe(180);
+
+	display.set({ width: 1280, height: 720 });
+	await settle();
+	catalog = await readCatalog(broadcast);
+	expect(Number(catalog?.video?.display?.width)).toBe(1280);
+	expect(Number(catalog?.video?.display?.height)).toBe(720);
+	expect(catalog?.video?.rotation).toBeUndefined();
+
+	broadcast.close();
+});
+
 test("a rendition with an undefined config is omitted from the catalog", async () => {
 	const broadcast = new Broadcast({ enabled: true });
 

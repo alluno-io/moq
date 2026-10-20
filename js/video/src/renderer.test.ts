@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Signal } from "@moq/signals";
 import { PQ_CALIBRATION } from "./hdr";
+import type { Rect } from "./presentation";
 import { type Backend, Renderer } from "./renderer";
 
 // Let the probe's promise chain and the effects it wakes run to completion.
@@ -60,6 +61,7 @@ function half(value: number): number {
 class FakeDevice {
 	destroyed = false;
 	draws = 0;
+	scratch: number[][] = [];
 	imports: unknown[] = [];
 	writes: Float32Array[] = [];
 	options: DeviceOptions;
@@ -75,7 +77,12 @@ class FakeDevice {
 		this.#samples = [...(options.calibration ?? [])];
 	}
 
-	createTexture() {
+	createTexture(descriptor: { size: number[]; usage: number }) {
+		// A sampled texture belongs to the zoom; only the calibration reads one back.
+		if (descriptor.usage & 0x04) {
+			this.scratch.push(descriptor.size);
+			return { width: descriptor.size[0], height: descriptor.size[1], createView: () => ({}), destroy: () => {} };
+		}
 		if (!this.options.calibration) throw new Error("no readback in this test");
 		return { createView: () => ({}), destroy: () => {} };
 	}
@@ -496,6 +503,81 @@ describe("Renderer", () => {
 		} finally {
 			renderer.close();
 		}
+	});
+
+	describe("view", () => {
+		function sized(width: number, height: number): VideoFrame {
+			return Object.assign(frame(), { displayWidth: width, displayHeight: height });
+		}
+
+		function view(canvas: FakeCanvas, source: VideoFrame, rect: Rect, backend: Backend = "auto") {
+			return new Renderer({
+				canvas: canvas as unknown as HTMLCanvasElement,
+				frame: source,
+				view: rect,
+				backend,
+			});
+		}
+
+		it("draws the frame into the view's rect on Canvas2D", async () => {
+			const canvas = new FakeCanvas();
+			const renderer = view(canvas, sized(1920, 1080), { x: -320, y: -180, width: 1280, height: 720 }, "2d");
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.transforms.at(-1)).toEqual([1, 0, 0, 1, -320, -180]);
+				expect(canvas.draws.at(-1)?.slice(1)).toEqual([0, 0, 1280, 720]);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("copies, upscales and then sharpens a frame the view magnifies, in three WebGPU passes", async () => {
+			gpu.adapters = [{}];
+			const canvas = new FakeCanvas();
+			const renderer = view(canvas, sized(320, 180), { x: 0, y: 0, width: 640, height: 360 });
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				const device = gpu.devices[0];
+				expect(device.draws).toBe(3);
+				expect(device.scratch).toEqual([
+					[320, 180],
+					[640, 360],
+				]);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("draws a view that does not magnify in one WebGPU pass, black around it", async () => {
+			gpu.adapters = [{}];
+			const canvas = new FakeCanvas();
+			const renderer = view(canvas, sized(1920, 1080), { x: 0, y: 90, width: 320, height: 180 });
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				const device = gpu.devices[0];
+				expect(device.draws).toBe(1);
+				expect(device.scratch).toEqual([]);
+				expect(device.writes.at(-1)?.[10]).toBe(1);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("fills the canvas with no view, as before", async () => {
+			gpu.adapters = [{}];
+			const canvas = new FakeCanvas();
+			const renderer = create(canvas);
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(gpu.devices[0].writes.at(-1)?.[10]).toBe(0);
+			} finally {
+				renderer.close();
+			}
+		});
 	});
 
 	it("repaints with the new presentation", async () => {

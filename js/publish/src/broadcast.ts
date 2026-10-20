@@ -25,9 +25,10 @@ export type BroadcastInput = {
 	// The broadcast name.
 	name: Getter<Moq.Path.Valid>;
 
-	// Catalog video-section display size, shared by all video renditions. Usually wired from a
-	// Video.Capture's `display` output. Omitted from the catalog when undefined.
-	display: Getter<{ width: number; height: number } | undefined>;
+	// Catalog video-section display size and clockwise rotation, shared by all video renditions. The
+	// size is the captured one, before the rotation. Usually wired from a Video.Capture's `display`
+	// output. Omitted from the catalog when undefined.
+	display: Getter<{ width: number; height: number; rotation?: number } | undefined>;
 
 	// Whether the video should be flipped horizontally on playback. Catalog video-section metadata.
 	flip: Getter<boolean>;
@@ -199,7 +200,12 @@ export class Broadcast {
 				const section: Catalog.Video = { renditions: video };
 				// display is optional in the schema, so it gates only itself, not the whole section.
 				if (display) {
-					section.display = { width: Catalog.u53(display.width), height: Catalog.u53(display.height) };
+					const turned = display.rotation === 90 || display.rotation === 270;
+					section.display = {
+						width: Catalog.u53(turned ? display.height : display.width),
+						height: Catalog.u53(turned ? display.width : display.height),
+					};
+					if (display.rotation) section.rotation = display.rotation;
 				}
 				if (flip) section.flip = true;
 				catalog.video = section;

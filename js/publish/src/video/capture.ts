@@ -1,7 +1,8 @@
 import { Time } from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { Fanout } from "../fanout";
-import { TrackProcessor } from "./processor";
+import { reportsRotation, watchRotation } from "./orientation";
+import { type Stamped, TrackProcessor } from "./processor";
 import { normalizeSource, type Source } from "./types";
 
 // The raw capture source to pump frames from.
@@ -14,9 +15,12 @@ type CaptureOutput = {
 	// starting with a copy of the current picture; each reader owns the frames it receives and must
 	// close them.
 	frames: Signal<Fanout<VideoFrame> | undefined>;
-	// The captured dimensions and source scale, sampled together for each frame.
-	display: Signal<{ width: number; height: number; scale?: number } | undefined>;
+	// The captured dimensions, source scale, and the clockwise turn the picture is shown with, sampled
+	// together for each frame.
+	display: Signal<Display | undefined>;
 };
+
+type Display = { width: number; height: number; scale?: number; rotation?: number };
 
 /**
  * Pumps frames off a capture {@link Source} and distributes them to any number of readers.
@@ -31,7 +35,7 @@ export class Capture {
 
 	readonly #out: CaptureOutput = {
 		frames: new Signal<Fanout<VideoFrame> | undefined>(undefined),
-		display: new Signal<{ width: number; height: number; scale?: number } | undefined>(undefined),
+		display: new Signal<Display | undefined>(undefined),
 	};
 	readonly out = readonlys(this.#out);
 
@@ -49,12 +53,16 @@ export class Capture {
 		const source = effect.get(this.in.source);
 		if (!source) return;
 
-		// A capture track goes through MediaStreamTrackProcessor, which rewrites timestamps onto our
-		// wall clock so they stay consistent when the source changes or the encoder reloads. A
-		// FrameSource already stamps against that clock, so take its frames as they are.
-		const stream = "frames" in source ? source.frames : TrackProcessor(normalizeSource(source).track);
+		// A capture track goes through MediaStreamTrackProcessor, which times each frame on our wall
+		// clock so they stay consistent when the source changes or the encoder reloads. A FrameSource
+		// already stamps against that clock, so take its frames as they are.
+		const stream: ReadableStream<Stamped> =
+			"frames" in source ? source.frames.pipeThrough(asStamped()) : TrackProcessor(normalizeSource(source).track);
 
-		const fanout = new Frames(stream.pipeThrough(this.#measure(source)));
+		const rotation = new Signal(0);
+		if (!("frames" in source) && !reportsRotation()) watchRotation(effect, normalizeSource(source).track, rotation);
+
+		const fanout = new Frames(stream.pipeThrough(this.#measure(source, rotation)));
 		effect.cleanup(() => fanout.close());
 
 		effect.set(this.#out.frames, fanout, undefined);
@@ -64,13 +72,20 @@ export class Capture {
 	}
 
 	// Sample live source metadata even when the coded dimensions stay unchanged.
-	#measure(source: Source): TransformStream<VideoFrame, VideoFrame> {
-		return new TransformStream<VideoFrame, VideoFrame>({
-			transform: (frame, controller) => {
+	#measure(source: Source, rotation: Signal<number>): TransformStream<Stamped, Stamped> {
+		return new TransformStream<Stamped, Stamped>({
+			transform: (stamped, controller) => {
+				const { frame } = stamped;
 				try {
 					const scale = "frames" in source ? undefined : normalizeSource(source).scale;
-					this.#out.display.set({ width: frame.codedWidth, height: frame.codedHeight, scale });
-					controller.enqueue(frame);
+					const turn = (frame as VideoFrame & { rotation?: number }).rotation ?? rotation.peek();
+					this.#out.display.set({
+						width: frame.codedWidth,
+						height: frame.codedHeight,
+						scale,
+						rotation: turn || undefined,
+					});
+					controller.enqueue(stamped);
 				} catch (error) {
 					frame.close();
 					throw error;
@@ -96,13 +111,24 @@ class Frames extends Fanout<VideoFrame> {
 	// Copies handed to new readers and not yet read, released on close like the fanout's own queues.
 	readonly #unread = new Set<VideoFrame>();
 
-	constructor(source: ReadableStream<VideoFrame>) {
+	constructor(source: ReadableStream<Stamped>) {
 		const held: Held = { closed: false };
-		const hold = new TransformStream<VideoFrame, VideoFrame>({
-			transform: (frame, controller) => {
+		const hold = new TransformStream<Stamped, VideoFrame>({
+			transform: ({ frame, timestamp }, controller) => {
 				held.frame?.close();
 				held.frame = held.closed ? undefined : frame.clone();
-				controller.enqueue(frame);
+				if (frame.timestamp === timestamp) {
+					controller.enqueue(frame);
+					return;
+				}
+
+				let stamped: VideoFrame;
+				try {
+					stamped = new VideoFrame(frame, { timestamp });
+				} finally {
+					frame.close();
+				}
+				controller.enqueue(stamped);
 			},
 		});
 
@@ -182,3 +208,9 @@ class Frames extends Fanout<VideoFrame> {
 }
 
 type Held = { frame?: VideoFrame; closed: boolean };
+
+function asStamped(): TransformStream<VideoFrame, Stamped> {
+	return new TransformStream<VideoFrame, Stamped>({
+		transform: (frame, controller) => controller.enqueue({ frame, timestamp: frame.timestamp }),
+	});
+}

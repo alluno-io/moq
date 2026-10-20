@@ -23,5 +23,5 @@
  *
  * @module
  */
-export { type Dimensions, type Presentation, rotateVideoDimensions } from "./presentation";
+export { type Dimensions, type Presentation, type Rect, rotateVideoDimensions } from "./presentation";
 export * from "./renderer";
