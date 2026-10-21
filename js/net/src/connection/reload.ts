@@ -270,6 +270,7 @@ export class Reload {
 			effect.set(this.#estimate, undefined);
 			const connection = effect.get(this.established);
 			if (!connection) return;
+			if (!effect.get(this.bandwidth.claimed)) return;
 
 			let pending = false;
 			const sample = async () => {

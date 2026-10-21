@@ -304,3 +304,28 @@ test("reserve and update reject a non-finite or negative ceiling", () => {
 
 	allocator.close();
 });
+
+test("an allocator is claimed exactly while an open track holds a reservation", async () => {
+	const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
+	const allocator = new Allocator(new Signal<number | undefined>(4_000_000));
+	await settled();
+	expect(allocator.claimed.peek()).toBe(false);
+
+	const video = new TrackProducer("video").accept({ priority: VIDEO });
+	const reserved = allocator.reserve(video.demand(), 4_000_000);
+	await settled();
+	expect(allocator.claimed.peek()).toBe(true);
+
+	reserved.close();
+	await settled();
+	expect(allocator.claimed.peek()).toBe(false);
+
+	const audio = new TrackProducer("audio").accept({ priority: VIDEO + 20 });
+	allocator.reserve(audio.demand(), 128_000);
+	await settled();
+	expect(allocator.claimed.peek()).toBe(true);
+	audio.close();
+	await settled();
+	expect(allocator.claimed.peek()).toBe(false);
+	allocator.close();
+});

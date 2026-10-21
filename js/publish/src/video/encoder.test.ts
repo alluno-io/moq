@@ -1361,3 +1361,118 @@ test("a refused first ceiling recovers at a smaller size", async () => {
 		error.mockRestore();
 	}
 });
+
+// A capture faster than the encoder used to move every frame into VideoEncoder's own queue, which
+// has no limit, so nothing was ever dropped and the publisher's latency grew with the backlog.
+test("an encoder already holding a backlog skips new captures instead of queueing them", async () => {
+	let backlog = 0;
+	const encoded: number[] = [];
+	class SlowVideoEncoder {
+		state: CodecState = "unconfigured";
+		#output: VideoEncoderInit["output"];
+		#codec?: string;
+
+		constructor(init: VideoEncoderInit) {
+			this.#output = init.output;
+		}
+
+		static async isConfigSupported(config: VideoEncoderConfig): Promise<{ supported: boolean }> {
+			return { supported: config.codec.startsWith("avc1") };
+		}
+
+		get encodeQueueSize(): number {
+			return backlog;
+		}
+
+		configure(config: VideoEncoderConfig): void {
+			this.state = "configured";
+			this.#codec = config.codec;
+		}
+
+		encode(frame: VideoFrame): void {
+			if (frame instanceof Frame) {
+				encoded.push(frame.timestamp / 1000);
+				backlog++;
+			}
+		}
+
+		async flush(): Promise<void> {
+			const chunk = { type: "key", timestamp: 0, byteLength: 1, copyTo: () => {} };
+			this.#output(chunk as never, { decoderConfig: { codec: this.#codec } } as never);
+		}
+
+		close(): void {
+			this.state = "closed";
+		}
+	}
+
+	const original = Object.getOwnPropertyDescriptor(globalThis, "VideoEncoder");
+	Object.defineProperty(globalThis, "VideoEncoder", {
+		configurable: true,
+		value: SlowVideoEncoder,
+		writable: true,
+	});
+	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+	Object.defineProperty(globalThis, "VideoFrame", { configurable: true, value: FakeVideoFrame, writable: true });
+
+	class Frame {
+		readonly timestamp: number;
+		constructor(timestamp: number) {
+			this.timestamp = timestamp;
+		}
+		clone(): Frame {
+			return new Frame(this.timestamp);
+		}
+		close(): void {}
+	}
+
+	const { Fanout } = await import("../fanout");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const fanout = new Fanout(
+		new ReadableStream<VideoFrame>({
+			start: (c) => {
+				controller = c;
+			},
+		}),
+		{ clone: (frame) => frame.clone(), release: (frame) => frame.close() },
+	);
+
+	const track = new Moq.Track.Producer("video").accept({ timescale: Moq.Time.Timescale.MILLI });
+	const rendition = {
+		config: new Signal(undefined),
+		track: new Signal<Moq.Track.Producer | undefined>(track),
+		close: () => track.close(),
+	};
+	const capture = {
+		in: { source: new Signal({ getSettings: () => ({ frameRate: 30 }), getConstraints: () => ({}) } as never) },
+		out: { display: new Signal({ width: 640, height: 480 }), frames: new Signal(fanout) },
+	};
+	const encoder = new Encoder("video", {
+		enabled: true,
+		broadcast: { video: () => rendition } as never,
+		capture: capture as never,
+	});
+
+	const send = async (millis: number) => {
+		controller.enqueue(new Frame(millis * 1000) as unknown as VideoFrame);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	};
+
+	try {
+		await settle();
+		for (let frame = 0; frame < 10; frame++) await send(frame * 100);
+		expect(encoded).toEqual([0, 100, 200]);
+
+		backlog = 0;
+		await send(1000);
+		expect(encoded).toEqual([0, 100, 200, 1000]);
+	} finally {
+		encoder.close();
+		fanout.close();
+		track.close();
+		if (original) Object.defineProperty(globalThis, "VideoEncoder", original);
+		else Reflect.deleteProperty(globalThis, "VideoEncoder");
+		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
+		else Reflect.deleteProperty(globalThis, "VideoFrame");
+	}
+});

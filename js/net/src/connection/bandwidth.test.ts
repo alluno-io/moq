@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import * as Lite from "../lite/index.ts";
 import { createMockTransportPair } from "../mock.ts";
 import * as Time from "../time.ts";
@@ -135,5 +135,28 @@ test("a private connection still exposes an allocator", async () => {
 		await waitUntil(() => reserved.peek() === 2_000_000);
 	} finally {
 		connection.close();
+	}
+});
+
+test("a connection nothing reserves bandwidth on never samples the send rate", async () => {
+	stubTransport({ estimatedSendRate: 2_000_000 });
+	const sampled = spyOn(Lite.Connection.prototype, "stats");
+
+	const connection = new Connection({ url, linger: Time.Milli(20) });
+	try {
+		await waitUntil(() => connection.status.peek() === "connected");
+		await new Promise((resolve) => setTimeout(resolve, 350));
+		expect(sampled).not.toHaveBeenCalled();
+
+		const allocator = connection.bandwidth.peek();
+		if (!allocator) throw new Error("missing allocator");
+		const track = new TrackProducer("video").accept({ priority: 60 });
+		track.subscribe();
+		const reserved = allocator.reserve(track.demand(), 4_000_000);
+		await waitUntil(() => reserved.peek() === 2_000_000);
+		expect(sampled).toHaveBeenCalled();
+	} finally {
+		connection.close();
+		sampled.mockRestore();
 	}
 });

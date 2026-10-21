@@ -84,3 +84,28 @@ test("broadcasts do not share a baseline", () => {
 	video.flush(0, new Baseline(), 200_000);
 	expect(video.estimate.delay).toBeUndefined();
 });
+
+test("regression: one late frame does not raise the jitter estimate for the rest of the track", () => {
+	const broadcast = new Baseline();
+	const estimator = new Estimator();
+	for (let frame = 0; frame < 50; frame++) {
+		const timestamp = frame * 20_000;
+		estimator.flush(timestamp, broadcast, timestamp + 5_000);
+	}
+	// A long task on the publisher's main thread holds one output back 300ms.
+	expect(estimator.flush(1_000_000, broadcast, 1_305_000)).toBe(false);
+	expect(estimator.estimate.jitter).toBeUndefined();
+});
+
+test("jitter that recurs still raises the estimate", () => {
+	const broadcast = new Baseline();
+	const estimator = new Estimator();
+	let raised = false;
+	for (let frame = 0; frame < 200; frame++) {
+		const timestamp = frame * 20_000;
+		const late = frame % 10 === 9 ? 45_000 : 5_000;
+		raised = estimator.flush(timestamp, broadcast, timestamp + late) || raised;
+	}
+	expect(raised).toBe(true);
+	expect(estimator.estimate.jitter).toBe(u53(40));
+});

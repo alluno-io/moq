@@ -378,6 +378,7 @@ export class Encoder {
 						const frame = next.value;
 						try {
 							if (encoder.state !== "configured") continue;
+							if (encoder.encodeQueueSize > MAX_ENCODE_BACKLOG) continue;
 
 							// This doesn't need to be reactive.
 							const config = this.config.peek();
@@ -740,6 +741,10 @@ export class Encoder {
 		this.#signals.close();
 	}
 }
+
+// The most frames an encoder may hold before a new capture is skipped instead of queued behind
+// them, so an encoder that falls behind capture drops frames rather than adding latency.
+const MAX_ENCODE_BACKLOG = 2;
 
 // The closest two requested keyframes may land. A keyframe costs several times a predicted frame,
 // and this stays well under the default two-second GOP so a request still beats the cadence.

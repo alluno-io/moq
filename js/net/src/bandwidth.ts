@@ -142,6 +142,8 @@ export class Allocator implements Handle {
 	#signals = new Effect();
 	#registry: Registry;
 
+	#claimed = new Signal(false);
+
 	/**
 	 * Divide `estimate`, normally a connection's sampled send rate.
 	 *
@@ -165,8 +167,17 @@ export class Allocator implements Handle {
 				effect.get(entry.demand.used);
 				effect.get(entry.demand.closed);
 			}
+			this.#claimed.set(entries.some((entry) => entry.demand.closed.peek() === undefined));
 			this.#publish();
 		});
+	}
+
+	/**
+	 * Whether any open track holds a reservation, which is when the estimate is worth sampling:
+	 * a connection that only receives has nothing to divide.
+	 */
+	get claimed(): Getter<boolean> {
+		return this.#claimed;
 	}
 
 	/**
@@ -233,6 +244,7 @@ export class Allocator implements Handle {
 			entry.grant.set(undefined);
 		}
 		this.#entries.set([]);
+		this.#claimed.set(false);
 		this.#signals.close();
 	}
 
