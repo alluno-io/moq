@@ -171,11 +171,12 @@ export class Decoder {
 
 		this.source = props.source;
 		this.sync = props.sync;
-		// "auto" holds the arrival estimate plus the active rendition's catalog `delay`, floored at the
-		// catalog requirement. The estimate cancels any offset between tracks, so the delay is added
-		// back. The audio frame term has no video counterpart: the rendition jitter already covers a
-		// frame interval.
+		// With a lookahead, "auto" holds the arrival estimate plus the active rendition's catalog `delay`,
+		// floored at the catalog requirement. The estimate cancels any offset between tracks, so the
+		// delay is added back. The audio frame term has no video counterpart: the rendition jitter
+		// already covers a frame interval.
 		const target = this.#signals.computed((effect) => {
+			if (!effect.get(this.sync.out.buffered)) return undefined;
 			const jitter = effect.get(this.out.jitter);
 			const spread = effect.get(this.#spread);
 			if (spread === undefined) return jitter;
@@ -558,14 +559,16 @@ class DecoderTrack {
 						this.frame.set(frame.clone());
 					}
 
-					// Returns immediately when the latency is "instant". Closing the track releases it.
-					// Capture the signal: a rerun replaces `effect.abort` before this continuation runs.
-					const signal = effect.abort;
-					await this.sync.wait(timestamp, signal);
-					if (signal.aborted) return;
-					if (epoch !== this.sync.epoch) {
-						this.#markDropped();
-						return;
+					if (this.sync.in.delay.peek() !== "auto" || this.sync.out.buffered.peek()) {
+						// Returns immediately when the latency is "instant". Closing the track releases it.
+						// Capture the signal: a rerun replaces `effect.abort` before this continuation runs.
+						const signal = effect.abort;
+						await this.sync.wait(timestamp, signal);
+						if (signal.aborted) return;
+						if (epoch !== this.sync.epoch) {
+							this.#markDropped();
+							return;
+						}
 					}
 
 					if (timestamp < (this.timestamp.peek() ?? 0)) {

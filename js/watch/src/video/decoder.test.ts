@@ -271,7 +271,8 @@ async function guardedPlayback(kind: "legacy" | "cmaf", reads: Read[], hold: rea
 	};
 	const source = new Source({ broadcast, supported: async () => true });
 	const delay = new Signal<Delay>("instant");
-	const sync = new Sync({ delay });
+	const buffer = new Signal(Time.Milli.zero);
+	const sync = new Sync({ delay, buffer });
 	const enabled = new Signal(true);
 	const decoder = new Decoder({ source, sync, enabled });
 	// Opened before the reads below, so it observes every one of them.
@@ -281,6 +282,7 @@ async function guardedPlayback(kind: "legacy" | "cmaf", reads: Read[], hold: rea
 		decoder,
 		arrivals,
 		delay,
+		buffer,
 		fail: (error: DOMException, index = -1) => errors.at(index)?.(error),
 		emit: (timestamp: number, index = -1) => frames.at(index)?.(new Picture(timestamp) as unknown as VideoFrame),
 		get codecs() {
@@ -705,5 +707,68 @@ it("a reset drops a parked video frame even when the next anchor restores the re
 		clear.mockRestore();
 		timer.mockRestore();
 		now.mockRestore();
+	}
+});
+
+async function heldByAudio(lookahead: Time.Milli): Promise<Time.Milli | undefined> {
+	const now = spyOn(Time.Milli, "now").mockReturnValue(Time.Milli(1000));
+	const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+		(() => 1 as unknown as ReturnType<typeof setTimeout>) as unknown as typeof setTimeout,
+	);
+	const clear = spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+	const reads: Read[] = [];
+	const playback = await guardedPlayback("legacy", reads);
+	const audio = playback.sync.register(new Signal<Time.Milli | undefined>(Time.Milli(1000)));
+	try {
+		playback.enabled.set(false);
+		playback.delay.set("auto");
+		playback.buffer.set(lookahead);
+		await microtasks();
+		reads.push(sample(0, 0), sample(0, 100_000, false));
+		playback.enabled.set(true);
+		await microtasks();
+		expect(playback.submitted).toEqual([0, 100_000]);
+		expect(playback.sync.out.delay.peek()).toBe(Time.Milli(1000));
+		return playback.decoder.out.timestamp.peek();
+	} finally {
+		audio();
+		playback.close();
+		await microtasks();
+		clear.mockRestore();
+		timer.mockRestore();
+		now.mockRestore();
+	}
+}
+
+it("an auto delay without a lookahead presents video on decode, whatever audio holds", async () => {
+	expect(await heldByAudio(Time.Milli.zero)).toBe(Time.Milli(100));
+});
+
+it("an auto delay with a lookahead still parks video behind the shared delay", async () => {
+	expect(await heldByAudio(Time.Milli(1))).toBe(Time.Milli(0));
+});
+
+it("video holds no share of an auto delay without a lookahead", async () => {
+	const catalog = new Signal<Catalog.Root>({
+		video: { renditions: { video: config({ delay: 200, jitter: 60 }) } },
+	});
+	const broadcast = new Signal<Broadcast | undefined>(watchBroadcast(catalog));
+	const source = new Source({ broadcast, supported: async () => true });
+	const buffer = new Signal(Time.Milli.zero);
+	const sync = new Sync({ delay: "auto", buffer });
+	await settle();
+	const decoder = new Decoder({ source, sync });
+	await settle();
+	try {
+		expect(decoder.out.jitter.peek()).toBe(Time.Milli(260));
+		expect(sync.out.delay.peek()).toBe(Time.Milli.zero);
+
+		buffer.set(Time.Milli(1));
+		await settle();
+		expect(sync.out.delay.peek()).toBe(Time.Milli(260));
+	} finally {
+		decoder.close();
+		source.close();
+		sync.close();
 	}
 });
