@@ -13,6 +13,10 @@ import (
 	"moq.dev/moq/internal/bridge"
 )
 
+func init() {
+	bridge.CatalogProducer = func(v any) *ffi.MoqMediaCatalogProducer { return v.(*CatalogProducer).inner }
+}
+
 type (
 	// Audio describes one audio rendition in a broadcast catalog: codec, sample rate, channel count, and container.
 	Audio = ffi.MoqAudio
@@ -41,14 +45,43 @@ type (
 	ContainerCmaf = ffi.MoqContainerCmaf
 	// ContainerLoc is the low-overhead container variant of Container; build one with LocContainer.
 	ContainerLoc = ffi.MoqContainerLoc
+	// Rendition is a catalog rendition: its ID (catalog key) and config. Build one with VideoRendition or AudioRendition.
+	Rendition = ffi.MoqRendition
+	// RenditionVideo is the video variant of Rendition; build one with VideoRendition.
+	RenditionVideo = ffi.MoqRenditionVideo
+	// RenditionAudio is the audio variant of Rendition; build one with AudioRendition.
+	RenditionAudio = ffi.MoqRenditionAudio
 
 	// AudioInit describes an audio codec and its initialization bytes.
 	AudioInit = ffi.MoqAudioInit
 	// VideoInit describes a video codec, initialization bytes, and hints.
 	VideoInit = ffi.MoqVideoInit
-	// ContainerInit describes a container and its leading bytes.
-	ContainerInit = ffi.MoqContainerInit
 )
+
+// Timebase shares a source's timestamp offset without keeping its broadcast open.
+type Timebase struct{ inner *ffi.MoqMediaTimebase }
+
+// NewTimebase creates a shared source timebase owned by broadcast.
+func NewTimebase(broadcast *moq.BroadcastProducer) (*Timebase, error) {
+	inner, err := ffi.NewMoqMediaTimebase(bridge.BroadcastProducer(broadcast))
+	if err != nil {
+		return nil, err
+	}
+	return &Timebase{inner: inner}, nil
+}
+
+// Close releases this timebase handle on the calling goroutine; existing imports keep their offset.
+func (t *Timebase) Close() { t.inner.Destroy() }
+
+// ContainerInit describes a container, its leading bytes and an optional shared timebase.
+type ContainerInit struct {
+	// Format selects the container parser.
+	Format ContainerFormat
+	// Data supplies the leading container bytes.
+	Data []byte
+	// Timebase shares a source offset, or nil for an independent offset.
+	Timebase *Timebase
+}
 
 // MediaFrame is a container-decoded payload, presentation timestamp, and keyframe flag.
 type MediaFrame struct {
@@ -100,6 +133,12 @@ func NewCatalogProducer(broadcast *moq.BroadcastProducer) (*CatalogProducer, err
 		return nil, err
 	}
 	return &CatalogProducer{inner: inner}, nil
+}
+
+// Now reads the broadcast clock, fixing it for subsequent media producers.
+func (c *CatalogProducer) Now() (time.Duration, error) {
+	us, err := c.inner.Now()
+	return time.Duration(us) * time.Microsecond, err
 }
 
 // SetVideoProperties replaces the video properties shared by all renditions.
@@ -158,22 +197,17 @@ func NewVideoTrackStreamProducer(broadcast *moq.BroadcastProducer, target Target
 	return &TrackStreamProducer{inner: inner}, nil
 }
 
-// NewContainerProducer imports complete container chunks.
+// NewContainerProducer imports a container from chunks split anywhere, such as a byte stream.
 func NewContainerProducer(broadcast *moq.BroadcastProducer, init ContainerInit) (*ContainerProducer, error) {
-	inner, err := ffi.NewMoqMediaContainerProducer(bridge.BroadcastProducer(broadcast), init)
+	var timebase **ffi.MoqMediaTimebase
+	if init.Timebase != nil {
+		timebase = &init.Timebase.inner
+	}
+	inner, err := ffi.NewMoqMediaContainerProducer(bridge.BroadcastProducer(broadcast), ffi.MoqContainerInit{Format: init.Format, Data: init.Data, Timebase: timebase})
 	if err != nil {
 		return nil, err
 	}
 	return &ContainerProducer{inner: inner}, nil
-}
-
-// NewContainerStreamProducer imports a container byte stream.
-func NewContainerStreamProducer(broadcast *moq.BroadcastProducer, format ContainerFormat) (*ContainerStreamProducer, error) {
-	inner, err := ffi.NewMoqMediaContainerStreamProducer(bridge.BroadcastProducer(broadcast), format)
-	if err != nil {
-		return nil, err
-	}
-	return &ContainerStreamProducer{inner: inner}, nil
 }
 
 // NewCatalogConsumer subscribes to broadcast's catalog snapshots.
@@ -185,37 +219,35 @@ func NewCatalogConsumer(ctx context.Context, broadcast *moq.BroadcastConsumer) (
 	return &CatalogConsumer{inner: inner}, nil
 }
 
-// TrackConfig names a media track, its container, and live delivery options.
+// TrackConfig names a catalog rendition and live delivery options.
 type TrackConfig struct {
-	Name         string
-	Container    Container
+	Rendition    Rendition
 	Subscription *moq.Subscription
 }
 
-// NewTrackConsumer subscribes to and decodes a media track.
+// NewTrackConsumer subscribes to and decodes a catalog rendition, following its broadcast and track.
 func NewTrackConsumer(ctx context.Context, broadcast *moq.BroadcastConsumer, config TrackConfig) (*TrackConsumer, error) {
 	sub, err := bridge.Subscription(config.Subscription)
 	if err != nil {
 		return nil, err
 	}
-	inner, err := ffi.MoqMediaTrackConsumerSubscribe(ctx, bridge.BroadcastConsumer(broadcast), ffi.MoqMediaTrackConfig{Name: config.Name, Container: config.Container, Subscription: sub})
+	inner, err := ffi.MoqMediaTrackConsumerSubscribe(ctx, bridge.BroadcastConsumer(broadcast), ffi.MoqMediaTrackConfig{Rendition: config.Rendition, Subscription: sub})
 	if err != nil {
 		return nil, err
 	}
 	return &TrackConsumer{inner: inner}, nil
 }
 
-// GroupConfig names a group, its container, and fetch delivery options.
+// GroupConfig names a catalog rendition's group and fetch delivery options.
 type GroupConfig struct {
-	Name      string
+	Rendition Rendition
 	Sequence  uint64
-	Container Container
 	Options   *moq.FetchGroupOptions
 }
 
-// FetchGroup fetches and decodes exactly one media group.
+// FetchGroup fetches and decodes exactly one group of a catalog rendition, following its broadcast and track.
 func FetchGroup(ctx context.Context, broadcast *moq.BroadcastConsumer, config GroupConfig) (*GroupConsumer, error) {
-	inner, err := ffi.MoqMediaGroupConsumerFetch(ctx, bridge.BroadcastConsumer(broadcast), ffi.MoqMediaGroupConfig{Name: config.Name, Sequence: config.Sequence, Container: config.Container, Options: config.Options})
+	inner, err := ffi.MoqMediaGroupConsumerFetch(ctx, bridge.BroadcastConsumer(broadcast), ffi.MoqMediaGroupConfig{Rendition: config.Rendition, Sequence: config.Sequence, Options: config.Options})
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +266,16 @@ func NewGroupConsumer(group *moq.GroupConsumer, container Container) (*GroupCons
 		return nil, err
 	}
 	return &GroupConsumer{inner: inner}, nil
+}
+
+// VideoRendition selects the video rendition the catalog lists under id.
+func VideoRendition(id string, config Video) Rendition {
+	return RenditionVideo{Id: id, Config: config}
+}
+
+// AudioRendition selects the audio rendition the catalog lists under id.
+func AudioRendition(id string, config Audio) Rendition {
+	return RenditionAudio{Id: id, Config: config}
 }
 
 // LegacyContainer selects the legacy hang container for a media subscription.
@@ -286,7 +328,7 @@ const (
 
 // ContainerFormat values: a container that publishes its own tracks.
 const (
-	// ContainerFormatFmp4 is fragmented MP4 / CMAF.
+	// ContainerFormatFmp4 is fragmented MP4 / CMAF, split into one frame per sample.
 	ContainerFormatFmp4 = ffi.MoqContainerFormatFmp4
 	// ContainerFormatMkv is Matroska / WebM.
 	ContainerFormatMkv = ffi.MoqContainerFormatMkv
@@ -320,17 +362,7 @@ func (m *TrackProducer) WriteFrame(frame moq.Frame) error {
 	return m.inner.WriteFrame(f)
 }
 
-// Flush records a local encoder's frame handoff on the broadcast media clock.
-// Call after WriteFrame only for local encoder output, not file or network imports.
-func (m *TrackProducer) Flush(timestamp time.Duration) error {
-	us, err := bridge.Duration(timestamp, "timestamp")
-	if err != nil {
-		return err
-	}
-	return m.inner.Flush(us)
-}
-
-// Discontinuity marks a timeline break and restarts handoff measurement, preserving advertised jitter.
+// Discontinuity marks a timeline break, preserving the advertised jitter and delay.
 func (m *TrackProducer) Discontinuity() error {
 	return m.inner.Discontinuity()
 }
@@ -365,7 +397,7 @@ type ContainerProducer struct {
 	inner *ffi.MoqMediaContainerProducer
 }
 
-// Write pushes a whole chunk of container bytes.
+// Write pushes container bytes; the container recovers its own framing.
 func (c *ContainerProducer) Write(payload []byte) error {
 	return c.inner.Write(payload)
 }
@@ -384,22 +416,6 @@ func (c *ContainerProducer) Seek(sequence uint64) error {
 
 // Finish finishes every track this container publishes.
 func (c *ContainerProducer) Finish() error {
-	return c.inner.Finish()
-}
-
-// ContainerStreamProducer publishes a container fed by a raw byte stream, which
-// recovers its own framing.
-type ContainerStreamProducer struct {
-	inner *ffi.MoqMediaContainerStreamProducer
-}
-
-// Write pushes raw container bytes; chunk boundaries don't matter.
-func (c *ContainerStreamProducer) Write(payload []byte) error {
-	return c.inner.Write(payload)
-}
-
-// Finish finishes every track this container publishes.
-func (c *ContainerStreamProducer) Finish() error {
 	return c.inner.Finish()
 }
 
@@ -428,6 +444,14 @@ func (m *TrackStreamProducer) Finish() error {
 	return m.inner.Finish()
 }
 
+// mediaFrame converts the result of a Next call, keeping (nil, nil) for the end.
+func mediaFrame(frame *ffi.MoqMediaFrame, err error) (*MediaFrame, error) {
+	if frame == nil || err != nil {
+		return nil, err
+	}
+	return &MediaFrame{Payload: frame.Payload, Timestamp: time.Duration(frame.TimestampUs) * time.Microsecond, Keyframe: frame.Keyframe}, nil
+}
+
 // TrackConsumer is a stream of decoded media frames.
 type TrackConsumer struct {
 	inner *ffi.MoqMediaTrackConsumer
@@ -435,11 +459,7 @@ type TrackConsumer struct {
 
 // Next returns the next frame, or (nil, nil) when the track ends.
 func (m *TrackConsumer) Next(ctx context.Context) (*MediaFrame, error) {
-	frame, err := bridge.Call(ctx, m.inner.Cancel, m.inner.Next)
-	if frame == nil || err != nil {
-		return nil, err
-	}
-	return &MediaFrame{Payload: frame.Payload, Timestamp: time.Duration(frame.TimestampUs) * time.Microsecond, Keyframe: frame.Keyframe}, nil
+	return mediaFrame(bridge.Call(ctx, m.inner.Cancel, m.inner.Next))
 }
 
 // All ranges over frames until the track ends or the loop breaks.
@@ -465,11 +485,7 @@ func (m *GroupConsumer) Sequence() uint64 {
 
 // Next returns the next decoded frame, or (nil, nil) when the group ends.
 func (m *GroupConsumer) Next(ctx context.Context) (*MediaFrame, error) {
-	frame, err := bridge.Call(ctx, m.inner.Cancel, m.inner.Next)
-	if frame == nil || err != nil {
-		return nil, err
-	}
-	return &MediaFrame{Payload: frame.Payload, Timestamp: time.Duration(frame.TimestampUs) * time.Microsecond, Keyframe: frame.Keyframe}, nil
+	return mediaFrame(bridge.Call(ctx, m.inner.Cancel, m.inner.Next))
 }
 
 // All ranges over decoded frames until the group ends or the loop breaks.

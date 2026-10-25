@@ -47,11 +47,6 @@ impl Import {
 		self.track.track().demand()
 	}
 
-	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> crate::Result<()> {
-		self.track.flush(timestamp, now)
-	}
-
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
 		self.track.finish()?;
@@ -64,8 +59,6 @@ impl Import {
 		self.track.abort(err);
 	}
 
-	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
-	/// the fields its config didn't supply.
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;
@@ -124,6 +117,7 @@ impl From<Config> for hang::catalog::AudioConfig {
 	/// informational input rate in [`Config::sample_rate`] claims.
 	fn from(config: Config) -> Self {
 		let mut audio = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, config.channel_count);
+		audio.warmup = Some(super::WARMUP);
 		audio.description = config.encode().ok();
 		audio.container = hang::catalog::Container::Legacy;
 		audio
@@ -143,6 +137,7 @@ mod tests {
 		let config = super::config(&head).unwrap();
 		assert_eq!(config.sample_rate, 48_000);
 		assert_eq!(config.description.as_deref(), Some(head.as_ref()));
+		assert_eq!(config.warmup, Some(Duration::from_millis(80)));
 
 		let config: hang::catalog::AudioConfig = super::Config::new(44_100, 2).into();
 		assert_eq!(config.sample_rate, 48_000);

@@ -8,9 +8,21 @@
 //! cached group, swept over cache depth so a per-delivery scan shows up as a slope.
 //! It also covers the steady-state path after a subscriber has reached the edge.
 //!
+//! `track_stamp_groups` covers stamping a group's first frame, which checks it
+//! against its neighbors' starts, swept over cache depth so a scan shows as a slope:
+//! `append` among stamped groups, `sparse` among groups created but not yet stamped.
+//!
 //! Run with `cargo bench -p moq-net`.
 
-use std::{hint::black_box, time::Duration};
+#![expect(
+	clippy::disallowed_methods,
+	reason = "`iter_custom` timings measure the host clock on purpose"
+)]
+
+use std::{
+	hint::black_box,
+	time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -76,10 +88,7 @@ fn bench_write(c: &mut Criterion) {
 				|| (fresh_group(), frame::Buffer::<32>::new()),
 				|(mut ctx, mut buf)| {
 					for _ in 0..n {
-						let frame = frame::Frame {
-							timestamp: Some(Timestamp::ZERO),
-							payload: payload.clone(),
-						};
+						let frame = frame::Frame::new(Timestamp::ZERO, payload.clone());
 						// A full buffer hands the frame back: flush, then take it.
 						if let Err(frame) = buf.push(frame) {
 							ctx.group.write_frames(&mut buf).unwrap();
@@ -216,7 +225,7 @@ fn filled_track(n: usize, payload: &Bytes) -> TrackCtx {
 fn replay() -> track::Subscription {
 	track::Subscription::default()
 		.with_max_delay(Duration::MAX)
-		.with_start(track::Position::group(0))
+		.with_range(0..)
 }
 
 /// Drain N cached groups from a track, in arrival order and in sequence order.
@@ -319,5 +328,149 @@ fn bench_roundtrip(c: &mut Criterion) {
 	g.finish();
 }
 
-criterion_group!(benches, bench_write, bench_read, bench_roundtrip, bench_track_recv);
+/// Sweep payload depth and subscribers for both plain and property-bearing frames.
+fn bench_relay_frames(c: &mut Criterion) {
+	#[cfg(feature = "fuzz")]
+	{
+		let mut g = c.benchmark_group("group_relay_frames");
+		for frames in [4, 512, 8192] {
+			for subscribers in [1, 8, 64] {
+				for properties in [false, true] {
+					let context = moq_net::fuzz::object_group(frames, properties);
+					let mode = if properties { "properties" } else { "plain" };
+					g.throughput(Throughput::Elements((frames * subscribers) as u64));
+					g.bench_function(BenchmarkId::new(mode, format!("{frames}/{subscribers}")), |b| {
+						b.iter_batched(
+							|| (0..subscribers).map(|_| context.2.consume()).collect::<Vec<_>>(),
+							|mut readers| {
+								// A capacity `group_read_frames` doesn't sweep: sharing its readers'
+								// instantiation moves them out of line and shifts that sweep.
+								let mut buffer = frame::Buffer::<16>::new();
+								for reader in &mut readers {
+									drain_batched(reader, &mut buffer);
+								}
+								readers
+							},
+							BatchSize::SmallInput,
+						);
+					});
+				}
+			}
+		}
+		g.finish();
+	}
+	#[cfg(not(feature = "fuzz"))]
+	let _ = c;
+}
+
+/// Append and stamp groups on a track already holding N cached groups.
+///
+/// A group's first frame is checked against the nearest stamped starts on either side,
+/// once per group. Each fresh track takes at most N more groups, so the cache stays
+/// within 2N for the whole measurement.
+fn bench_stamp(c: &mut Criterion) {
+	let payload = Bytes::from(vec![0u8; PAYLOAD]);
+	let mut g = c.benchmark_group("track_stamp_groups");
+	for &n in &DEPTHS {
+		g.bench_with_input(BenchmarkId::new("append", n), &n, |b, &n| {
+			b.iter_custom(|iters| {
+				let mut total = Duration::ZERO;
+				let mut left = iters;
+				while left > 0 {
+					let ctx = filled_track(n, &payload);
+					let batch = left.min(n as u64);
+					let start = Instant::now();
+					for _ in 0..batch {
+						let mut group = ctx.track.append_group().unwrap();
+						group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+						group.finish().unwrap();
+					}
+					total += start.elapsed();
+					left -= batch;
+				}
+				total
+			});
+		});
+		// N groups created before any is stamped, then stamped in order: each one's upper
+		// neighbor is a run of unstamped groups, which a slot scan walks.
+		g.bench_with_input(BenchmarkId::new("sparse", n), &n, |b, &n| {
+			b.iter_custom(|iters| {
+				let mut total = Duration::ZERO;
+				let mut left = iters;
+				while left > 0 {
+					let ctx = filled_track(0, &payload);
+					let mut groups: Vec<_> = (0..n).map(|_| ctx.track.append_group().unwrap()).collect();
+					let batch = left.min(n as u64);
+					let start = Instant::now();
+					for group in groups.iter_mut().take(batch as usize) {
+						group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+					}
+					total += start.elapsed();
+					left -= batch;
+				}
+				total
+			});
+		});
+	}
+	g.finish();
+}
+
+/// Read every frame of fresh compressed groups with N plain readers each.
+///
+/// The group inflates once into a copy every plain reader shares, so the cost should
+/// slope with the groups and stay nearly flat in the readers; a per-reader inflate
+/// shows up as a slope over the readers.
+fn bench_inflate(c: &mut Criterion) {
+	const FRAMES: usize = 32;
+	let payloads: Vec<Bytes> = (0..FRAMES)
+		.map(|index| Bytes::from(format!("{{\"frame\":{index},\"status\":\"{}\"}}", "ok".repeat(100))))
+		.collect();
+	let mut g = c.benchmark_group("group_inflate");
+	for groups in [1usize, 16] {
+		for readers in [1usize, 8, 64] {
+			g.throughput(Throughput::Elements((groups * readers * FRAMES) as u64));
+			let id = BenchmarkId::new(format!("groups{groups}"), readers);
+			g.bench_with_input(id, &readers, |b, &readers| {
+				b.iter_batched(
+					|| {
+						let broadcast = broadcast::Producer::new(broadcast::Info::default());
+						let track = broadcast.create_track("bench", timed().with_compress(true)).unwrap();
+						let consumers: Vec<group::Consumer> = (0..groups)
+							.flat_map(|_| {
+								let mut group = track.append_group().unwrap();
+								for payload in &payloads {
+									group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+								}
+								group.finish().unwrap();
+								(0..readers).map(move |_| group.consume()).collect::<Vec<_>>()
+							})
+							.collect();
+						(broadcast, track, consumers)
+					},
+					|(broadcast, track, mut consumers)| {
+						for consumer in &mut consumers {
+							while let Some(frame) = consumer.read_frame().now_or_never().unwrap().unwrap() {
+								black_box(frame);
+							}
+						}
+						(broadcast, track, consumers)
+					},
+					BatchSize::SmallInput,
+				);
+			});
+		}
+	}
+	g.finish();
+}
+
+criterion_group!(
+	benches,
+	bench_write,
+	bench_read,
+	bench_roundtrip,
+	bench_track_recv,
+	bench_stamp,
+	bench_relay_frames,
+	bench_inflate
+);
 criterion_main!(benches);

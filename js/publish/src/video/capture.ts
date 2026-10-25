@@ -1,13 +1,17 @@
-import { Time } from "@moq/net";
+import { Instant, Nano, now } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { Fanout } from "../fanout";
 import { reportsRotation, watchRotation } from "./orientation";
-import { type Stamped, TrackProcessor } from "./processor";
+import { type Timed, TrackProcessor } from "./processor";
 import { normalizeSource, type Source } from "./types";
 
-// The raw capture source to pump frames from.
+/** Signals the capture reads. */
 export type CaptureInput = {
+	// The raw capture source to pump frames from.
 	source: Getter<Source | undefined>;
+	// Clockwise turn a landscape frame needs to appear upright, usually a Camera's `orientation`.
+	// Ignored for portrait frames and for frames that carry their own rotation. Defaults to 0.
+	orientation: Getter<number>;
 };
 
 type CaptureOutput = {
@@ -15,12 +19,12 @@ type CaptureOutput = {
 	// starting with a copy of the current picture; each reader owns the frames it receives and must
 	// close them.
 	frames: Signal<Fanout<VideoFrame> | undefined>;
-	// The captured dimensions, source scale, and the clockwise turn the picture is shown with, sampled
-	// together for each frame.
-	display: Signal<Display | undefined>;
+	// The captured dimensions and source scale, sampled together for each frame.
+	display: Signal<{ width: number; height: number; scale?: number } | undefined>;
+	// Clockwise rotation needed to show the live frames upright. Frames never carry their own
+	// VideoFrame.rotation: it is moved here, so every reader applies exactly one turn.
+	rotation: Signal<number>;
 };
-
-type Display = { width: number; height: number; scale?: number; rotation?: number };
 
 /**
  * Pumps frames off a capture {@link Source} and distributes them to any number of readers.
@@ -31,22 +35,31 @@ type Display = { width: number; height: number; scale?: number; rotation?: numbe
  * picture, so a still source (a screen share of an unchanging slide) is visible to it.
  */
 export class Capture {
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<CaptureInput>;
 
 	readonly #out: CaptureOutput = {
 		frames: new Signal<Fanout<VideoFrame> | undefined>(undefined),
-		display: new Signal<Display | undefined>(undefined),
+		display: new Signal<{ width: number; height: number; scale?: number } | undefined>(undefined),
+		rotation: new Signal(0),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
+
+	// The turn the newest frame declared via VideoFrame.rotation, or undefined where unsupported.
+	#native = new Signal<number | undefined>(undefined);
+	#painted = new Signal<number | undefined>(undefined);
 
 	#signals = new Effect();
 
 	constructor(props?: Inputs<CaptureInput>) {
 		this.in = {
 			source: getter(props?.source),
+			orientation: getter(props?.orientation ?? 0),
 		};
 
 		this.#signals.run(this.#run.bind(this));
+		this.#signals.run(this.#runRotation.bind(this));
 	}
 
 	#run(effect: Effect) {
@@ -56,36 +69,61 @@ export class Capture {
 		// A capture track goes through MediaStreamTrackProcessor, which times each frame on our wall
 		// clock so they stay consistent when the source changes or the encoder reloads. A FrameSource
 		// already stamps against that clock, so take its frames as they are.
-		const stream: ReadableStream<Stamped> =
-			"frames" in source ? source.frames.pipeThrough(asStamped()) : TrackProcessor(normalizeSource(source).track);
+		const stream: ReadableStream<Timed> =
+			"frames" in source ? source.frames.pipeThrough(asTimed()) : TrackProcessor(normalizeSource(source).track);
 
-		const rotation = new Signal(0);
-		if (!("frames" in source) && !reportsRotation()) watchRotation(effect, normalizeSource(source).track, rotation);
-
-		const fanout = new Frames(stream.pipeThrough(this.#measure(source, rotation)));
+		const fanout = new Frames(stream.pipeThrough(this.#measure(source)));
 		effect.cleanup(() => fanout.close());
+		if (!("frames" in source) && !reportsRotation())
+			watchRotation(effect, normalizeSource(source).track, this.#painted);
 
 		effect.set(this.#out.frames, fanout, undefined);
 		effect.cleanup(() => {
 			this.#out.display.set(undefined);
+			this.#native.set(undefined);
+			this.#painted.set(undefined);
 		});
 	}
 
+	// Derived from the live frames rather than the track settings: Safari reports the requested size
+	// until the first frame arrives, then the delivered size without an event.
+	#runRotation(effect: Effect) {
+		const display = effect.get(this.#out.display);
+		if (!display) return;
+
+		// A browser that exposes VideoFrame.rotation describes the frame fully, even when it says 0.
+		const native = effect.get(this.#native);
+		const landscape = display.width > display.height;
+		const rotation = native ?? effect.get(this.#painted) ?? (landscape ? effect.get(this.in.orientation) : 0);
+		effect.set(this.#out.rotation, rotation, 0);
+	}
+
 	// Sample live source metadata even when the coded dimensions stay unchanged.
-	#measure(source: Source, rotation: Signal<number>): TransformStream<Stamped, Stamped> {
-		return new TransformStream<Stamped, Stamped>({
-			transform: (stamped, controller) => {
-				const { frame } = stamped;
+	#measure(source: Source): TransformStream<Timed, Timed> {
+		return new TransformStream<Timed, Timed>({
+			transform: ({ frame: input, timestamp }, controller) => {
+				let frame = input;
 				try {
 					const scale = "frames" in source ? undefined : normalizeSource(source).scale;
-					const turn = (frame as VideoFrame & { rotation?: number }).rotation ?? rotation.peek();
-					this.#out.display.set({
-						width: frame.codedWidth,
-						height: frame.codedHeight,
-						scale,
-						rotation: turn || undefined,
-					});
-					controller.enqueue(stamped);
+					this.#out.display.set({ width: frame.codedWidth, height: frame.codedHeight, scale });
+
+					// Readers would otherwise turn a tagged frame twice: once natively when drawing, again
+					// for `out.rotation`. The encoder would also copy it into its decoder config. A
+					// constructor rotation adds to the frame's own, so cancel it here.
+					const tagged = frame as VideoFrame & { rotation?: number; flip?: boolean };
+					let native = tagged.rotation;
+					if (native) {
+						// A mirrored frame subtracts a constructor rotation, and its mirror, drawn natively first,
+						// makes the picture need the opposite turn.
+						frame = new VideoFrame(input, {
+							rotation: tagged.flip ? native : 360 - native,
+						} as VideoFrameInit);
+						input.close();
+						if (tagged.flip) native = 360 - native;
+					}
+					this.#native.set(native);
+
+					controller.enqueue({ frame, timestamp });
 				} catch (error) {
 					frame.close();
 					throw error;
@@ -94,12 +132,14 @@ export class Capture {
 		});
 	}
 
+	/** Stop and release everything this holds. */
 	close() {
 		this.#signals.close();
 	}
 }
 
-// A fanout that holds the newest frame and opens every new reader with a copy of it. A still source
+// A fanout that stamps each frame as it goes out, holds the newest one, and opens every new reader
+// with a copy of it. A still source
 // delivers a frame only when its picture changes, so without this a reader that attaches later (a
 // late viewer, an encoder resuming after a demand gap) waits for a change that may never come.
 // Video only: replaying audio would repeat sound.
@@ -111,23 +151,27 @@ class Frames extends Fanout<VideoFrame> {
 	// Copies handed to new readers and not yet read, released on close like the fanout's own queues.
 	readonly #unread = new Set<VideoFrame>();
 
-	constructor(source: ReadableStream<Stamped>) {
-		const held: Held = { closed: false };
-		const hold = new TransformStream<Stamped, VideoFrame>({
+	// The latest stamp handed to a new reader. Live frames follow the source's order, but a replay is
+	// stamped here, and a later frame can be held below it.
+	#replayed = 0;
+
+	constructor(source: ReadableStream<Timed>) {
+		const held: Held = { closed: false, timestamp: 0, at: Instant(0) };
+		const hold = new TransformStream<Timed, VideoFrame>({
 			transform: ({ frame, timestamp }, controller) => {
 				held.frame?.close();
 				held.frame = held.closed ? undefined : frame.clone();
-				if (frame.timestamp === timestamp) {
-					controller.enqueue(frame);
-					return;
-				}
+				held.at = now();
 
-				let stamped: VideoFrame;
-				try {
-					stamped = new VideoFrame(frame, { timestamp });
-				} finally {
-					frame.close();
+				let stamped = frame;
+				if (frame.timestamp !== timestamp) {
+					try {
+						stamped = new VideoFrame(frame, { timestamp });
+					} finally {
+						frame.close();
+					}
 				}
+				held.timestamp = stamped.timestamp;
 				controller.enqueue(stamped);
 			},
 		});
@@ -149,7 +193,13 @@ class Frames extends Fanout<VideoFrame> {
 
 		// Re-stamped to now. The held frame may be minutes old, and publishing it at its capture time
 		// would deliver it that late, a delay the jitter estimate keeps for the life of the stream.
-		const at = Time.Micro.fromMilli(performance.now() as Time.Milli);
+		// Capture stamps can run ahead of the clock (the first frame's arrival anchors them), so now
+		// alone could fall below frames an earlier reader published, rewinding a track resumed after a
+		// gap. Never stamp below the held stamp plus how long it was held, nor below an earlier replay.
+		const clock = now();
+		const elapsed = Nano.toMicro(Instant.durationSince(clock, this.#held.at));
+		const at = Math.round(Math.max(this.#held.timestamp + elapsed, Nano.toMicro(Nano(clock)), this.#replayed));
+		this.#replayed = at;
 		let first: VideoFrame | undefined = new VideoFrame(held, { timestamp: at });
 		this.#unread.add(first);
 		const release = () => {
@@ -159,6 +209,7 @@ class Frames extends Fanout<VideoFrame> {
 		effect.cleanup(release);
 
 		const reader = live.getReader();
+		let cancelled = false;
 		return new ReadableStream<VideoFrame>(
 			{
 				pull: async (controller) => {
@@ -173,7 +224,13 @@ class Frames extends Fanout<VideoFrame> {
 					for (;;) {
 						const { value } = await reader.read();
 						if (!value) {
-							controller.close();
+							if (!cancelled) controller.close();
+							return;
+						}
+
+						// Cancelled while this read was resolving, so the stream can no longer take it.
+						if (cancelled) {
+							value.close();
 							return;
 						}
 
@@ -187,6 +244,7 @@ class Frames extends Fanout<VideoFrame> {
 					}
 				},
 				cancel: async (reason) => {
+					cancelled = true;
 					release();
 					await reader.cancel(reason);
 				},
@@ -207,10 +265,11 @@ class Frames extends Fanout<VideoFrame> {
 	}
 }
 
-type Held = { frame?: VideoFrame; closed: boolean };
+// The newest frame before stamping, its stamp, when it came through, and whether the fanout closed.
+type Held = { frame?: VideoFrame; timestamp: number; at: Instant; closed: boolean };
 
-function asStamped(): TransformStream<VideoFrame, Stamped> {
-	return new TransformStream<VideoFrame, Stamped>({
+function asTimed(): TransformStream<VideoFrame, Timed> {
+	return new TransformStream<VideoFrame, Timed>({
 		transform: (frame, controller) => controller.enqueue({ frame, timestamp: frame.timestamp }),
 	});
 }

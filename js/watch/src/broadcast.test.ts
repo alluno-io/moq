@@ -1,5 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as Catalog from "@moq/hang/catalog";
+import * as Json from "@moq/json";
+import * as Msf from "@moq/msf";
 import * as Moq from "@moq/net";
 import { Origin, Path } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -54,6 +56,139 @@ const video = (codec: string, broadcast?: string): Catalog.VideoConfig =>
 
 it("refuses the released reload input", () => {
 	expect(() => new Broadcast({ reload: true } as never)).toThrow("renamed to `announced`");
+});
+
+describe("unsupported catalog", () => {
+	it("reports an inline catalog needing a newer player and clears on replacement or disable", async () => {
+		const logged = spyOn(console, "error").mockImplementation(() => {});
+		const catalog = new Signal<Catalog.Root | undefined>({ version: Catalog.VERSION + 1 });
+		const enabled = new Signal(true);
+		const source = new Broadcast({ catalogFormat: "manual", catalog, enabled });
+		try {
+			await Promise.resolve();
+			expect(source.out.status.peek()).toBe("unsupported");
+			expect(source.out.catalog.peek()).toBeUndefined();
+			expect(source.out.error.peek()).toBeUndefined();
+
+			let changed = source.out.status.changed();
+			catalog.set({});
+			await changed;
+			expect(source.out.status.peek()).toBe("live");
+
+			changed = source.out.status.changed();
+			const cleared = source.out.catalog.changed();
+			catalog.set({ version: Catalog.VERSION + 1 });
+			await changed;
+			await cleared;
+			expect(source.out.status.peek()).toBe("unsupported");
+			expect(source.out.catalog.peek()).toBeUndefined();
+
+			changed = source.out.status.changed();
+			enabled.set(false);
+			await changed;
+			expect(source.out.status.peek()).toBe("offline");
+		} finally {
+			source.close();
+			logged.mockRestore();
+		}
+	});
+
+	for (const format of ["hang", "hangz"] as const) {
+		it(`reports a fetched ${format} catalog needing a newer player and clears stale media`, async () => {
+			const logged = spyOn(console, "error").mockImplementation(() => {});
+			const owner = new Origin.Producer();
+			const name = Path.from("room/live.hang");
+			const published = publish(owner, name);
+			const track = published.createTrack(format === "hang" ? Catalog.TRACK : Catalog.TRACK_COMPRESSED);
+			const producer = new Json.Snapshot.Producer<Catalog.Root>({
+				track,
+				deltas: false,
+				compression: format === "hangz" ? "deflate" : "none",
+			});
+			const enabled = new Signal(true);
+			const source = new Broadcast({ origin: owner, name, catalogFormat: format, enabled });
+			try {
+				const ready = source.out.catalog.changed();
+				producer.update({ value: {} });
+				await ready;
+				expect(source.out.status.peek()).toBe("live");
+
+				const rejected = source.out.status.changed();
+				const cleared = source.out.catalog.changed();
+				producer.update({ value: { version: Catalog.VERSION + 1 } });
+				await rejected;
+				await cleared;
+				expect(source.out.status.peek()).toBe("unsupported");
+				expect(source.out.catalog.peek()).toBeUndefined();
+				expect(source.out.error.peek()).toBeUndefined();
+
+				const disabled = source.out.status.changed();
+				enabled.set(false);
+				await disabled;
+				expect(source.out.status.peek()).toBe("offline");
+			} finally {
+				source.close();
+				producer.finish();
+				owner.close();
+				logged.mockRestore();
+			}
+		});
+	}
+});
+
+// Regression: a finished catalog track dropped the catalog at once, so a publisher finishing its
+// broadcast cut every viewer off before it drained the tail the broadcast still served.
+it("keeps playing a finished catalog until the broadcast ends", async () => {
+	const owner = new Origin.Producer();
+	const name = Path.from("room/live.hang");
+	const published = publish(owner, name);
+	const producer = new Json.Snapshot.Producer<Catalog.Root>({
+		track: published.createTrack(Catalog.TRACK),
+		deltas: false,
+	});
+	const source = new Broadcast({ origin: owner, name, catalogFormat: "hang", enabled: true });
+	try {
+		const ready = source.out.catalog.changed();
+		producer.update({ value: { video: { renditions: { hd: video("avc1.640028") } } } });
+		await ready;
+		expect(source.out.status.peek()).toBe("live");
+
+		producer.finish();
+		await settle();
+		expect(source.out.status.peek()).toBe("live");
+		expect(videoRenditions(source)).toEqual(["hd"]);
+
+		published.close();
+		await settle();
+		expect(source.out.status.peek()).toBe("offline");
+		expect(source.out.catalog.peek()).toBeUndefined();
+	} finally {
+		source.close();
+		owner.close();
+	}
+});
+
+// A catalog track that ends before its first snapshot has nothing to play, so it reads as offline.
+it("reports a catalog that ends empty as offline", async () => {
+	const owner = new Origin.Producer();
+	const name = Path.from("room/live.hang");
+	const published = publish(owner, name);
+	const producer = new Json.Snapshot.Producer<Catalog.Root>({
+		track: published.createTrack(Catalog.TRACK),
+		deltas: false,
+	});
+	const source = new Broadcast({ origin: owner, name, catalogFormat: "hang", enabled: true });
+	try {
+		await settle();
+		producer.finish();
+		await settle();
+		expect(source.out.status.peek()).toBe("offline");
+		expect(source.out.catalog.peek()).toBeUndefined();
+	} finally {
+		published.close();
+		source.close();
+		owner.close();
+	}
 });
 
 describe("relativeBroadcast", () => {
@@ -122,6 +257,9 @@ describe("relativeBroadcast", () => {
 			// The catalog is validated by an effect, which settles a microtask later.
 			await Promise.resolve();
 			expect(source.out.catalog.peek()).toBeUndefined();
+			expect(source.out.status.peek()).toBe(
+				logged instanceof Catalog.UnsupportedVersion ? "unsupported" : "loading",
+			);
 			return logged;
 		} finally {
 			console.error = error;
@@ -140,14 +278,31 @@ describe("relativeBroadcast", () => {
 		expect(await rejection(catalog)).toBeInstanceOf(Catalog.EscapingBroadcast);
 	});
 
+	it("rejects a catalog needing a newer reader or with a malformed version", async () => {
+		// A manual catalog goes through the same schema as a fetched one.
+		const catalog = (version: unknown) =>
+			({ version, video: { renditions: { good: rendition() } } }) as unknown as Catalog.Root;
+		expect(await rejection(catalog(Catalog.VERSION + 1))).toBeInstanceOf(Catalog.UnsupportedVersion);
+		for (const malformed of [-1, Number.NaN, 4.5, "4"]) {
+			const err = await rejection(catalog(malformed));
+			expect(err).toBeInstanceOf(Error);
+			expect(err).not.toBeInstanceOf(Catalog.UnsupportedVersion);
+		}
+	});
+
 	it("rejects a catalog whose text or data track escapes the root", async () => {
 		// The shared hang check runs here too, so every section it covers rejects the catalog.
 		const broadcast = Path.normalizeRelative("../../x");
 		for (const section of ["text", "json", "binary"] as const) {
 			const key = section === "text" ? "renditions" : "tracks";
+			// Otherwise valid, so the schema passes it and the reference check is what refuses it.
+			const entry =
+				section === "text"
+					? { broadcast, format: "vtt", container: { kind: "legacy" } }
+					: { broadcast, mode: "stream" };
 			const catalog = {
 				video: { renditions: { good: rendition() } },
-				[section]: { [key]: { entry: { broadcast } } },
+				[section]: { [key]: { entry } },
 			} as Catalog.Root;
 			expect(await rejection(catalog)).toBeInstanceOf(Catalog.EscapingBroadcast);
 		}
@@ -166,6 +321,122 @@ describe("relativeBroadcast", () => {
 			expect(Object.keys(renditions).sort()).toEqual(["good", "root", "sibling"]);
 		} finally {
 			source.close();
+			owner.close();
+		}
+	});
+
+	it("reads a reference only from the epoch it names, best effort without one", async () => {
+		const owner = new Origin.Producer();
+		const [catalogEpoch, siblingEpoch, other] = [Moq.Epoch.mint(), Moq.Epoch.mint(), Moq.Epoch.mint()];
+		const catalog = owner.createBroadcast(Path.from("a/b"));
+		catalog.announce({ epoch: catalogEpoch });
+		const sibling = owner.createBroadcast(Path.from("a/source"));
+		sibling.announce({ epoch: siblingEpoch });
+		const plain = publish(owner, Path.from("a/plain"));
+		const source = new Broadcast({
+			origin: owner,
+			name: Path.from("a/b"),
+			enabled: true,
+			announced: false,
+			catalogFormat: "manual",
+		});
+		const effect = new Effect();
+		try {
+			await settle();
+			const rel = Path.normalizeRelative("./source");
+			expect(source.relativeBroadcast(effect, rel)?.epoch).toBe(siblingEpoch);
+			expect(source.relativeBroadcast(effect, rel, siblingEpoch)?.epoch).toBe(siblingEpoch);
+			const own = source.out.active.peek();
+			expect(own?.epoch).toBe(catalogEpoch);
+			expect(source.relativeBroadcast(effect, undefined, catalogEpoch)).toBe(own);
+			withoutWarnings(() => {
+				expect(source.relativeBroadcast(effect, rel, other)).toBeUndefined();
+				expect(source.relativeBroadcast(effect, undefined, other)).toBeUndefined();
+				expect(source.relativeBroadcast(effect, Path.normalizeRelative("./b"), other)).toBeUndefined();
+			});
+			// An epochless route cannot prove its instance, so the epoch cannot refuse it.
+			expect(source.relativeBroadcast(effect, Path.normalizeRelative("./plain"), other)).toBeDefined();
+		} finally {
+			effect.close();
+			source.close();
+			plain.close();
+			sibling.close();
+			catalog.close();
+			owner.close();
+		}
+	});
+
+	it("follows a replaced sibling only for a reference that names no epoch", async () => {
+		const owner = new Origin.Producer();
+		const main = publish(owner, Path.from("a/b"));
+		const [oldEpoch, newEpoch] = [Moq.Epoch.mint(), Moq.Epoch.mint()];
+		const old = owner.createBroadcast(Path.from("a/source"));
+		old.announce({ epoch: oldEpoch });
+		const source = new Broadcast({
+			origin: owner,
+			name: Path.from("a/b"),
+			enabled: true,
+			catalogFormat: "manual",
+		});
+		const effect = new Effect();
+		const rel = Path.normalizeRelative("./source");
+		let following: Moq.Broadcast.Consumer | undefined;
+		let pinned: Moq.Broadcast.Consumer | undefined;
+		effect.run((nested) => {
+			following = source.relativeBroadcast(nested, rel);
+		});
+		effect.run((nested) => {
+			pinned = withoutWarnings(() => source.relativeBroadcast(nested, rel, oldEpoch));
+		});
+		try {
+			await settle();
+			expect(following?.epoch).toBe(oldEpoch);
+			expect(pinned?.epoch).toBe(oldEpoch);
+
+			// The announcement is the online signal: the plain reference follows the restart,
+			// while one naming the old instance never reads the new one.
+			const replacement = owner.createBroadcast(Path.from("a/source"));
+			replacement.announce({ epoch: newEpoch });
+			await settle();
+			expect(following?.epoch).toBe(newEpoch);
+			expect(pinned).toBeUndefined();
+			replacement.close();
+		} finally {
+			effect.close();
+			source.close();
+			old.close();
+			main.close();
+			owner.close();
+		}
+	});
+
+	it("drops a rendition from the catalog while its broadcast proves another epoch", async () => {
+		const owner = new Origin.Producer();
+		const main = publish(owner, Path.from("a/b"));
+		const [oldEpoch, newEpoch] = [Moq.Epoch.mint(), Moq.Epoch.mint()];
+		const old = owner.createBroadcast(Path.from("a/source"));
+		old.announce({ epoch: oldEpoch });
+		const named = { ...video("avc1.64001f", "./source"), epoch: oldEpoch } as Catalog.VideoConfig;
+		const source = new Broadcast({
+			origin: owner,
+			name: Path.from("a/b"),
+			enabled: true,
+			catalogFormat: "manual",
+			catalog: { video: { renditions: { plain: video("avc1.64001f", "./source"), named } } } as Catalog.Root,
+		});
+		try {
+			await settle();
+			expect(videoRenditions(source)).toEqual(["named", "plain"]);
+
+			const replacement = owner.createBroadcast(Path.from("a/source"));
+			replacement.announce({ epoch: newEpoch });
+			await withoutWarnings(settle);
+			expect(videoRenditions(source)).toEqual(["plain"]);
+			replacement.close();
+		} finally {
+			source.close();
+			old.close();
+			main.close();
 			owner.close();
 		}
 	});
@@ -207,7 +478,7 @@ describe("blind resolution", () => {
 
 		// Stand in for a dynamic route answering the request.
 		const upstream = new Moq.Broadcast.Producer();
-		const route = owner.dynamic(Path.from("blind.hang"));
+		const route = owner.dynamicRoute(Path.from("blind.hang"));
 		const requests = route.requested();
 		const next = await requests.next();
 		expect(next.done).toBe(false);
@@ -319,7 +590,7 @@ describe("restart", () => {
 	it("moves to a more specific announcement of another instance", async () => {
 		const owner = new Origin.Producer();
 		const name = Path.from("pool/job.hang");
-		const pool = owner.dynamic(Path.from("pool"), { epoch: Moq.Epoch.mint() });
+		const pool = owner.dynamicRoute(Path.from("pool"), { epoch: Moq.Epoch.mint() });
 		const requests = pool.requested();
 		const upstream = new Moq.Broadcast.Producer();
 		void (async () => {
@@ -365,7 +636,7 @@ describe("restart", () => {
 		// The exact route goes, which ends the request on it, and the prefix arrives under the same
 		// epoch before the table is read again. The player still has to ask again.
 		exact.close();
-		const pool = owner.dynamic(Path.from("pool"), { epoch });
+		const pool = owner.dynamicRoute(Path.from("pool"), { epoch });
 		const requests = pool.requested();
 		const upstream = new Moq.Broadcast.Producer();
 		void (async () => {
@@ -387,7 +658,7 @@ describe("restart", () => {
 	it("falls back to a covering prefix when the exact route ends", async () => {
 		const owner = new Origin.Producer();
 		const name = Path.from("pool/job.hang");
-		const pool = owner.dynamic(Path.from("pool"));
+		const pool = owner.dynamicRoute(Path.from("pool"));
 		const requests = pool.requested();
 		const upstream = new Moq.Broadcast.Producer();
 		void (async () => {
@@ -425,7 +696,7 @@ describe("refusal", () => {
 		const owner = new Origin.Producer();
 		const name = Path.from("room/live.hang");
 		const upstream = new Moq.Broadcast.Producer();
-		const first = owner.dynamic(Path.from("room"), { epoch: Moq.Epoch.mint() });
+		const first = owner.dynamicRoute(Path.from("room"), { epoch: Moq.Epoch.mint() });
 		const firstRequests = first.requested();
 		void (async () => {
 			for await (const request of firstRequests) request.accept(upstream);
@@ -435,7 +706,7 @@ describe("refusal", () => {
 		expect(source.out.active.peek()).toBeDefined();
 
 		// The restarted publisher refuses with the same code an ended instance reports.
-		const second = owner.dynamic(Path.from("room"), { epoch: Moq.Epoch.mint() });
+		const second = owner.dynamicRoute(Path.from("room"), { epoch: Moq.Epoch.mint() });
 		const refused = await second.requested().next();
 		refused.value?.reject(new Moq.Error.Stream(Moq.StreamCode.Unroutable, { message: "refused" }));
 		await settle();
@@ -473,7 +744,7 @@ describe("refusal", () => {
 	for (const announced of [true, false]) {
 		it(`reports a refusal until a fresh request (announced: ${announced})`, async () => {
 			const owner = new Origin.Producer();
-			const route = owner.dynamic(Path.from("room"));
+			const route = owner.dynamicRoute(Path.from("room"));
 			const requests = route.requested();
 			const name = new Signal(Path.from("room/refused.hang"));
 			const enabled = new Signal(true);
@@ -755,7 +1026,7 @@ describe("wildcard renditions", () => {
 			await settle();
 			expect(videoRenditions(source)).toEqual(["source"]);
 
-			const worker = owner.dynamic(Path.from(".pro/transcode"));
+			const worker = owner.dynamicRoute(Path.from(".pro/transcode"));
 			const requests = worker.requested();
 			await settle();
 			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
@@ -804,8 +1075,8 @@ describe("wildcard renditions", () => {
 
 		try {
 			// A catch-all (an archive) and a narrower pool both cover the derived path.
-			const archive = owner.dynamic(Path.empty());
-			const worker = owner.dynamic(Path.from(".pro/transcode"));
+			const archive = owner.dynamicRoute(Path.empty());
+			const worker = owner.dynamicRoute(Path.from(".pro/transcode"));
 			await settle();
 			expect(videoRenditions(source)).toEqual(["source", "transcode"]);
 
@@ -847,4 +1118,54 @@ describe("manual catalog", () => {
 			owner.close();
 		}
 	});
+});
+
+it("subscribes a cross-broadcast MSF rendition on its namespace", async () => {
+	const owner = new Origin.Producer();
+	const catalogBroadcast = publish(owner, Path.from("room/catalog.msf"));
+	const referenced = publish(owner, Path.from("room/left"));
+	catalogBroadcast.createTrack("video").writeFrame({ payload: new Uint8Array([1]) });
+	referenced.createTrack("video").writeFrame({ payload: new Uint8Array([2]) });
+	catalogBroadcast.createTrack("catalog").writeFrame({
+		payload: Msf.encode({
+			tracks: [
+				{
+					name: "video",
+					namespace: "room/left",
+					packaging: "loc",
+					role: "video",
+					codec: "vp8",
+				},
+			],
+		}),
+	});
+	const source = new Broadcast({
+		origin: owner,
+		name: Path.from("room/catalog.msf"),
+		enabled: true,
+		announced: false,
+	});
+	const effect = new Effect();
+	try {
+		await settle();
+		const config = source.out.catalog.peek()?.video?.renditions.video;
+		if (!config) throw new Error("MSF rendition missing");
+		let active: Moq.Broadcast.Consumer | undefined;
+		effect.run((inner) => {
+			active = source.relativeBroadcast(inner, config.broadcast);
+		});
+		await settle();
+		if (!active) throw new Error("referenced broadcast did not resolve");
+		const track = active.track("video").subscribe();
+		try {
+			const frame = await track.ordered().readFrame();
+			expect(frame?.payload).toEqual(new Uint8Array([2]));
+		} finally {
+			track.close();
+		}
+	} finally {
+		effect.close();
+		source.close();
+		owner.close();
+	}
 });

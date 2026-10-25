@@ -3,9 +3,10 @@
 use std::task::Poll;
 use std::time::Duration;
 
-use web_async::time::Instant;
+use moq_clock::Instant;
 
 use crate::catalog::{CatalogFormat, Stream};
+use crate::container::consumer::Event;
 use crate::container::{ExportSource, Frame};
 use crate::jitter::{self, Arrival, Push};
 
@@ -19,13 +20,16 @@ use crate::jitter::{self, Arrival, Push};
 /// releases fed the same objects write the same bytes. An object that arrives past its
 /// deadline is dropped and counted; the output shows a continuity error there, since nothing
 /// is rewritten, and carries on with the next object. A flagged forward jump, which the
-/// importer marks by skipping a group sequence, opens a new clock once it leaps further than
-/// the delay, so the output does not wait it out; the bytes carry the jump.
+/// importer declares with a discontinuity marker, opens a new clock, so the output does not
+/// wait it out; the bytes carry the jump.
 pub struct Release {
 	source: crate::Source,
 	catalog: Option<crate::catalog::Consumer<()>>,
 	/// The `m2ts` track, once a catalog names it.
 	track: Option<(String, ExportSource)>,
+	/// When the track was subscribed. Nothing it delivers reached the release before then,
+	/// however long the cache held it.
+	subscribed: Instant,
 	finished: bool,
 	/// An object has gone out.
 	released: bool,
@@ -49,6 +53,7 @@ impl Release {
 			source,
 			catalog: Some(catalog),
 			track: None,
+			subscribed: moq_clock::now(),
 			finished: false,
 			released: false,
 			delay: Duration::ZERO,
@@ -101,12 +106,28 @@ impl Release {
 		self.jitter.out_of_tolerance()
 	}
 
+	/// Snapshot how the release clock is keeping up with the source.
+	pub fn stats(&self) -> super::stats::Release {
+		let mut stats = super::stats::Release::of(&self.jitter);
+		if let Some((_, track)) = &self.track {
+			stats.gaps = track.skips() - track.markers();
+		}
+		stats
+	}
+
+	/// How many objects are waiting in the jitter buffer.
+	#[cfg(test)]
+	pub(super) fn buffered(&self) -> usize {
+		self.jitter.len()
+	}
+
 	/// The next object, at its time: whole TS packets, verbatim, stamped with the PCR time of
 	/// its first byte. Returns `None` once the track, or a catalog that never named one, ends.
 	pub async fn next(&mut self) -> crate::Result<Option<Frame>> {
 		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 
+	/// Poll for the next original MPEG-TS frame at its release time, or `None` at end.
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Frame>>> {
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
@@ -120,8 +141,12 @@ impl Release {
 			&& let Some((name, track)) = self.track.as_mut()
 		{
 			loop {
-				let frame = match track.poll_read(waiter) {
-					Poll::Ready(Ok(Some(frame))) => frame,
+				if self.jitter.full(&()) {
+					break;
+				}
+				let (frame, arrived) = match track.poll_event(waiter) {
+					Poll::Ready(Ok(Some(Event::Frame { frame, arrived }))) => (frame, arrived),
+					Poll::Ready(Ok(Some(Event::GroupEnd | Event::FrameEnd { .. } | Event::Cut))) => continue,
 					Poll::Ready(Ok(None)) => {
 						self.finished = true;
 						break;
@@ -129,18 +154,19 @@ impl Release {
 					Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
 					Poll::Pending => break,
 				};
-				// The track wakes the release as each object lands, so the read times its arrival.
-				// The last empty poll would let one landing past its deadline out late instead.
-				let read = Instant::now();
+				// Judged on when the object landed, so a sink that leaves arrived objects unread
+				// does not make them late, and a stall of the whole path does not hide that they are.
 				let arrival = Arrival {
-					arrived: read,
-					read,
-					decode: frame.timestamp,
+					arrived: arrived.max(self.subscribed),
+					read: moq_clock::now(),
+					decode: frame.timestamp.into(),
 					restart: track.markers(),
 					skip: track.skips(),
+					cut: track.cuts(),
 					// The output opens on a group, at a random access point; from then on every
 					// object goes out on its own, so one dropped late is a gap of its packets only.
 					sync: frame.keyframe || self.released,
+					leading: false,
 					item: frame,
 				};
 				if self.jitter.push((), arrival)? == Push::Late {
@@ -182,6 +208,7 @@ impl Release {
 					false => source.live(),
 				};
 				self.track = Some((m2ts.track.clone(), source));
+				self.subscribed = moq_clock::now();
 			}
 			Some((name, _)) if *name != m2ts.track => {
 				return Err(anyhow::anyhow!("the `m2ts` track moved from `{name}` to `{}`", m2ts.track).into());

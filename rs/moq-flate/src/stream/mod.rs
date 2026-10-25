@@ -22,13 +22,15 @@
 //! Instead an append that might not fit is refused with [`moq_net::Error::GroupTooLarge`] before
 //! it is encoded, and the log stays intact and writable. With compression the check counts the
 //! payload's raw size plus DEFLATE's worst-case overhead ([`Encoder::bound`](crate::Encoder::bound)),
-//! since the compressed size is only known once the window has moved. The budget is below the
-//! decoder's [`DEFAULT_MAX_FRAME_SIZE`](crate::DEFAULT_MAX_FRAME_SIZE), so any payload that fits is
-//! one every consumer can inflate. The budget covers the whole log rather than a single payload, so
+//! since the compressed size is only known once the window has moved, and each written payload is
+//! charged its inflated size: the [`Decoder`](crate::Decoder) holds its window to the same budget, so
+//! compression shrinks the wire but not how much a log can hold. The budget covers the whole log rather than a single payload, so
 //! once it is spent every append is refused: the live stream is bounded history by design, and a
 //! publisher with more to say opens a new track.
 
 use crate::Compression;
+#[cfg(test)]
+use futures::FutureExt;
 
 pub mod consumer;
 pub mod producer;
@@ -59,6 +61,51 @@ mod test {
 
 	use super::*;
 
+	/// Refused before the log's group opens, so the log carries on rather than ending.
+	#[test]
+	fn a_timed_track_refuses_a_bare_publish() {
+		let (mut producer, track) = producer_on(false, timed());
+		assert!(matches!(
+			producer.append(&b"zero"[..]),
+			Err(crate::Error::Net(moq_net::Error::TimestampMismatch))
+		));
+		let at = moq_net::Timestamp::from_millis(100).unwrap();
+		producer
+			.append(moq_net::Timed::<Bytes>::from(&b"one"[..]).at(at))
+			.unwrap();
+		assert!(matches!(
+			producer.append(&b"two"[..]),
+			Err(crate::Error::Net(moq_net::Error::TimestampMismatch))
+		));
+		producer
+			.append(moq_net::Timed::<Bytes>::from(&b"three"[..]).at(at))
+			.unwrap();
+		producer.finish().unwrap();
+		assert_eq!(
+			drain(track, false),
+			vec![Bytes::from_static(b"one"), Bytes::from_static(b"three")]
+		);
+	}
+
+	#[test]
+	fn a_bare_publish_stays_untimed() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("untimed", moq_net::track::Info::default())
+			.unwrap();
+		let mut groups = track.subscribe(None);
+		let mut producer = Producer::new(track, Config::default());
+		producer.append(&b"payload"[..]).unwrap();
+		let waiter = kio::Waiter::noop();
+		let Poll::Ready(Ok(Some(mut group))) = groups.poll_recv_group(&waiter) else {
+			panic!("expected an untimed group");
+		};
+		let Poll::Ready(Ok(Some(frame))) = group.poll_read_frame(&waiter) else {
+			panic!("expected an untimed frame");
+		};
+		assert_eq!(frame.timestamp, None);
+	}
+
 	/// A millisecond track: the frames written here carry timestamps.
 	fn timed() -> moq_net::track::Info {
 		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
@@ -75,9 +122,13 @@ mod test {
 	}
 
 	fn producer(compression: bool) -> (Producer, moq_net::track::Subscriber) {
+		producer_on(compression, moq_net::track::Info::default())
+	}
+
+	fn producer_on(compression: bool, info: moq_net::track::Info) -> (Producer, moq_net::track::Subscriber) {
 		let track = moq_net::broadcast::Info::new()
 			.produce()
-			.create_track("test", timed())
+			.create_track("test", info)
 			.unwrap();
 		let consumer = track.subscribe(None);
 		(Producer::new(track, cfg(compression)), consumer)
@@ -89,7 +140,7 @@ mod test {
 		let waiter = kio::Waiter::noop();
 		let mut out = Vec::new();
 		while let Poll::Ready(Ok(Some(payload))) = consumer.poll_next(&waiter) {
-			out.push(payload);
+			out.push(payload.value);
 		}
 		out
 	}
@@ -100,7 +151,7 @@ mod test {
 
 	#[test]
 	fn every_payload_survives_in_order() {
-		let (mut producer, track) = producer(false);
+		let (mut producer, mut track) = producer(false);
 		let expected = payloads(5);
 		for payload in &expected {
 			producer.append(payload.clone()).unwrap();
@@ -108,20 +159,25 @@ mod test {
 		producer.finish().unwrap();
 
 		// One group holds the whole log, unlike snapshot's group-per-value.
-		assert_eq!(track.latest(), Some(0));
+		assert_eq!(
+			track.largest().now_or_never().flatten().map(|position| position.group),
+			Some(0)
+		);
 		assert_eq!(drain(track, false), expected);
 	}
 
-	/// Each record keeps its own capture time, and a bare payload is stamped when written.
+	/// Each record keeps its caller-supplied capture time.
 	#[test]
 	fn a_stamped_append_writes_its_capture_time() {
-		let (mut producer, _track) = producer(true);
+		let (mut producer, _track) = producer_on(true, timed());
 		let mut groups = producer.consume();
 		let captured = moq_net::Timestamp::from_millis(1_234).unwrap();
 		let first = producer
 			.append(moq_net::Timed::from(vec![1u8; 4096]).at(captured))
 			.unwrap();
-		producer.append(vec![2u8; 16]).unwrap();
+		producer
+			.append(moq_net::Timed::from(vec![2u8; 16]).at(moq_net::Timestamp::from_millis(2_345).unwrap()))
+			.unwrap();
 
 		let waiter = kio::Waiter::noop();
 		let Poll::Ready(Ok(Some(mut group))) = groups.poll_recv_group(&waiter) else {
@@ -136,18 +192,6 @@ mod test {
 			panic!("expected a frame");
 		};
 		assert_ne!(frame.timestamp.unwrap().as_micros(), captured.as_micros());
-	}
-
-	#[test]
-	fn compressed_roundtrip_in_order() {
-		let (mut producer, track) = producer(true);
-		let expected = payloads(20);
-		for payload in &expected {
-			producer.append(payload.clone()).unwrap();
-		}
-		producer.finish().unwrap();
-
-		assert_eq!(drain(track, true), expected);
 	}
 
 	/// The window spans the whole group, so a repeated payload costs almost nothing after the first.
@@ -214,6 +258,12 @@ mod test {
 			.unwrap()
 	}
 
+	/// `payload` at a time [`rejecting_track`] can't hold: it matches the timed track, so the
+	/// append gets as far as the group before the conversion fails.
+	fn late(payload: &'static [u8]) -> moq_net::Timed<Bytes> {
+		moq_net::Timed::from(Bytes::from_static(payload)).at(moq_net::Timestamp::from_millis(10_000).unwrap())
+	}
+
 	/// A failed write must reach the consumer, not just the caller. A clean close drains a reader to
 	/// `None`, which is exactly what a completed log looks like, so a truncated log would be
 	/// indistinguishable from a whole one.
@@ -223,7 +273,7 @@ mod test {
 		let mut subscriber = track.subscribe(None);
 		let mut producer = Producer::new(track, Config::default());
 
-		assert!(producer.append(&b"rejected"[..]).is_err());
+		assert!(producer.append(late(b"rejected")).is_err());
 
 		// Aborting the group alone is not enough: the group is dropped from the cache and the reader
 		// still sees a clean end, which is exactly what a completed log looks like.
@@ -240,11 +290,10 @@ mod test {
 
 	/// A payload past the group budget is refused before anything is written, so the log carries
 	/// on: the next payload lands and decodes, which with compression proves the window never
-	/// moved. One past the decoder's cap is refused the same way rather than ending the track.
+	/// moved.
 	#[test]
 	fn an_oversized_payload_is_refused_and_the_log_continues() {
-		let huge = Bytes::from(vec![0u8; crate::DEFAULT_MAX_FRAME_SIZE as usize + 1]);
-		let past_budget = huge.slice(..moq_net::group::MAX_CACHE_BYTES as usize);
+		let past_budget = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize]);
 
 		for compression in [false, true] {
 			let (mut producer, track) = producer(compression);
@@ -254,8 +303,7 @@ mod test {
 				refused(producer.append(past_budget.clone())),
 				"compression={compression}"
 			);
-			assert!(refused(producer.append(huge.clone())), "compression={compression}");
-			assert!(producer.demand().is_used(), "a refusal must not end the track");
+			assert!(producer.demand().wanted().is_some(), "a refusal must not end the track");
 
 			producer.append(&b"second"[..]).unwrap();
 			producer.finish().unwrap();
@@ -271,10 +319,26 @@ mod test {
 	/// A refused first payload opens no group, so a subscriber is not handed an empty one to wait on.
 	#[test]
 	fn a_refused_first_payload_publishes_nothing() {
-		let (mut producer, track) = producer(true);
-		let huge = Bytes::from(vec![0u8; crate::DEFAULT_MAX_FRAME_SIZE as usize + 1]);
+		let (mut producer, mut track) = producer(true);
+		let huge = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize + 1]);
 		assert!(refused(producer.append(huge)));
-		assert_eq!(track.latest(), None);
+		assert_eq!(
+			track.largest().now_or_never().flatten().map(|position| position.group),
+			None
+		);
+	}
+
+	/// A compressed payload is charged its inflated size, since that is what every reader's decoder
+	/// holds the group to: two payloads that each fit, and deflate to almost nothing, still overflow
+	/// the budget together.
+	#[test]
+	fn a_compressed_log_is_charged_its_inflated_size() {
+		let half = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize / 2 + 1]);
+		let (mut producer, track) = producer(true);
+		assert!(producer.append(half.clone()).unwrap() < 64 * 1024);
+		assert!(refused(producer.append(half.clone())));
+		producer.finish().unwrap();
+		assert_eq!(drain(track, true), vec![half]);
 	}
 
 	/// The budget covers the whole log, so once its frames are spent every append is refused, and
@@ -320,8 +384,8 @@ mod test {
 		};
 		assert!(matches!(group.poll_read_frame(&waiter), Poll::Ready(Ok(Some(_)))));
 
-		// Stamped now, which overflows the timescale, so the write fails and ends the log.
-		let Err(crate::Error::Net(written)) = producer.append(&b"rejected"[..]) else {
+		// Too late for the timescale, so the write fails and ends the log.
+		let Err(crate::Error::Net(written)) = producer.append(late(b"rejected")) else {
 			panic!("the write should fail");
 		};
 
@@ -342,19 +406,6 @@ mod test {
 		moq_net::track::Subscription::default().with_max_delay(std::time::Duration::from_secs(30))
 	}
 
-	/// The track ends with the group, so nothing opens a second one and splits the log.
-	#[test]
-	fn a_failed_write_ends_the_track() {
-		let track = rejecting_track();
-		let mut producer = Producer::new(track, Config::default());
-
-		assert!(producer.append(&b"rejected"[..]).is_err());
-		assert!(
-			producer.append(&b"again"[..]).is_err(),
-			"a second append must fail on the closed track rather than open another group"
-		);
-	}
-
 	/// An ended log reports why it ended, even for a payload past the budget: `GroupTooLarge` would
 	/// tell the caller the log is still writable.
 	#[test]
@@ -362,7 +413,7 @@ mod test {
 		let track = rejecting_track();
 		let mut producer = Producer::new(track, Config::default());
 
-		let Err(written) = producer.append(&b"rejected"[..]) else {
+		let Err(written) = producer.append(late(b"rejected")) else {
 			panic!("the write should fail");
 		};
 
@@ -433,7 +484,7 @@ mod test {
 
 		assert!(matches!(
 			consumer.poll_next(&waiter),
-			Poll::Ready(Ok(Some(payload))) if payload == Bytes::from_static(b"first")
+			Poll::Ready(Ok(Some(payload))) if payload.value == Bytes::from_static(b"first")
 		));
 		assert!(matches!(
 			consumer.poll_next(&waiter),
@@ -459,13 +510,13 @@ mod test {
 			.unwrap();
 		let subscriber = track.subscribe(replaying());
 
-		// Publish sequence 1 before sequence 0, the way reordering delivers them.
+		// Publish sequence 1 before sequence 0, the way reordering delivers them. Each still
+		// starts after the one before it.
 		for sequence in [1u64, 0] {
 			let mut flate = crate::Encoder::new();
 			let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
-			group
-				.write_frame(moq_net::Timestamp::now(), flate.frame(&[sequence as u8; 8]))
-				.unwrap();
+			let timestamp = moq_net::Timestamp::from_millis(sequence).unwrap();
+			group.write_frame(timestamp, flate.frame(&[sequence as u8; 8])).unwrap();
 			group.finish().unwrap();
 		}
 		track.finish().unwrap();
@@ -475,7 +526,7 @@ mod test {
 
 		assert!(matches!(
 			consumer.poll_next(&waiter),
-			Poll::Ready(Ok(Some(payload))) if payload == vec![1u8; 8]
+			Poll::Ready(Ok(Some(payload))) if payload.value == vec![1u8; 8]
 		));
 		assert!(matches!(
 			consumer.poll_next(&waiter),

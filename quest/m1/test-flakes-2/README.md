@@ -3,9 +3,9 @@
 ## Goal
 
 A second round after [#4286](https://github.com/moq-dev/moq/pull/4286):
-tests that pass alone but have failed under a loaded `just check` pass
-reliably, each fixed at its cause, never by raising a timeout or adding a
-retry.
+tests that pass alone but have failed under a loaded `just check`, or
+intermittently in CI or interop, pass reliably, each fixed at its cause,
+never by raising a timeout or adding a retry.
 
 ## Plan
 
@@ -21,26 +21,26 @@ Rules every child keeps:
   slow, fix that.
 - A paused clock auto-advances while the runtime idles, so it can fire a
   timer before a real socket delivers. Where real sockets fight the paused
-  clock, make the timers mockable or move the test off real sockets.
+  clock, drive the timers with a `moq_clock::Manual` clock or the sim (every
+  crate's timers run on `moq-clock`), or move the test off real sockets.
+- A mocked clock still flakes when the code jitters its timers with `rand`
+  (the draft-16 cancel race was a retry sweep jittered past a fixed settle
+  budget). Wait out the jitter's whole window, not a count of small steps.
 
 This README's own work, after the children: run `just check --all` several
-times on a loaded machine, as the first round did. moq-tokio's
-`a_subscription_cut_by_the_publisher_disconnecting_does_not_end_clean` is a
-known exception, tracked by [SUBSCRIBE_DROP](/quest/m1/subscribe-drop.md).
+times on a loaded machine, as the first round did.
+
+The redundant failover drift moved to m0 on 2026-10-20 (maintainer) and is
+fixed by [moq-dev/moq#6113](https://github.com/moq-dev/moq/pull/6113).
+
+Added 2026-10-21 and 2026-10-22 (maintainer): failures from the m0/m1
+merge runs, one child each.
 
 Public API: none. Wire: none.
 
 ## Required
 
-- [TS decoded content](/quest/m1/test-flakes-2/ts-video-content.md) - CI's TS compliance decoded-content checks fail only on real loss, and the exporter names every frame it drops
-- [Interop close code](/quest/m1/test-flakes-2/interop-close-code.md) - the browser close-code test reliably sees `unauthorized` for a refused session
-- [Handshake ACK](/quest/m1/test-flakes-2/handshake-ack.md) - the impaired cluster drill's connect survives a lost handshake ACK
-- [Auth refresh mocks time](/quest/m1/test-flakes-2/auth-refresh-mock-time.md) - moq-relay's auth refresh and fixed-lease tests measure a grant's life on one mocked clock
-- [uring teardown close](/quest/m1/test-flakes-2/uring-teardown-close.md) - moq-uring's published-close teardown test holds under load, fixed at its cause
-- [Auth serve signals](/quest/m1/test-flakes-2/auth-serve-signals.md) - moq-cli's auth serve signal tests hold under load
-- [Export failure exit](/quest/m1/test-flakes-2/export-failure-exit.md) - moq-cli's failed-export exit test holds under load
-- [FFI shutdown](/quest/m1/test-flakes-2/ffi-shutdown.md) - moq-ffi's graceful shutdown tests hold under load
-
-## Related
-
-- [Controlled time](/quest/m1/time/README.md) - the systemic fix these rules ask for: every crate on a controlled clock
+- [Media resource instrumentation](/quest/m1/test-flakes-2/resource-instrumentation.md) - the media test stops seeing a playing player report nothing to release
+- [Tone check grace](/quest/m1/test-flakes-2/tone-grace.md) - the interop tone check charges its grace only for audible playback, so a refilling ring under CPU starvation is not a failure
+- [IETF22 fallback](/quest/m1/test-flakes-2/ietf22-fallback.md) - an IETF22 browser viewer follows a fallback within the media lane's bound, keeping its session and its audio
+- [Go reservation grant](/quest/m1/test-flakes-2/go-reservation-grant.md) - the Go reservation test waits for its grant

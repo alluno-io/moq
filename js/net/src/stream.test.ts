@@ -518,7 +518,9 @@ test("Writer reset forwards only a stream error code", async () => {
 		() => undefined,
 		(err: unknown) => err,
 	);
-	expect(sessionResult).toBe(session);
+	// The session code means nothing on a stream; the stream only lost its route.
+	expect(sessionResult).toBeInstanceOf(StreamError);
+	expect((sessionResult as StreamError).code).toBe(StreamCode.Unroutable);
 
 	const stream = new StreamError(StreamCode.DeliveryTimeout);
 	const streamWriter = new Writer(new WritableStream<Uint8Array>(), QUIC);
@@ -534,6 +536,32 @@ test("Writer reset forwards only a stream error code", async () => {
 test("closed is stable, so racing it per frame does not allocate", async () => {
 	const reader = new Reader(new ReadableStream<Uint8Array>(), undefined, QUIC);
 	expect(reader.closed).toBe(reader.closed);
+});
+
+test("reading to FIN builds no error", async () => {
+	// Fixtures built outside the window, and kept alive so an error they retain stays counted.
+	const readers = Array.from(
+		{ length: 32 },
+		() =>
+			new Reader(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new Uint8Array([7]));
+						controller.close();
+					},
+				}),
+				undefined,
+				QUIC,
+			),
+	);
+	const before = heapStats().objectTypeCounts;
+	for (const reader of readers) {
+		expect(await reader.u8()).toBe(7);
+		expect(await reader.done()).toBe(true);
+	}
+	const after = heapStats().objectTypeCounts;
+	expect(after.TypeError ?? 0).toBeLessThanOrEqual(before.TypeError ?? 0);
+	expect(after.Error ?? 0).toBeLessThanOrEqual(before.Error ?? 0);
 });
 
 test("stop after FIN allocates nothing and sends nothing", async () => {

@@ -1,6 +1,6 @@
 ---
 title: Transport
-description: QUIC, WebTransport, the WebSocket fallback, raw QUIC, stream listeners, and iroh
+description: QUIC, WebTransport, the WebSocket fallback, raw QUIC, stream listeners, WebRTC data channels, and iroh
 ---
 
 # Transport
@@ -41,7 +41,7 @@ connection (`wss://`) and keep whichever wins. A small multiplexer,
 [qmux](/draft/qmux-websocket), carries MoQ streams over the socket. It works
 everywhere but cannot escape TCP head-of-line blocking, so priority and resets
 only help once bytes leave the TCP queue. The fallback is automatic in every
-client; the relay enables it with `[web.https]`. A session that lands on
+client; the relay serves it on its `[web.http]` or `[web.https]` listener. A session that lands on
 WebSocket stays there until it ends; the next connect races again.
 
 ## Raw QUIC (native)
@@ -49,8 +49,9 @@ WebSocket stays there until it ends; the next connect races again.
 Native clients dial the relay directly with the MoQ ALPN, skipping the HTTP/3
 handshake. The URL path and `?jwt=` token travel in the MoQ `SETUP` message
 instead of a `CONNECT` request, so the server sees the same thing either way.
-`moq-tokio` picks this automatically for `https://` URLs; use `moql://` or
-`moqt://` to force it.
+`moq-tokio` dials WebTransport for `https://` URLs; use `moql://` or `moqt://`
+for raw QUIC. A browser cannot dial raw QUIC, so `@moq/net` reaches a `moqt://`
+or `moql://` URL over WebTransport at the same host, port, and path.
 
 ## TCP and Unix sockets (local workers)
 
@@ -61,12 +62,31 @@ authenticate through the same JWT and public-access rules as QUIC, and the Unix
 socket can additionally allowlist the connecting process by uid, gid, or pid.
 See [stream listeners](/bin/relay/auth#stream-listeners).
 
+## WebRTC data channels (experimental)
+
+The private workspace P2P transport is exercised by `test/p2p`; it is not a
+published package. Applications in this checkout that negotiate a browser
+`RTCPeerConnection` can pass an
+[`@moq/p2p` transport](https://github.com/moq-dev/moq/tree/main/js/p2p) to
+`@moq/net`'s connect or accept. One reliable ordered data channel carries qmux
+records, with no datagrams. The application supplies signaling and ICE and
+keeps ownership of the peer connection; closing the transport closes only its
+channel. SCTP ordering means one lost packet can hold back every stream.
+
+Native peers can opt into `moq-tokio`'s internal `webrtc` feature, which runs its own ICE agent:
+host candidates on every interface, server-reflexive candidates from the STUN
+servers it is given, and mDNS resolution of a browser's `.local` candidates.
+The application still carries the offer, answer, and candidates; the offering
+peer connects as the MoQ client and the answering peer accepts.
+
 ## iroh (peer-to-peer, experimental)
 
 [iroh](https://www.iroh.computer/) swaps "dial a hostname" for "dial a public
 key". Two native MoQ endpoints on the same network can exchange media with no
 relay, no DNS, and no certificate authority: the endpoint's key is its address
-and its TLS identity.
+and its TLS identity. Build `moq` from source with
+`cargo build -p moq-cli --release --features iroh,play,openh264` for native playback;
+published binaries, Docker images, and the Nix package leave iroh out.
 
 ```bash
 moq --iroh-enabled --iroh-disable-relay \

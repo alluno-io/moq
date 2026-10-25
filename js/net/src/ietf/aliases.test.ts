@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Manual, Milli, Nano } from "@moq/clock";
 import { DuplicateTrackAlias, RetiredTrackAlias, SharedTrackAlias, TrackAliases } from "./aliases.ts";
 
 test("waits for the control message that establishes an alias", async () => {
@@ -46,6 +47,14 @@ test("sharing an alias across subscriptions to one track is not fatal", () => {
 	aliases.set(7n, {}, { broadcast: "cam", name: "video" });
 
 	expect(() => aliases.set(7n, {}, { broadcast: "cam", name: "video" })).toThrow(SharedTrackAlias);
+});
+
+// Another publisher instance is other content under the same name (MoQ Epoch).
+test("one alias for two epochs of a track is a collision", () => {
+	const aliases = new TrackAliases<object>();
+	aliases.set(7n, {}, { broadcast: "cam", name: "video", epoch: "a" });
+
+	expect(() => aliases.set(7n, {}, { broadcast: "cam", name: "video", epoch: "b" })).toThrow(DuplicateTrackAlias);
 });
 
 // Metadata keyed by an alias (the track's timescale) must only be torn down by whoever
@@ -97,6 +106,9 @@ test("a later subscribe reclaims a retired alias", async () => {
 // Tombstones are bounded: a session churning through subscriptions must not accumulate
 // one entry per alias it ever used.
 test("retired aliases are capped", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	using _clock = { [Symbol.dispose]: () => installed.close() };
 	const aliases = new TrackAliases<object>();
 
 	for (let i = 0n; i < 74n; i++) {
@@ -106,6 +118,8 @@ test("retired aliases are capped", async () => {
 	}
 
 	// The oldest tombstones are forgotten, so they fall back to the unknown-alias wait.
-	await expect(aliases.get(0n)).rejects.toThrow("unknown track alias");
+	const forgotten = aliases.get(0n).catch((error: unknown) => error);
+	await clock.advance(Nano.fromMilli(Milli(1000)));
+	expect(await forgotten).toHaveProperty("message", "unknown track alias: 0");
 	await expect(aliases.get(73n)).rejects.toBeInstanceOf(RetiredTrackAlias);
 });

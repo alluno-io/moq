@@ -1,16 +1,18 @@
 import type * as Epoch from "../epoch.ts";
-import { ProtocolViolation } from "../error.ts";
+import { fromTransport, ProtocolViolation, StreamCode, StreamError, toStreamCode } from "../error.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
-import type { Location, Order } from "../track.ts";
+import type { Order, Position } from "../track.ts";
 import { decodeEpoch, encodeEpoch } from "./epoch.ts";
 import * as Message from "./message.ts";
+import { fromWire, toWire } from "./priority.ts";
 import {
+	hasDropCode,
 	hasFrameBounds,
 	hasGroupOrder,
 	hasLargest,
 	hasOrder,
-	hasStreamCount,
+	hasRefresh,
 	resolvesStart,
 	Version,
 } from "./version.ts";
@@ -154,7 +156,7 @@ async function encodeOrder(w: Writer, version: Version, order: Order) {
 /**
  * Exclusive model/local cap from a decoded inclusive last group.
  *
- * The wire's `Group End` is inclusive once decoded; the track model and `setGroups` are
+ * The wire's `Group End` is inclusive once decoded; the track model and `withRange` are
  * exclusive. `undefined` stays unbounded.
  */
 export function exclusiveGroupEnd(inclusive?: number): number | undefined {
@@ -189,6 +191,8 @@ export function emptyRange({ startGroup, endGroup }: { startGroup?: number; endG
 }
 
 export class SubscribeUpdate {
+	/** A join requesting this group or later, judged against the local refresh ratio. */
+	wantedGroup?: number;
 	priority: number;
 	/** See {@link Subscribe.order}. */
 	order: Order;
@@ -203,6 +207,7 @@ export class SubscribeUpdate {
 
 	constructor(props: {
 		priority: number;
+		wantedGroup?: number;
 		order?: Order;
 		maxDelay?: number;
 		startGroup?: number;
@@ -210,6 +215,9 @@ export class SubscribeUpdate {
 		startFrame?: number;
 		endFrame?: number;
 	}) {
+		if (props.wantedGroup !== undefined && (!Number.isSafeInteger(props.wantedGroup) || props.wantedGroup < 0))
+			throw new RangeError("wanted group must be a safe non-negative integer");
+		this.wantedGroup = props.wantedGroup;
 		this.priority = props.priority;
 		this.order = props.order ?? "descending";
 		this.maxDelay = props.maxDelay ?? 0;
@@ -223,15 +231,17 @@ export class SubscribeUpdate {
 		switch (version) {
 			case Version.DRAFT_01:
 			case Version.DRAFT_02:
-				await w.u8(this.priority);
+				await w.u8(toWire(this.priority));
 				break;
 			default:
-				await w.u8(this.priority);
+				await w.u8(toWire(this.priority));
 				await encodeOrder(w, version, this.order);
 				await w.u53(this.maxDelay);
 				await encodeStartGroup(w, version, this.startGroup);
 				await w.u53(this.endGroup !== undefined ? this.endGroup + 1 : 0);
 				await encodeFrameBounds(w, version, this);
+				if (hasRefresh(version))
+					await w.u62(this.wantedGroup === undefined ? 0n : BigInt(this.wantedGroup) + 1n);
 				break;
 		}
 	}
@@ -240,16 +250,20 @@ export class SubscribeUpdate {
 		switch (version) {
 			case Version.DRAFT_01:
 			case Version.DRAFT_02:
-				return new SubscribeUpdate({ priority: await r.u8() });
+				return new SubscribeUpdate({ priority: fromWire(await r.u8()) });
 			default: {
-				const priority = await r.u8();
+				const priority = fromWire(await r.u8());
 				const order = await decodeOrder(r, version);
 				const maxDelay = await r.u53();
 				const startGroup = await decodeStartGroup(r, version);
 				const endGroup = (await r.u53()) || undefined;
 				const end = endGroup !== undefined ? endGroup - 1 : undefined;
 				const frames = await decodeFrameBounds(r, version, startGroup, end);
+				const wanted = hasRefresh(version) ? await r.u62() : 0n;
+				if (wanted > BigInt(Number.MAX_SAFE_INTEGER) + 1n)
+					throw new RangeError("wanted group exceeds safe integer");
 				return new SubscribeUpdate({
+					wantedGroup: wanted === 0n ? undefined : Number(wanted - 1n),
 					priority,
 					order,
 					maxDelay,
@@ -262,6 +276,8 @@ export class SubscribeUpdate {
 	}
 
 	async encode(w: Writer, version: Version): Promise<void> {
+		if (this.wantedGroup !== undefined && (!Number.isSafeInteger(this.wantedGroup) || this.wantedGroup < 0))
+			throw new RangeError("wanted group must be a safe non-negative integer");
 		return Message.encode(w, (w) => this.#encode(w, version));
 	}
 
@@ -336,7 +352,7 @@ export class Subscribe {
 		await w.string(Path.encode(this.broadcast));
 		await encodeEpoch(w, version, this.epoch);
 		await w.string(this.track);
-		await w.u8(this.priority);
+		await w.u8(toWire(this.priority));
 
 		switch (version) {
 			case Version.DRAFT_01:
@@ -357,7 +373,7 @@ export class Subscribe {
 		const broadcast = Path.decode(await r.string());
 		const epoch = await decodeEpoch(r, version);
 		const track = await r.string();
-		const priority = await r.u8();
+		const priority = fromWire(await r.u8());
 
 		switch (version) {
 			case Version.DRAFT_01:
@@ -431,12 +447,12 @@ export class SubscribeOk {
 				// noop
 				break;
 			case Version.DRAFT_01:
-				await w.u8(this.priority ?? 0);
+				await w.u8(toWire(this.priority));
 				break;
 			// Draft-05+ never sends SUBSCRIBE_OK, but keep the field layout matching
 			// Draft-03/04 so a stray future use stays well-formed.
 			default:
-				await w.u8(this.priority);
+				await w.u8(toWire(this.priority));
 				await padGroupOrder(w, version);
 				await w.u53(this.maxDelay);
 				await w.u53(this.startGroup !== undefined ? this.startGroup + 1 : 0);
@@ -456,10 +472,10 @@ export class SubscribeOk {
 				// noop
 				break;
 			case Version.DRAFT_01:
-				priority = await r.u8();
+				priority = fromWire(await r.u8());
 				break;
 			default:
-				priority = await r.u8();
+				priority = fromWire(await r.u8());
 				await skipGroupOrder(r, version);
 				maxDelay = await r.u53();
 				startGroup = await r.u53();
@@ -500,9 +516,9 @@ export class SubscribeStart {
 	 * The publisher's largest (group, frame) when it answered, or `undefined` for a track
 	 * with nothing yet. Draft-07+ only; not on the wire before, where it decodes as `undefined`.
 	 */
-	largest?: Location;
+	largest?: Position;
 
-	constructor(group: number, largest?: Location) {
+	constructor(group: number, largest?: Position) {
 		this.group = group;
 		this.largest = largest;
 	}
@@ -540,35 +556,24 @@ export class SubscribeEnd {
 	/** The exclusive final group sequence: the first sequence that will never be produced. */
 	group: number;
 
-	/**
-	 * The number of group streams the publisher opened for this subscription.
-	 * Draft-07+ only; not on the wire before, where it decodes as 0.
-	 */
-	streams: number;
-
-	constructor(group: number, streams = 0) {
+	constructor(group: number) {
 		this.group = group;
-		this.streams = streams;
 	}
 
-	async encode(w: Writer, version: Version): Promise<void> {
+	async encode(w: Writer, _version: Version): Promise<void> {
 		return Message.encode(w, async (w) => {
 			await w.u53(this.group);
-			if (hasStreamCount(version)) await w.u53(this.streams);
 		});
 	}
 
-	static async decode(r: Reader, version: Version): Promise<SubscribeEnd> {
-		return Message.decode(
-			r,
-			async (r) => new SubscribeEnd(await r.u53(), hasStreamCount(version) ? await r.u53() : 0),
-		);
+	static async decode(r: Reader, _version: Version): Promise<SubscribeEnd> {
+		return Message.decode(r, async (r) => new SubscribeEnd(await r.u53()));
 	}
 }
 
 /// Indicates that one or more groups have been dropped.
 ///
-/// Draft-03 to Draft-06 only: Draft-07 counts group streams in SUBSCRIBE_END instead.
+/// Draft-03+; publishers send it on Draft-05 and later.
 export class SubscribeDrop {
 	start: number;
 	end: number;
@@ -578,6 +583,25 @@ export class SubscribeDrop {
 		this.start = props.start;
 		this.end = props.end;
 		this.error = props.error;
+	}
+
+	/** Name `[start, end]` given up with `err`, as `version` carries it. */
+	static given(start: number, end: number, err: unknown, version: Version): SubscribeDrop {
+		// Before lite-07 the code is the application's, so it says nothing of why.
+		return new SubscribeDrop({ start, end, error: hasDropCode(version) ? toStreamCode(err) : 0 });
+	}
+
+	/**
+	 * The error the dropped groups' readers end with, as `version` reads the code.
+	 *
+	 * Before lite-07 the code is the application's, so every drop reads as NOT_FOUND: the
+	 * groups are not there to deliver.
+	 */
+	cause(version: Version): Error {
+		if (!hasDropCode(version)) return new StreamError(StreamCode.NotFound, { message: "dropped" });
+		if (this.error > 0xffff_ffff)
+			return new StreamError(StreamCode.Internal, { message: `dropped: ${this.error}` });
+		return fromTransport({ source: "stream", streamErrorCode: this.error });
 	}
 
 	async #encode(w: Writer) {
@@ -605,9 +629,8 @@ export class SubscribeDrop {
  *
  * The discriminator is version-dependent:
  * - Draft-03/04: `0x0` SUBSCRIBE_OK, `0x1` SUBSCRIBE_DROP.
- * - Draft-05/06: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
+ * - Draft-05+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END, `0x2` SUBSCRIBE_DROP
  *   (SUBSCRIBE_OK was removed; acceptance is implicit).
- * - Draft-07+: `0x0` SUBSCRIBE_START, `0x1` SUBSCRIBE_END (SUBSCRIBE_DROP was removed).
  */
 export type SubscribeResponse =
 	| { ok: SubscribeOk }
@@ -645,7 +668,7 @@ export async function encodeSubscribeResponse(w: Writer, resp: SubscribeResponse
 			} else if ("end" in resp) {
 				await w.u53(0x1);
 				await resp.end.encode(w, version);
-			} else if ("drop" in resp && !hasStreamCount(version)) {
+			} else if ("drop" in resp) {
 				await w.u53(0x2);
 				await resp.drop.encode(w);
 			} else {
@@ -669,7 +692,7 @@ export async function decodeSubscribeResponse(r: Reader, version: Version): Prom
 				case 0x1:
 					return { drop: await SubscribeDrop.decode(r) };
 				default:
-					throw new Error(`unknown subscribe response type: ${typ}`);
+					throw new ProtocolViolation(`unknown subscribe response type: ${typ}`);
 			}
 		}
 		default: {
@@ -680,10 +703,9 @@ export async function decodeSubscribeResponse(r: Reader, version: Version): Prom
 				case 0x1:
 					return { end: await SubscribeEnd.decode(r, version) };
 				case 0x2:
-					if (hasStreamCount(version)) throw new Error(`unknown subscribe response type: ${typ}`);
 					return { drop: await SubscribeDrop.decode(r) };
 				default:
-					throw new Error(`unknown subscribe response type: ${typ}`);
+					throw new ProtocolViolation(`unknown subscribe response type: ${typ}`);
 			}
 		}
 	}

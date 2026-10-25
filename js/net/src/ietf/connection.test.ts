@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { offered } from "../connection/extensions.ts";
 import { exchangeSetup } from "../connection/handshake.ts";
-import { SessionCode } from "../error.ts";
+import { SessionCode, StreamCode, StreamError } from "../error.ts";
 import { createMockTransportPair } from "../mock.ts";
 import { Producer as OriginProducer } from "../origin.ts";
 import * as Path from "../path.ts";
@@ -11,9 +11,10 @@ import { Connection } from "./connection.ts";
 import * as Message from "./message.ts";
 import * as Namespace from "./namespace.ts";
 import { Group } from "./object.ts";
-import { Parameters, SetupOption, SetupOptions } from "./parameters.ts";
-import { initialMaxRequestId, MaxRequestId, RequestError, RequestOk } from "./request.ts";
+import { Parameters } from "./parameters.ts";
+import { MaxRequestId, RequestError, RequestOk } from "./request.ts";
 import { Setup } from "./setup.ts";
+import { initialMaxRequestId, SetupOption, SetupOptions } from "./setup_options.ts";
 import { SubscribeError, SubscribeOk } from "./subscribe.ts";
 import {
 	SUBSCRIBE_TRACKS_ID,
@@ -133,8 +134,8 @@ for (const [version, alpn] of [
 	}
 }
 
-/** A defined but unsupported request is refused without closing the session. */
-test("SUBSCRIBE_TRACKS refuses only its request", async () => {
+/** A cancelled listing leaves the session usable for a new listing of the same prefix. */
+test("SUBSCRIBE_TRACKS accepts an empty origin", async () => {
 	const version = Version.DRAFT_19;
 	const pair = createMockTransportPair(ALPN.DRAFT_19);
 	const control = await Stream.open(pair.server, { version });
@@ -148,19 +149,18 @@ test("SUBSCRIBE_TRACKS refuses only its request", async () => {
 	});
 
 	try {
-		// A second refusal proves the first left the session usable.
+		// A disjoint second listing proves the first left the session usable.
 		for (let i = 0; i < 2; i++) {
 			const stream = await Stream.open(pair.client, { version });
 			await stream.writer.u62(BigInt(SUBSCRIBE_TRACKS_ID));
 			await Message.encode(stream.writer, async (writer) => {
 				await writer.u62(BigInt(i * 2));
-				await Namespace.encode(writer, Path.from(""));
+				await Namespace.encode(writer, Path.from(`prefix-${i}`));
 				await writer.u53(0);
 			});
-			expect(await stream.reader.u53()).toBe(RequestError.id);
-			const refused = await RequestError.decode(stream.reader, version);
-			expect(refused.errorCode).toBe(0x3);
-			expect(refused.reasonPhrase).toBe("SUBSCRIBE_TRACKS is not supported");
+			expect(await stream.reader.u53()).toBe(RequestOk.id);
+			await RequestOk.decode(stream.reader, version);
+			stream.abort(new StreamError(StreamCode.Cancel));
 		}
 	} finally {
 		connection.abort();
@@ -306,7 +306,10 @@ test("uni streams before SETUP are held until it lands", async () => {
 	parameters.setBytes(SetupOption.Implementation, new TextEncoder().encode("test"));
 	await new Setup({ parameters }).encode(setup, version);
 
-	const { control, early, solicit, hidden, cluster } = await exchangeSetup(pair.server, version, "test", offered());
+	const { control, early, solicit, hidden, cluster } = await exchangeSetup(pair.server, version, "test", {
+		client: false,
+		extensions: offered(),
+	});
 	expect(early.length).toBe(2);
 
 	let closed = false;
@@ -356,7 +359,9 @@ test("malformed uni stream before SETUP fails the handshake", async () => {
 	parameters.setBytes(SetupOption.Implementation, new TextEncoder().encode("test"));
 	await new Setup({ parameters }).encode(setup, version);
 
-	await expect(exchangeSetup(pair.server, version, "test", offered())).rejects.toThrow("leading-ones varint");
+	await expect(exchangeSetup(pair.server, version, "test", { client: false, extensions: offered() })).rejects.toThrow(
+		"leading-ones varint",
+	);
 });
 
 /** An early stream that ends partway through its type died; it is skipped like an empty one. */
@@ -375,7 +380,7 @@ test("truncated uni stream before SETUP is skipped", async () => {
 	parameters.setBytes(SetupOption.Implementation, new TextEncoder().encode("test"));
 	await new Setup({ parameters }).encode(setup, version);
 
-	const { early } = await exchangeSetup(pair.server, version, "test", offered());
+	const { early } = await exchangeSetup(pair.server, version, "test", { client: false, extensions: offered() });
 	expect(early.length).toBe(0);
 });
 

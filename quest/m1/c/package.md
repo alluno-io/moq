@@ -19,8 +19,11 @@ under the same names.
 - `doc/index.md` says the C library ships static and shared; say what the
   package actually ships.
 - A release workflow and nightly/CI jobs follow the C++ package's, on the same
-  generator pin; `v0.11.0-kixelated.4+v0.32.2` already carries the C backend
+  generator pin; `v0.11.0-kixelated.5+v0.32.2` already carries the C backend
   (`--lang c`).
+- Ship a `MIGRATE.md` with the package, since it is what C users install.
+  Carry over `rs/moq-c/MIGRATE.md`'s history, and map the hand-written ABI to
+  the generated one in the PR's Impact bullet.
 - Ship a hand-written `moq_shutdown` that calls `moq_ffi_shutdown`, then
   `moq_shutdown_dispatcher`.
 - moq-c and moq-cpp each embed the moq-ffi staticlib, so one program can't link
@@ -29,6 +32,7 @@ under the same names.
   target of `rs/moq-ffi` changes, and its `moq.h` C ABI) point at the
   generated package instead; update `AGENTS.md` in this quest.
 
-## Required
-
-- [FFI shape](/quest/m1/ffi-shape/README.md) - moq-c 0.8.0 ships the reshaped moq-ffi, so C breaks once
+The hand-written session callback delivers a `moq_connection_state`
+snapshot naming a retrying first dial, ending with a terminal closed
+snapshot; the generated package must keep both, through moq-ffi's `state()`
+and `state_changed()`.

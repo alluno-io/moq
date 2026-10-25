@@ -17,7 +17,8 @@ implemented contract, with links from the relevant concept and library docs.
 Explain path plus epoch as content identity, not an encoder configuration
 hash; unique epochs for replacement producers; same-epoch replicas; sticky
 handles; explicit Restart and player resubscription; and publisher name reuse
-as a bug. Show catalog-instance lifetime pins, optional expected sibling
+as a bug. Show lifetime pins for readers without announcement following and
+Start/End/Restart for those that follow siblings. Explain optional expected
 epochs, known mismatch refusal, and the weaker legacy best-effort guarantee.
 
 Include lazy epochless claims, exact per-job announcements, the accepted
@@ -39,5 +40,4 @@ Public API and wire: none; this is a user guide for existing feature owners.
 
 ## Required
 
-- [Catalog references](/quest/m0/broadcast-epoch/catalog-references.md) - establishes the shared pinning behavior
 - [Announcement takeover](/quest/m1/announce-takeover.md) - establishes the continuity operation the guide demonstrates

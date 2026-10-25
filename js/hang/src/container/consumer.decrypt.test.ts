@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
+import { type Micro, Milli } from "@moq/clock";
 import { Group, Time, Track, Varint } from "@moq/net";
 import { Consumer } from "./consumer.ts";
 import { Format as LegacyFormat } from "./legacy.ts";
 
 const SEAL = 0x53;
 
-function legacyFrame(timestamp: Time.Micro, payload: Uint8Array): Uint8Array {
+function legacyFrame(timestamp: Micro, payload: Uint8Array): Uint8Array {
 	const ts = Varint.encode(timestamp);
 	const data = new Uint8Array(ts.byteLength + payload.byteLength);
 	data.set(ts, 0);
@@ -13,7 +14,7 @@ function legacyFrame(timestamp: Time.Micro, payload: Uint8Array): Uint8Array {
 	return data;
 }
 
-function writeGroup(track: Track.Producer, sequence: number, frames: [Time.Micro, Uint8Array][]) {
+function writeGroup(track: Track.Producer, sequence: number, frames: [Micro, Uint8Array][]) {
 	const group = new Group.Producer(sequence);
 	for (const [ts, payload] of frames) {
 		group.writeFrame({ payload: legacyFrame(ts, payload), timestamp: Time.Timestamp.fromMicros(ts) });
@@ -40,9 +41,9 @@ const sealed = new Uint8Array([SEAL, 0xde, 0xad]);
 test("decrypt unseals each frame and is told its track, group and object", async () => {
 	const track = new Track.Producer("cam");
 	const seen: { track: string; group: number; object: number }[] = [];
-	const consumer = new Consumer(track.subscribe({ maxDelay: Time.Milli(30_000) }), {
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
 		format: new LegacyFormat("data"),
-		maxDelay: Time.Milli(30_000),
+		maxDelay: Milli(30_000),
 		decrypt: async (payload, ctx) => {
 			seen.push(ctx);
 			expect(payload[0]).toBe(SEAL);
@@ -51,10 +52,10 @@ test("decrypt unseals each frame and is told its track, group and object", async
 	});
 
 	writeGroup(track, 0, [
-		[0 as Time.Micro, sealed],
-		[33_000 as Time.Micro, sealed],
+		[0 as Micro, sealed],
+		[33_000 as Micro, sealed],
 	]);
-	writeGroup(track, 1, [[66_000 as Time.Micro, sealed]]);
+	writeGroup(track, 1, [[66_000 as Micro, sealed]]);
 	track.close();
 
 	const payloads = await drain(consumer);
@@ -76,9 +77,9 @@ test("decrypt unseals each frame and is told its track, group and object", async
 test("an end marker is never handed to decrypt", async () => {
 	const track = new Track.Producer("cam");
 	let calls = 0;
-	const consumer = new Consumer(track.subscribe({ maxDelay: Time.Milli(30_000) }), {
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
 		format: new LegacyFormat("video"),
-		maxDelay: Time.Milli(30_000),
+		maxDelay: Milli(30_000),
 		decrypt: async (payload) => {
 			calls += 1;
 			return payload.subarray(1);
@@ -86,8 +87,8 @@ test("an end marker is never handed to decrypt", async () => {
 	});
 
 	writeGroup(track, 0, [
-		[0 as Time.Micro, sealed],
-		[33_000 as Time.Micro, new Uint8Array()],
+		[0 as Micro, sealed],
+		[33_000 as Micro, new Uint8Array()],
 	]);
 	track.close();
 

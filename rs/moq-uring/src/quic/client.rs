@@ -53,8 +53,9 @@ impl Config {
 /// Shorthand for a dial-only [`Endpoint`](super::Endpoint) and one
 /// [`connect`](super::Endpoint::connect) through it. The connection's driver
 /// runs as a task on the worker that adopted `socket`. Wrap the returned
-/// [`Connection`] with [`crate::transport::Session::new`] to hand it to
-/// `moq_net::Client::connect_lite`, or use the stream API directly.
+/// [`Connection`] with [`crate::transport::Session::new`] and
+/// [`moq_net::transport::Binding::InBand`], then [`crate::transport::Local`], to
+/// hand it to `moq_net::Client::connect`, or use the stream API directly.
 pub async fn connect(socket: udp::Socket, config: &Config) -> Result<Connection, Error> {
 	let endpoint = super::Endpoint::new(socket, super::endpoint::Config::default())?;
 	endpoint.connect(config).await

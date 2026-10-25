@@ -5,9 +5,10 @@
  *
  * @module
  */
+
+import { Milli } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Container from "@moq/hang/container";
-import type { Time } from "@moq/net";
 import * as Moq from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
 import type * as Audio from "./audio";
@@ -28,6 +29,16 @@ function parseUrl(value: string | null): URL | undefined {
 	}
 }
 
+// Parse the `versions` attribute: a comma-separated list, or the defaults when absent or empty.
+// The connection checks the names and reports an unsupported one on `connection.error`.
+function parseVersions(value: string | null): string[] | undefined {
+	const versions = value
+		?.split(",")
+		.map((version) => version.trim())
+		.filter((version) => version !== "");
+	return versions?.length ? versions : undefined;
+}
+
 function parseVolume(value: string | null): number {
 	if (!value?.trim()) return 0.5;
 	const volume = Number(value);
@@ -38,6 +49,7 @@ function parseVolume(value: string | null): number {
 
 const OBSERVED = [
 	"url",
+	"versions",
 	"name",
 	"paused",
 	"volume",
@@ -47,11 +59,6 @@ const OBSERVED = [
 	"announced",
 	"delay",
 	"buffer",
-	// Released spellings are observed only so assigning them can fail loudly instead of being ignored.
-	"reload",
-	"latency",
-	"latency-min",
-	"jitter",
 	"catalog-format",
 	"captions",
 	"hardware-acceleration",
@@ -94,13 +101,13 @@ function parseDelay(value: string | null): Delay {
 }
 
 // Parse the `buffer` attribute: a duration, or none when absent.
-function parseBuffer(value: string | null): Time.Milli {
+function parseBuffer(value: string | null): Milli {
 	const trimmed = value?.trim();
-	if (!trimmed) return Moq.Time.Milli.zero;
+	if (!trimmed) return Milli.zero;
 	const parsed = parseDuration(trimmed);
 	if (parsed !== undefined) return parsed;
 	console.warn(`moq-watch: invalid buffer="${value}", expected a duration like "30s"`);
-	return Moq.Time.Milli.zero;
+	return Milli.zero;
 }
 
 // Parse the `recover` attribute, a count of decode errors recovered in place, falling back to 0.
@@ -149,11 +156,10 @@ function parseBoolean(value: string | null, defaultValue: boolean): boolean {
 // There's no destructor for web components so this is the best we can do.
 const cleanup = new FinalizationRegistry<Effect>((signals) => signals.close());
 
-// An optional web component that wraps a <canvas>
+/** The `<moq-watch>` element: plays a broadcast into a nested <canvas>. */
 export default class MoqWatch extends HTMLElement {
 	static observedAttributes = OBSERVED;
 
-	// The connection to the moq-relay server.
 	/**
 	 * The relay connection, shared with every other element on the page pointing at the
 	 * same URL. Its `origin` is where the broadcasts live.
@@ -162,12 +168,7 @@ export default class MoqWatch extends HTMLElement {
 
 	/** Headless playback pipeline behind this element. */
 	readonly player: Player;
-	/** Fatal media decode failure; select another source to clear it. */
-	get error() {
-		return this.player.error;
-	}
-
-	// The broadcast being watched.
+	/** The broadcast being watched. */
 	broadcast: Broadcast;
 
 	/** Downloads and decodes the video track. `video.source` picks the rendition. */
@@ -191,31 +192,41 @@ export default class MoqWatch extends HTMLElement {
 	/** Keeps audio and video playing at the configured delay. */
 	sync: Sync;
 
-	// The mutable user controls. As the top of the tree, this element owns the
-	// writable Signals and wires read-only views into the pipeline. The UI and
-	// the attribute/property accessors read and write these directly.
+	/**
+	 * The mutable user controls. As the top of the tree, this element owns the
+	 * writable Signals and wires read-only views into the pipeline. The UI and
+	 * the attribute/property accessors read and write these directly.
+	 */
 	readonly controls = {
 		paused: new Signal(false),
-		volume: new Signal(0.5),
-		muted: new Signal(false),
-		// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
-		visible: new Signal<Video.Visible>("20%"),
-		// Which graphics API paints the canvas. See {@link Video.Backend}.
-		backend: new Signal<Video.Backend>("auto"),
 		// How far playback trails the live edge.
 		delay: new Signal<Delay>("auto"),
 		// Future-dated media held beyond the live edge before playback skips ahead.
-		buffer: new Signal<Time.Milli>(Moq.Time.Milli.zero),
-		// The desired video rendition (resolution/bitrate cap).
-		target: new Signal<Video.Target | undefined>(undefined),
-		// The selected caption track name, or undefined for off (the default; captions are opt-in).
-		captions: new Signal<string | undefined>(undefined),
-		// WebCodecs hardware-acceleration preference for video decode.
-		hardwareAcceleration: new Signal<Video.HardwareAcceleration>("no-preference"),
-		// Present PQ video in HDR on an HDR display when the browser can.
-		hdr: new Signal(true),
-		// Video decode errors recovered in place before the failure is reported.
-		recover: new Signal<number>(0),
+		buffer: new Signal<Milli>(Milli.zero),
+		video: {
+			// The desired video rendition (resolution/bitrate cap).
+			target: new Signal<Video.Target | undefined>(undefined),
+			// When video is downloaded relative to the canvas position. See {@link Video.Visible}.
+			visible: new Signal<Video.Visible>("20%"),
+			// Which graphics API paints the canvas. See {@link Video.Backend}.
+			backend: new Signal<Video.Backend>("auto"),
+			// WebCodecs hardware-acceleration preference for video decode.
+			hardwareAcceleration: new Signal<Video.HardwareAcceleration>("no-preference"),
+			// Present PQ video in HDR on an HDR display when the browser can.
+			hdr: new Signal(true),
+			// Video decode errors recovered in place before the failure is reported.
+			recover: new Signal<number>(0),
+		},
+		audio: {
+			// The desired audio rendition, or automatic selection when unset.
+			target: new Signal<Audio.Target | undefined>(undefined),
+			volume: new Signal(0.5),
+			muted: new Signal(false),
+		},
+		text: {
+			// The selected caption track name, or undefined for off (the default; captions are opt-in).
+			target: new Signal<string | undefined>(undefined),
+		},
 	};
 
 	// Unseals each media frame for end-to-end encryption; set through the `decrypt` property.
@@ -267,10 +278,10 @@ export default class MoqWatch extends HTMLElement {
 			announced: this.#announced,
 			catalogFormat: this.#catalogFormat,
 			catalog: this.#catalog,
-			canvas: this.#canvas,
-			container: this.#captionsOverlay,
 			decrypt: this.#decrypt,
 			...this.controls,
+			video: { ...this.controls.video, canvas: this.#canvas },
+			text: { ...this.controls.text, container: this.#captionsOverlay },
 		});
 		this.signals.cleanup(() => this.player.close());
 		this.broadcast = this.player.broadcast;
@@ -286,17 +297,17 @@ export default class MoqWatch extends HTMLElement {
 		// the policy lives here: muting stashes and zeroes the volume; a zero volume
 		// reports as muted.
 		this.signals.run((effect) => {
-			const muted = effect.get(this.controls.muted);
+			const muted = effect.get(this.controls.audio.muted);
 			if (muted) {
-				this.#unmuteVolume = this.controls.volume.peek() || 0.5;
-				this.controls.volume.set(0);
+				this.#unmuteVolume = this.controls.audio.volume.peek() || 0.5;
+				this.controls.audio.volume.set(0);
 			} else {
-				this.controls.volume.set(this.#unmuteVolume);
+				this.controls.audio.volume.set(this.#unmuteVolume);
 			}
 		});
 		this.signals.run((effect) => {
-			const volume = effect.get(this.controls.volume);
-			this.controls.muted.set(volume === 0);
+			const volume = effect.get(this.controls.audio.volume);
+			this.controls.audio.muted.set(volume === 0);
 		});
 
 		// Watch to see if the canvas element is added or removed.
@@ -320,7 +331,7 @@ export default class MoqWatch extends HTMLElement {
 		// A canvas that lost its GPU never hands out another context, so swap in a fresh copy. The
 		// observer above picks it up, which clears the error and selects a renderer again.
 		this.signals.run((effect) => {
-			if (effect.get(this.renderer.out.error) !== "surface-lost") return;
+			if (effect.get(this.renderer.out.error)?.name !== "InvalidStateError") return;
 			// Peek: rerunning on the swap itself would replace the fresh canvas before the error clears.
 			const canvas = this.#canvas.peek();
 			canvas?.replaceWith(canvas.cloneNode());
@@ -340,12 +351,21 @@ export default class MoqWatch extends HTMLElement {
 		});
 
 		this.signals.run((effect) => {
+			const versions = effect.get(this.connection.versions);
+			if (versions) {
+				this.setAttribute("versions", versions.join(","));
+			} else {
+				this.removeAttribute("versions");
+			}
+		});
+
+		this.signals.run((effect) => {
 			const name = effect.get(this.#name);
 			this.setAttribute("name", name.toString());
 		});
 
 		this.signals.run((effect) => {
-			const muted = effect.get(this.controls.muted);
+			const muted = effect.get(this.controls.audio.muted);
 			if (muted) {
 				this.setAttribute("muted", "");
 			} else {
@@ -363,17 +383,17 @@ export default class MoqWatch extends HTMLElement {
 		});
 
 		this.signals.run((effect) => {
-			const volume = effect.get(this.controls.volume);
+			const volume = effect.get(this.controls.audio.volume);
 			this.setAttribute("volume", volume.toString());
 		});
 
 		this.signals.run((effect) => {
-			const visible = effect.get(this.controls.visible);
+			const visible = effect.get(this.controls.video.visible);
 			this.setAttribute("visible", visible);
 		});
 
 		this.signals.run((effect) => {
-			this.setAttribute("backend", effect.get(this.controls.backend));
+			this.setAttribute("backend", effect.get(this.controls.video.backend));
 		});
 
 		// Each knob is 1:1 with its attribute, so the echo back through attributeChangedCallback
@@ -392,7 +412,7 @@ export default class MoqWatch extends HTMLElement {
 		const updateDimensions = (width: number, height: number) => {
 			if (width <= 0 || height <= 0) return;
 			const dpr = window.devicePixelRatio || 1;
-			this.controls.target.update((prev) => ({
+			this.controls.video.target.update((prev) => ({
 				...prev,
 				width: Math.round(width * dpr),
 				height: Math.round(height * dpr),
@@ -446,48 +466,51 @@ export default class MoqWatch extends HTMLElement {
 
 		if (name === "url") {
 			this.connection.url.set(parseUrl(newValue));
+		} else if (name === "versions") {
+			this.connection.versions.set(parseVersions(newValue));
 		} else if (name === "name") {
 			this.#name.set(Moq.Path.from(newValue ?? ""));
 		} else if (name === "paused") {
 			this.controls.paused.set(parseBoolean(newValue, false));
 		} else if (name === "volume") {
 			const volume = parseVolume(newValue);
-			this.controls.volume.set(volume);
+			this.controls.audio.volume.set(volume);
 		} else if (name === "muted") {
-			this.controls.muted.set(parseBoolean(newValue, false));
+			this.controls.audio.muted.set(parseBoolean(newValue, false));
 		} else if (name === "visible") {
-			this.controls.visible.set(parseVisible(newValue));
+			this.controls.video.visible.set(parseVisible(newValue));
 		} else if (name === "backend") {
-			this.controls.backend.set(parseBackend(newValue));
+			this.controls.video.backend.set(parseBackend(newValue));
 		} else if (name === "announced") {
 			this.#announced.set(parseBoolean(newValue, true));
 		} else if (name === "delay") {
 			this.controls.delay.set(parseDelay(newValue));
 		} else if (name === "buffer") {
 			this.controls.buffer.set(parseBuffer(newValue));
-		} else if (name === "reload") {
-			console.warn("moq-watch: `reload` was renamed to `announced`");
-		} else if (name === "latency" || name === "latency-min" || name === "jitter") {
-			console.warn(`moq-watch: \`${name}\` is gone; use \`delay\` and \`buffer\``);
 		} else if (name === "catalog-format") {
 			this.#catalogFormat.set(parseCatalogFormat(newValue));
 		} else if (name === "captions") {
 			// The selected caption track name; absent or empty turns captions off.
-			this.controls.captions.set(newValue || undefined);
+			this.controls.text.target.set(newValue || undefined);
 		} else if (name === "hardware-acceleration") {
-			this.controls.hardwareAcceleration.set(parseHardwareAcceleration(newValue));
+			this.controls.video.hardwareAcceleration.set(parseHardwareAcceleration(newValue));
 		} else if (name === "hdr") {
-			this.controls.hdr.set(parseBoolean(newValue, true));
+			this.controls.video.hdr.set(parseBoolean(newValue, true));
 		} else if (name === "recover") {
-			this.controls.recover.set(parseRecover(newValue));
+			this.controls.video.recover.set(parseRecover(newValue));
 		} else {
 			const exhaustive: never = name;
 			throw new Error(`Invalid attribute: ${exhaustive}`);
 		}
 	}
 
+	/** The relay URL, mirrored by the `url` attribute. */
 	get url(): URL | undefined {
 		return this.connection.url.peek();
+	}
+
+	set url(value: string | URL | undefined) {
+		this.connection.url.set(value ? new URL(value) : undefined);
 	}
 
 	/**
@@ -496,29 +519,29 @@ export default class MoqWatch extends HTMLElement {
 	 * requires a hardware decoder (no software fallback) and `"prefer-software"` forces software.
 	 */
 	get hardwareAcceleration(): Video.HardwareAcceleration {
-		return this.controls.hardwareAcceleration.peek();
+		return this.controls.video.hardwareAcceleration.peek();
 	}
 
 	set hardwareAcceleration(value: Video.HardwareAcceleration) {
-		this.controls.hardwareAcceleration.set(value);
+		this.controls.video.hardwareAcceleration.set(value);
 	}
 
-	/** Present PQ (HDR10) video in HDR when the display and browser allow; read when the canvas is attached. */
 	/** Video decode errors recovered in place, by a fresh decoder from the next keyframe, before the failure is reported. */
 	get recover(): number {
-		return this.controls.recover.peek();
+		return this.controls.video.recover.peek();
 	}
 
 	set recover(value: number) {
-		this.controls.recover.set(value);
+		this.controls.video.recover.set(value);
 	}
 
+	/** Present PQ (HDR10) video in HDR when the display and browser allow; read when the canvas is attached. */
 	get hdr(): boolean {
-		return this.controls.hdr.peek();
+		return this.controls.video.hdr.peek();
 	}
 
 	set hdr(value: boolean) {
-		this.controls.hdr.set(value);
+		this.controls.video.hdr.set(value);
 	}
 
 	/**
@@ -534,10 +557,16 @@ export default class MoqWatch extends HTMLElement {
 		this.#decrypt.set(value);
 	}
 
-	set url(value: string | URL | undefined) {
-		this.connection.url.set(value ? new URL(value) : undefined);
+	/** The protocol versions to offer, most preferred first, mirrored by the `versions` attribute; undefined offers the defaults. */
+	get versions(): readonly string[] | undefined {
+		return this.connection.versions.peek();
 	}
 
+	set versions(value: readonly string[] | undefined) {
+		this.connection.versions.set(value);
+	}
+
+	/** The broadcast name, mirrored by the `name` attribute. */
 	get name(): Moq.Path.Valid {
 		return this.#name.peek();
 	}
@@ -546,6 +575,7 @@ export default class MoqWatch extends HTMLElement {
 		this.#name.set(Moq.Path.from(value));
 	}
 
+	/** Whether playback is paused, mirrored by the `paused` attribute. */
 	get paused(): boolean {
 		return this.controls.paused.peek();
 	}
@@ -554,50 +584,49 @@ export default class MoqWatch extends HTMLElement {
 		this.controls.paused.set(value);
 	}
 
+	/** The playback volume from 0 to 1, mirrored by the `volume` attribute. */
 	get volume(): number {
-		return this.controls.volume.peek();
+		return this.controls.audio.volume.peek();
 	}
 
 	set volume(value: number) {
-		this.controls.volume.set(value);
+		this.controls.audio.volume.set(value);
 	}
 
+	/** Whether audio is muted, mirrored by the `muted` attribute. */
 	get muted(): boolean {
-		return this.controls.muted.peek();
+		return this.controls.audio.muted.peek();
 	}
 
 	set muted(value: boolean) {
-		this.controls.muted.set(value);
+		this.controls.audio.muted.set(value);
 	}
 
+	/** When to download and render video, mirrored by the `visible` attribute. See {@link Video.Visible}. */
 	get visible(): Video.Visible {
-		return this.controls.visible.peek();
+		return this.controls.video.visible.peek();
 	}
 
 	set visible(value: Video.Visible) {
-		this.controls.visible.set(value);
+		this.controls.video.visible.set(value);
 	}
 
 	/** Which graphics API paints the canvas. See {@link Video.Backend}. */
 	get backend(): Video.Backend {
-		return this.controls.backend.peek();
+		return this.controls.video.backend.peek();
 	}
 
 	set backend(value: Video.Backend) {
-		this.controls.backend.set(value);
+		this.controls.video.backend.set(value);
 	}
 
+	/** Whether to wait for the broadcast's announcement before subscribing, mirrored by the `announced` attribute. */
 	get announced(): boolean {
 		return this.#announced.peek();
 	}
 
 	set announced(value: boolean) {
 		this.#announced.set(value);
-	}
-
-	/** @internal */
-	set reload(_value: unknown) {
-		throw new Error("moq-watch: `reload` was renamed to `announced`");
 	}
 
 	/**
@@ -622,46 +651,12 @@ export default class MoqWatch extends HTMLElement {
 	 * once they would sit further than `delay + buffer` past the playhead. Call `reset()` at each
 	 * utterance boundary.
 	 */
-	get buffer(): Time.Milli {
+	get buffer(): Milli {
 		return this.controls.buffer.peek();
 	}
 
-	set buffer(value: Time.Milli) {
+	set buffer(value: Milli) {
 		this.controls.buffer.set(value);
-	}
-
-	/** @internal */
-	get latency(): Delay {
-		return this.controls.delay.peek();
-	}
-
-	set latency(_value: unknown) {
-		throw new Error("moq-watch: `latency` is gone; use `delay` and `buffer`");
-	}
-
-	/** @internal */
-	get latencyMin(): Delay {
-		return this.controls.delay.peek();
-	}
-
-	set latencyMin(_value: unknown) {
-		throw new Error("moq-watch: `latencyMin` is gone; use `delay` and `buffer`");
-	}
-
-	/** @internal */
-	set latencyMax(_value: unknown) {
-		throw new Error(
-			"moq-watch: `latencyMax` is gone. Use `buffer`, the media held beyond the live edge; the old ceiling included the floor, so it is `latencyMax - delay`.",
-		);
-	}
-
-	/** The jitter buffer in milliseconds. */
-	get jitter(): Time.Milli {
-		return this.sync.out.jitter.peek();
-	}
-
-	set jitter(_value: unknown) {
-		throw new Error("moq-watch: `jitter` is a readout; set `delay` instead");
 	}
 
 	/**
@@ -672,6 +667,7 @@ export default class MoqWatch extends HTMLElement {
 		this.player.reset();
 	}
 
+	/** The catalog format to read, mirrored by the `catalog-format` attribute; undefined detects it. */
 	get catalogFormat(): CatalogFormat | undefined {
 		return this.#catalogFormat.peek();
 	}
@@ -698,11 +694,11 @@ export default class MoqWatch extends HTMLElement {
 	 * list of renditions the broadcast publishes.
 	 */
 	get captions(): string | undefined {
-		return this.controls.captions.peek();
+		return this.controls.text.target.peek();
 	}
 
 	set captions(value: string | undefined) {
-		this.controls.captions.set(value || undefined);
+		this.controls.text.target.set(value || undefined);
 	}
 }
 

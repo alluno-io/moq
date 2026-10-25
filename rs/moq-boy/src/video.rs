@@ -6,9 +6,10 @@
 //! encode and the avc3 publish; this module keeps moq-boy's threading,
 //! frame-dropping, force-keyframe and timing-stats behavior.
 
+use moq_clock::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -55,8 +56,11 @@ impl VideoEncoder {
 		// Probed from a throwaway encoder, before the emulator has run a frame, so a
 		// viewer can discover (and unpause) a moq-boy that has published nothing.
 		let rendition = config.probe().await.expect("failed to probe the H.264 encoder");
+		let reserved = catalog
+			.reserve()
+			.with_timeline_hint(config.gop.duration(config.framerate));
 		let producer =
-			moq_video::encode::Producer::new(broadcast, catalog, rendition).expect("failed to create avc3 producer");
+			moq_video::encode::Producer::new(broadcast, reserved, rendition).expect("failed to create avc3 producer");
 		let demand = producer.demand();
 
 		let force_keyframe = Arc::new(AtomicBool::new(false));

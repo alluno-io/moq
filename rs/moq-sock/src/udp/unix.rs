@@ -5,19 +5,13 @@ use std::{
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     os::fd::AsRawFd,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::{Duration, Instant},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use socket2::SockRef;
 
-use super::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, TransportError, UdpSockRef, cmsg,
-    log_sendmsg_error,
-};
+use super::{EcnCodepoint, RecvMeta, Transmit, TransportError, UdpSockRef, cmsg};
 
 #[cfg(apple_fast)]
 use super::apple_fast::{msghdr_x, recv_via_recvmsg_x, send};
@@ -30,7 +24,6 @@ use super::linux::{LinuxError, gso};
 /// platforms.
 #[derive(Debug)]
 pub struct UdpSocketState {
-    last_send_error: Mutex<Instant>,
     max_gso_segments: AtomicUsize,
     gro_segments: usize,
     may_fragment: bool,
@@ -55,6 +48,7 @@ pub struct UdpSocketState {
 }
 
 impl UdpSocketState {
+    /// Configures `sock` for this platform's offloads and ancillary data and returns its state.
     pub fn new(sock: UdpSockRef<'_>) -> io::Result<Self> {
         let io = sock.0;
         let mut cmsg_platform_space = 0;
@@ -103,7 +97,7 @@ impl UdpSocketState {
         let mut may_fragment = false;
         #[cfg_attr(
             not(any(target_os = "linux", target_os = "android")),
-            expect(unused_mut)
+            expect(unused_mut, reason = "only the Linux GRO path sets it")
         )]
         let mut gro_segments = 1;
 
@@ -197,9 +191,7 @@ impl UdpSocketState {
             let _ = io.set_send_buffer_size(Self::MIN_SAFE_SNDBUF);
         }
 
-        let now = Instant::now();
         Ok(Self {
-            last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
             gro_segments,
             may_fragment,
@@ -211,38 +203,12 @@ impl UdpSocketState {
         })
     }
 
-    /// Sends a [`Transmit`] on the given socket
-    ///
-    /// This function will only ever return errors of kind [`io::ErrorKind::WouldBlock`].
-    /// All other errors will be logged and converted to `Ok`.
-    ///
-    /// UDP transmission errors are considered non-fatal because higher-level protocols must
-    /// employ retransmits and timeouts anyway in order to deal with UDP's unreliable nature.
-    /// Thus, logging is most likely the only thing you can do with these errors.
-    ///
-    /// If you would like to handle these errors yourself, use [`UdpSocketState::try_send`]
-    /// instead.
-    #[deprecated(note = "silences I/O errors; use `UdpSocketState::try_send() instead")]
-    pub fn send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
-        match send(self, socket.0, transmit) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
-            // - EMSGSIZE is expected for MTU probes. Future work might be able to avoid
-            //   these by automatically clamping the MTUD upper bound to the interface MTU.
-            Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => Ok(()),
-            Err(e) => {
-                log_sendmsg_error(&self.last_send_error, e, transmit);
-
-                Ok(())
-            }
-        }
-    }
-
     /// Sends a [`Transmit`] on the given socket without any additional error handling
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         send(self, socket.0, transmit)
     }
 
+    /// Receives datagrams into `bufs`, filling one [`RecvMeta`] per message, and returns how many messages arrived.
     #[cfg(not(any(
         apple,
         target_os = "openbsd",
@@ -261,6 +227,7 @@ impl UdpSocketState {
         recv_via_recvmmsg(socket.0, bufs, meta)
     }
 
+    /// Receives datagrams into `bufs`, filling one [`RecvMeta`] per message, and returns how many messages arrived.
     #[cfg(apple_fast)]
     pub fn recv(
         &self,
@@ -275,6 +242,7 @@ impl UdpSocketState {
         }
     }
 
+    /// Receives datagrams into `bufs`, filling one [`RecvMeta`] per message, and returns how many messages arrived.
     #[cfg(any(
         target_os = "openbsd",
         target_os = "netbsd",
@@ -508,12 +476,11 @@ impl UdpSocketState {
 
 #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd")))]
 fn send(
-    #[allow(unused_variables)] // only used on Linux
-    state: &UdpSocketState,
+    #[allow(unused_variables, reason = "only used on Linux")] state: &UdpSocketState,
     io: SockRef<'_>,
     transmit: &Transmit<'_>,
 ) -> io::Result<()> {
-    #[allow(unused_mut)] // only mutable on FreeBSD
+    #[allow(unused_mut, reason = "only mutable on FreeBSD")]
     let mut encode_src_ip = true;
     #[cfg(target_os = "freebsd")]
     {
@@ -631,7 +598,10 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 }
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", apple))]
-#[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
+#[cfg_attr(
+    apple_fast,
+    allow(dead_code, reason = "unused when apple_fast is enabled")
+)]
 pub(crate) fn send_single(
     state: &UdpSocketState,
     io: SockRef<'_>,
@@ -708,7 +678,10 @@ fn recv_via_recvmmsg(
     solarish,
     apple
 ))]
-#[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
+#[cfg_attr(
+    apple_fast,
+    allow(dead_code, reason = "unused when apple_fast is enabled")
+)]
 pub(crate) fn recv_single(
     io: SockRef<'_>,
     bufs: &mut [IoSliceMut<'_>],
@@ -730,15 +703,17 @@ pub(crate) fn recv_single(
     Ok(1)
 }
 
-#[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
+#[cfg_attr(
+    apple_fast,
+    allow(dead_code, reason = "unused when apple_fast is enabled")
+)]
 fn prepare_msg(
     transmit: &Transmit<'_>,
     dst_addr: &socket2::SockAddr,
     hdr: &mut libc::msghdr,
     iov: &mut libc::iovec,
     ctrl: &mut cmsg::Aligned<[u8; cmsg::LEN]>,
-    #[allow(unused_variables)] // only used on FreeBSD & macOS
-    encode_src_ip: bool,
+    #[allow(unused_variables, reason = "only used on FreeBSD & macOS")] encode_src_ip: bool,
     sendmsg_einval: bool,
 ) {
     iov.iov_base = transmit.contents.as_ptr() as *const _ as *mut _;
@@ -825,7 +800,10 @@ fn prepare_msg(
     encoder.finish();
 }
 
-#[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
+#[cfg_attr(
+    apple_fast,
+    allow(dead_code, reason = "unused when apple_fast is enabled")
+)]
 fn prepare_recv(
     buf: &mut IoSliceMut<'_>,
     name: &mut MaybeUninit<libc::sockaddr_storage>,
@@ -902,7 +880,10 @@ impl ControlMetadata {
             (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => unsafe {
                 // Temporary hack around broken macos ABI. Remove once upstream fixes it.
                 // https://bugreport.apple.com/web/?problemID=48761855
-                #[allow(clippy::unnecessary_cast)] // cmsg.cmsg_len defined as size_t
+                #[allow(
+                    clippy::unnecessary_cast,
+                    reason = "`cmsg_len` is `size_t` on glibc but narrower on other libcs"
+                )]
                 if cfg!(apple)
                     && cmsg.cmsg_len as usize == libc::CMSG_LEN(size_of::<u8>() as _) as usize
                 {
@@ -928,7 +909,13 @@ impl ControlMetadata {
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg.decode::<libc::in6_pktinfo>() };
                 self.dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
-                #[cfg_attr(not(target_os = "android"), expect(clippy::unnecessary_cast))]
+                #[cfg_attr(
+                    not(target_os = "android"),
+                    expect(
+                        clippy::unnecessary_cast,
+                        reason = "`ipi6_ifindex` is already `u32` off Android"
+                    )
+                )]
                 {
                     self.interface_index = Some(pktinfo.ipi6_ifindex as u32);
                 }
@@ -998,7 +985,10 @@ mod gso {
         1
     }
 
-    #[cfg_attr(apple_fast, allow(dead_code))] // Unused when apple_fast is enabled
+    #[cfg_attr(
+        apple_fast,
+        allow(dead_code, reason = "unused when apple_fast is enabled")
+    )]
     pub(super) fn set_segment_size(
         #[cfg(not(apple_fast))] _encoder: &mut cmsg::Encoder<'_, libc::msghdr>,
         #[cfg(apple_fast)] _encoder: &mut cmsg::Encoder<'_, msghdr_x>,

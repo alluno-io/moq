@@ -5,21 +5,18 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::client::WebPkiServerVerifier;
-#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 
-#[cfg(feature = "bloom")]
 use crate::BloomTokenLog;
-#[cfg(not(feature = "bloom"))]
-use crate::NoneTokenLog;
-#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::crypto::rustls::{QuicServerConfig, configured_provider};
 use crate::{
-    DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
-    TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
+    DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, TokenLog,
+    TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded, Wall,
     cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
     crypto::{self, HandshakeTokenKey, HmacKey},
     shared::ConnectionId,
@@ -89,6 +86,53 @@ impl EndpointConfig {
         self
     }
 
+    /// Derive the reset key from a random 32-byte `secret` with HKDF-SHA256, so an endpoint
+    /// restarted with the same secret resets its predecessor's connections
+    ///
+    /// Every endpoint holding the secret resets every other holder's connections, so RFC 9000
+    /// section 21.11 requires that packets for a live connection only ever reach its owner: share
+    /// it across live endpoints only behind one address that routes by connection ID.
+    ///
+    /// Also keys a [`HashedConnectionIdGenerator`] from it, since an endpoint drops packets for
+    /// connection IDs it can't validate instead of resetting them. Set
+    /// [`cid_generator`](Self::cid_generator) afterwards to use another generator; it must accept
+    /// the predecessor's IDs for the reset to reach them.
+    ///
+    /// Lowers [`min_reset_interval`](Self::min_reset_interval) to 1ms too, since a restart leaves
+    /// every peer waiting on a reset at once: 1000 a second resets 2,000 connections in 2s, where
+    /// 20ms takes 40s. A reset is always smaller than the packet that drew it, so this never
+    /// amplifies, and the limit still caps what a flood of spoofed packets can reflect.
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    pub fn reset_secret(&mut self, secret: &[u8; 32]) -> &mut Self {
+        #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+        use aws_lc_rs::{hkdf, hmac};
+        #[cfg(feature = "ring")]
+        use ring::{hkdf, hmac};
+
+        struct Len(usize);
+        impl hkdf::KeyType for Len {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(secret);
+        let reset_key = prk
+            .expand(&[b"moq-quic reset key"], hmac::HMAC_SHA256)
+            .expect("an HMAC key fits HKDF-SHA256");
+        self.reset_key = Arc::new(hmac::Key::from(reset_key));
+
+        let mut cid_key = [0; 8];
+        prk.expand(&[b"moq-quic cid key"], Len(cid_key.len()))
+            .and_then(|okm| okm.fill(&mut cid_key))
+            .expect("8 bytes fit HKDF-SHA256");
+        let cid_key = u64::from_le_bytes(cid_key);
+        self.connection_id_generator_factory =
+            Arc::new(move || Box::new(HashedConnectionIdGenerator::from_key(cid_key)));
+        self.min_reset_interval = Duration::from_millis(1);
+        self
+    }
+
     /// Maximum UDP payload size accepted from peers (excluding UDP and IP overhead).
     ///
     /// Must be greater or equal than 1200.
@@ -136,8 +180,8 @@ impl EndpointConfig {
 
     /// Minimum interval between outgoing stateless reset packets
     ///
-    /// Defaults to 20ms. Limits the impact of attacks which flood an endpoint with garbage packets,
-    /// e.g. [ISAKMP/IKE amplification]. Larger values provide a stronger defense, but may delay
+    /// Defaults to 20ms, or 1ms after [`reset_secret`](Self::reset_secret). Limits the impact of
+    /// attacks which flood an endpoint with garbage packets, e.g. [ISAKMP/IKE amplification]. Larger values provide a stronger defense, but may delay
     /// detection of some error conditions by clients. Using a [`ConnectionIdGenerator`] with a low
     /// rate of false positives in [`validate`](ConnectionIdGenerator::validate) reduces the risk
     /// incurred by a small minimum reset interval.
@@ -184,7 +228,7 @@ impl Default for EndpointConfig {
         use ring::hmac;
 
         let mut reset_key = [0; 64];
-        rand::rng().fill_bytes(&mut reset_key);
+        crate::entropy::rng().fill_bytes(&mut reset_key);
 
         Self::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)))
     }
@@ -354,11 +398,11 @@ impl ServerConfig {
         self
     }
 
-    /// Object to get current [`SystemTime`]
+    /// Object to get current [`Wall`]
     ///
     /// This exists to allow system time to be mocked in tests, or wherever else desired.
     ///
-    /// Defaults to [`StdSystemTime`], which simply calls [`SystemTime::now()`](SystemTime::now).
+    /// Defaults to [`StdSystemTime`], which reads the ambient clock's wall time.
     pub fn time_source(&mut self, time_source: Arc<dyn TimeSource>) -> &mut Self {
         self.time_source = time_source;
         self
@@ -369,7 +413,7 @@ impl ServerConfig {
     }
 }
 
-#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ServerConfig {
     /// Create a server config with the given certificate chain to be presented to clients
     ///
@@ -396,7 +440,7 @@ impl ServerConfig {
         #[cfg(feature = "ring")]
         use ring::hkdf;
 
-        let rng = &mut rand::rng();
+        let rng = &mut crate::entropy::rng();
         let mut master_key = [0u8; 64];
         rng.fill_bytes(&mut master_key);
         let master_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
@@ -491,15 +535,14 @@ impl ValidationTokenConfig {
         self
     }
 
-    #[allow(rustdoc::redundant_explicit_links)] // which links are redundant depends on features
+    #[allow(
+        rustdoc::redundant_explicit_links,
+        reason = "which links are redundant depends on features"
+    )]
     /// Set a custom [`TokenLog`]
     ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to a default
-    /// [`BloomTokenLog`][crate::BloomTokenLog], which is suitable for most internet applications.
-    ///
-    /// If the `bloom` feature is disabled, defaults to [`NoneTokenLog`][crate::NoneTokenLog],
-    /// which makes the server ignore all address validation tokens (that is, tokens originating
-    /// from NEW_TOKEN frames--retry tokens are not affected).
+    /// Defaults to [`BloomTokenLog`][crate::BloomTokenLog], suitable for internet applications.
+    /// Set [`NoneTokenLog`][crate::NoneTokenLog] to ignore NEW_TOKEN address validation tokens.
     pub fn log(&mut self, log: Arc<dyn TokenLog>) -> &mut Self {
         self.log = log;
         self
@@ -509,8 +552,7 @@ impl ValidationTokenConfig {
     ///
     /// This refers only to tokens sent in NEW_TOKEN frames, in contrast to retry tokens.
     ///
-    /// If the `bloom` feature is enabled (which it is by default), defaults to 2. Otherwise,
-    /// defaults to 0.
+    /// Defaults to 2, including builds without default crypto features.
     pub fn sent(&mut self, value: u32) -> &mut Self {
         self.sent = value;
         self
@@ -519,14 +561,11 @@ impl ValidationTokenConfig {
 
 impl Default for ValidationTokenConfig {
     fn default() -> Self {
-        #[cfg(feature = "bloom")]
         let log = Arc::new(BloomTokenLog::default());
-        #[cfg(not(feature = "bloom"))]
-        let log = Arc::new(NoneTokenLog);
         Self {
             lifetime: Duration::from_secs(2 * 7 * 24 * 60 * 60),
             log,
-            sent: if cfg!(feature = "bloom") { 2 } else { 0 },
+            sent: 2,
         }
     }
 }
@@ -614,16 +653,8 @@ impl ClientConfig {
     }
 }
 
-#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ClientConfig {
-    /// Create a client configuration that trusts the platform's native roots
-    #[cfg(feature = "platform-verifier")]
-    pub fn try_with_platform_verifier() -> Result<Self, rustls::Error> {
-        Ok(Self::new(Arc::new(
-            crypto::rustls::QuicClientConfig::with_platform_verifier()?,
-        )))
-    }
-
     /// Create a client configuration that trusts specified trust anchors
     pub fn with_root_certificates(
         roots: Arc<rustls::RootCertStore>,
@@ -666,21 +697,21 @@ impl From<VarIntBoundsExceeded> for ConfigError {
     }
 }
 
-/// Object to get current [`SystemTime`]
+/// Object to get current [`Wall`]
 ///
 /// This exists to allow system time to be mocked in tests, or wherever else desired.
 pub trait TimeSource: Send + Sync {
-    /// Get [`SystemTime::now()`](SystemTime::now) or the mocked equivalent
-    fn now(&self) -> SystemTime;
+    /// Get [`Wall::now()`](Wall::now) or the mocked equivalent
+    fn now(&self) -> Wall;
 }
 
 /// Default implementation of [`TimeSource`]
 ///
-/// Implements `now` by calling [`SystemTime::now()`](SystemTime::now).
+/// Implements `now` by reading the ambient clock's wall time, [`moq_clock::wall()`].
 pub struct StdSystemTime;
 
 impl TimeSource for StdSystemTime {
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
+    fn now(&self) -> Wall {
+        moq_clock::wall()
     }
 }

@@ -21,7 +21,7 @@ export function normalizeSource(source: StreamTrack | SourceConfig): SourceConfi
  * A stream of frames from something that isn't a capture device.
  *
  * Frames are delivered in presentation order and are owned by the reader, which closes each one.
- * Stamp their timestamps against `performance.now() * 1000`, the same epoch capture uses, so audio
+ * Stamp their timestamps against `@moq/clock`'s `now()` in microseconds, the same epoch capture uses, so audio
  * and video stay in sync.
  */
 export interface FrameSource {
@@ -38,13 +38,14 @@ export function isStreamTrack(source: Source): source is StreamTrack {
 	return !("frames" in source) && !("track" in source);
 }
 
-// Stronger typing for the MediaStreamTrack interface.
+/** Stronger typing for the MediaStreamTrack interface. */
 export interface StreamTrack extends MediaStreamTrack {
 	kind: "video";
 	clone(): StreamTrack;
 	getSettings(): TrackSettings;
 }
 
+/** The settings a video track reports, with the fields video always has made required. */
 export interface TrackSettings {
 	deviceId: string;
 	groupId: string;
@@ -58,6 +59,7 @@ export interface TrackSettings {
 	width: number;
 }
 
+/** The `getUserMedia` constraints that apply to video. */
 export type Constraints = Omit<
 	MediaTrackConstraints,
 	"autoGainControl" | "channelCount" | "echoCancellation" | "noiseSuppression" | "sampleRate" | "sampleSize"

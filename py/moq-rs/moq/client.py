@@ -8,16 +8,28 @@ from datetime import timedelta
 from moq_ffi import (
     MoqClient,
     MoqClientConfig,
-    MoqClientTls,
-    MoqQuicConfig,
-    MoqWebSocketConfig,
+    MoqCongestionControl,
+    moq_qlog_supported,
+    moq_versions,
 )
 
-from ._records import Backoff, _opt_us, _strs
+from ._records import Backoff, ClientTls, QuicConfig, WebSocketConfig, _opt_us, _strs
 from .origin import AnnounceConsumer, AnnouncedBroadcast, OriginConsumer, OriginProducer
 from .publish import BroadcastProducer
 from .session import Session
 from .subscribe import BroadcastConsumer
+
+CongestionControl = MoqCongestionControl
+
+
+def versions() -> list[str]:
+    """The protocol versions offered by default, most preferred first, as ``versions`` spells them."""
+    return moq_versions()
+
+
+def qlog_supported() -> bool:
+    """Whether this build can write qlog traces; ``qlog`` raises `moq.Error` otherwise."""
+    return moq_qlog_supported()
 
 
 class Client:
@@ -36,40 +48,42 @@ class Client:
         client = Client("https://relay.example.com", publish=origin, consume=origin)
 
     The WebSocket fallback races QUIC for ``http(s)`` URLs after a 200 ms head start.
-    Pass ``websocket_enabled=False`` against a QUIC-only relay, or a ``websocket_delay``
-    to change the head start:
+    Pass ``websocket=WebSocketConfig(enabled=False)`` against a QUIC-only relay, or a
+    ``delay`` to change the head start:
 
-        client = Client("https://relay.example.com", websocket_delay=timedelta(milliseconds=50))
+        client = Client("https://relay.example.com", websocket=WebSocketConfig(delay=timedelta(milliseconds=50)))
 
     For a relay that requires mTLS, pass a paired client certificate and key:
 
-        client = Client("https://relay.example.com", tls_cert="client.pem", tls_key="client.key")
+        client = Client("https://relay.example.com", tls=ClientTls(cert="client.pem", key="client.key"))
 
     The session automatically reconnects with backoff when the transport drops, and
-    broadcasts consumed through it ride out the gap. Pass ``reconnect=False`` for a
-    one-shot dial, or a :class:`Backoff` to tune the retry pacing; watch
-    :meth:`Session.status` for the connect/disconnect transitions.
+    broadcasts consumed through it ride out the gap. Pass ``once=True`` for a one-shot
+    dial, or a :class:`Backoff` to tune the retry pacing; watch
+    :meth:`Session.state_changed` for the connect/disconnect transitions.
 
     ``versions`` restricts the protocol versions offered, most preferred first, spelled
-    like ``"moq-lite-03"``; empty offers every supported version.
+    like ``"moq-lite-03"``; empty offers every supported version, which :func:`versions` lists.
+
+    ``timeout`` bounds one connect, dial and handshake together (zero waits forever).
+    ``race`` and ``resolution_delay`` pace Happy Eyeballs. ``tls`` sets certificate trust
+    and the mTLS identity (:class:`ClientTls`), and ``quic`` tunes the transport
+    (:class:`QuicConfig`). ``None`` keeps the library default throughout.
     """
 
     def __init__(
         self,
         url: str,
         *,
-        tls_verify: bool = True,
-        tls_roots: Sequence[str] = (),
-        tls_system_roots: bool | None = None,
-        tls_fingerprints: Sequence[str] = (),
-        tls_cert: str | None = None,
-        tls_key: str | None = None,
         bind: str | None = None,
         versions: Sequence[str] = (),
-        max_streams: int | None = None,
-        websocket_enabled: bool | None = None,
-        websocket_delay: timedelta | None = None,
-        reconnect: bool = True,
+        timeout: timedelta | None = None,
+        race: timedelta | None = None,
+        resolution_delay: timedelta | None = None,
+        tls: ClientTls | None = None,
+        quic: QuicConfig | None = None,
+        websocket: WebSocketConfig | None = None,
+        once: bool = False,
         backoff: Backoff | None = None,
         publish: OriginProducer | None = None,
         consume: OriginProducer | None = None,
@@ -80,20 +94,13 @@ class Client:
         self._config = MoqClientConfig(
             bind=bind,
             versions=_strs(versions, "versions"),
-            tls=MoqClientTls(
-                insecure=not tls_verify,
-                roots=_strs(tls_roots, "tls_roots"),
-                system_roots=tls_system_roots,
-                fingerprints=_strs(tls_fingerprints, "tls_fingerprints"),
-                cert=tls_cert,
-                key=tls_key,
-            ),
-            quic=MoqQuicConfig(max_streams=max_streams),
-            websocket=MoqWebSocketConfig(
-                enabled=websocket_enabled,
-                delay_us=_opt_us(websocket_delay, "websocket_delay"),
-            ),
-            once=not reconnect,
+            timeout_us=_opt_us(timeout, "timeout"),
+            race_us=_opt_us(race, "race"),
+            resolution_delay_us=_opt_us(resolution_delay, "resolution_delay"),
+            tls=(tls or ClientTls())._ffi(),
+            quic=(quic or QuicConfig())._ffi(),
+            websocket=(websocket or WebSocketConfig())._ffi(),
+            once=once,
             backoff=(backoff or Backoff())._ffi(),
             publish=None if publish is None else publish._inner,
             consume=None if consume is None else consume._inner,
@@ -130,7 +137,8 @@ class Client:
                 # rather than skip: dropping the last session closes the transport, so
                 # one the caller kept a reference to would otherwise stay open.
                 if exc[0] is None:
-                    await self._session.shutdown()
+                    self._session.shutdown()
+                    await self._session.closed()
                 else:
                     self._session.cancel(0)
         finally:
@@ -154,7 +162,7 @@ class Client:
         return self._require_consumer().announced(prefix, filter=filter, hidden=hidden)
 
     def announced_broadcast(self, path: str) -> AnnouncedBroadcast:
-        """Await announcement of the broadcast at exactly ``path``.
+        """Follow the broadcast at exactly ``path`` across its publisher instances.
 
         See :meth:`OriginConsumer.announced_broadcast`.
         """
@@ -176,25 +184,22 @@ class Client:
 
     @property
     def session(self) -> Session | None:
-        """The established session, or `None` before connecting / after exit."""
+        """The connecting or connected session, or `None` before connecting / after exit."""
         return self._session
 
 
 def connect(
     url: str,
     *,
-    tls_verify: bool = True,
-    tls_roots: Sequence[str] = (),
-    tls_system_roots: bool | None = None,
-    tls_fingerprints: Sequence[str] = (),
-    tls_cert: str | None = None,
-    tls_key: str | None = None,
     bind: str | None = None,
     versions: Sequence[str] = (),
-    max_streams: int | None = None,
-    websocket_enabled: bool | None = None,
-    websocket_delay: timedelta | None = None,
-    reconnect: bool = True,
+    timeout: timedelta | None = None,
+    race: timedelta | None = None,
+    resolution_delay: timedelta | None = None,
+    tls: ClientTls | None = None,
+    quic: QuicConfig | None = None,
+    websocket: WebSocketConfig | None = None,
+    once: bool = False,
     backoff: Backoff | None = None,
     publish: OriginProducer | None = None,
     consume: OriginProducer | None = None,
@@ -208,18 +213,15 @@ def connect(
     """
     return Client(
         url,
-        tls_verify=tls_verify,
-        tls_roots=tls_roots,
-        tls_system_roots=tls_system_roots,
-        tls_fingerprints=tls_fingerprints,
-        tls_cert=tls_cert,
-        tls_key=tls_key,
         bind=bind,
         versions=versions,
-        max_streams=max_streams,
-        websocket_enabled=websocket_enabled,
-        websocket_delay=websocket_delay,
-        reconnect=reconnect,
+        timeout=timeout,
+        race=race,
+        resolution_delay=resolution_delay,
+        tls=tls,
+        quic=quic,
+        websocket=websocket,
+        once=once,
         backoff=backoff,
         publish=publish,
         consume=consume,

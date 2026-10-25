@@ -1,24 +1,25 @@
-import { Time } from "@moq/net";
+import { Micro, type Milli, Nano, now } from "@moq/clock";
 import { hostedAssets } from "../assets";
 import type { FromWorker, ToWorker } from "./capture-worker";
 // A blob: URL, or a hosted file when assets() is set; see vite-plugin-worklet.
 import CaptureWorker from "./capture-worker.ts?worklet";
 import type { StreamTrack } from "./types";
 
-/** A frame as the engine delivered it, and its time on our wall clock in microseconds. */
-export type Stamped = { frame: VideoFrame; timestamp: number };
+/** A captured frame, and its time on our wall clock in microseconds. */
+export type Timed = { frame: VideoFrame; timestamp: number };
 
 /**
  * Turns a camera track into a stream of frames, using the best pipeline the engine has.
  *
  * Each frame comes with its time on our wall clock, so audio and video share one epoch and stay
- * consistent when the source changes or the encoder reloads. The frame itself is left as delivered.
+ * consistent when the source changes or the encoder reloads. A MediaStreamTrackProcessor's frames
+ * are left as delivered; the `<video>` fallback builds its own at that time.
  */
-export function TrackProcessor(track: StreamTrack): ReadableStream<Stamped> {
+export function TrackProcessor(track: StreamTrack): ReadableStream<Timed> {
 	// Chrome exposes MediaStreamTrackProcessor on the window, so use it directly.
 	if ("MediaStreamTrackProcessor" in self) {
 		const input: ReadableStream<VideoFrame> = new MediaStreamTrackProcessor({ track }).readable;
-		return input.pipeThrough(rewrite());
+		return input.pipeThrough(timing());
 	}
 
 	// Safari and Firefox expose it only inside a dedicated worker, which means spawning one to find
@@ -54,10 +55,10 @@ class Epoch {
 	// Whether the source clock is stuck, decided on the second frame.
 	#stuck?: boolean;
 
-	// `at` is when the frame arrived, in milliseconds on our performance.now() timebase. For the
+	// `at` is when the frame arrived, in milliseconds on the installed clock. For the
 	// first frame it has to be measured as close to capture as possible: whatever delay sits between
 	// capture and the anchor becomes a permanent audio/video offset.
-	stamp(frame: VideoFrame, at: number): Stamped {
+	time(frame: VideoFrame, at: number): Timed {
 		const arrived = at * 1000;
 
 		if (this.#base === undefined) {
@@ -77,20 +78,20 @@ class Epoch {
 	}
 }
 
-// Stamps frames as they arrive, for pipelines that deliver straight to us.
-function rewrite(): TransformStream<VideoFrame, Stamped> {
+// Times frames as they arrive, for pipelines that deliver straight to us.
+function timing(): TransformStream<VideoFrame, Timed> {
 	const epoch = new Epoch();
 
-	return new TransformStream<VideoFrame, Stamped>({
+	return new TransformStream<VideoFrame, Timed>({
 		transform(frame, controller) {
-			controller.enqueue(epoch.stamp(frame, performance.now()));
+			controller.enqueue(epoch.time(frame, Nano.toMilli(Nano(now()))));
 		},
 	});
 }
 
 // Runs the native MediaStreamTrackProcessor in a worker, returning undefined if the engine doesn't
 // have one (or won't transfer the track), in which case the caller falls back.
-async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Stamped> | undefined> {
+async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Timed> | undefined> {
 	const worker = await spawn();
 	if (!worker) return undefined;
 
@@ -111,7 +112,7 @@ async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Stam
 
 	const epoch = new Epoch();
 
-	return new ReadableStream<Stamped>({
+	return new ReadableStream<Timed>({
 		async pull(controller) {
 			worker.post({ type: "pull" });
 
@@ -119,8 +120,11 @@ async function workerProcessor(source: StreamTrack): Promise<ReadableStream<Stam
 			switch (msg.type) {
 				case "frame":
 					// Anchor on when the worker read the frame, not when we got around to handling
-					// the message, so a busy main thread can't skew video against audio.
-					controller.enqueue(epoch.stamp(msg.frame, msg.at - performance.timeOrigin));
+					// the message, so a busy main thread can't skew video against audio. The worker's
+					// realm has its own origin, so the shared Unix-anchored time origin translates it
+					// onto the host clock.
+					// biome-ignore lint/style/noRestrictedGlobals: a cross-realm origin, not a clock read.
+					controller.enqueue(epoch.time(msg.frame, msg.at - performance.timeOrigin));
 					return;
 				case "done":
 					worker.close();
@@ -217,13 +221,13 @@ function handle(worker: Worker): Handle {
 // native MediaStreamTrackProcessor at all.
 // Based on: https://jan-ivar.github.io/polyfills/mediastreamtrackprocessor.js
 // Thanks Jan-Ivar
-function videoProcessor(track: StreamTrack): ReadableStream<Stamped> {
+function videoProcessor(track: StreamTrack): ReadableStream<Timed> {
 	console.warn("Using MediaStreamTrackProcessor polyfill; performance might suffer.");
 
 	let video: HTMLVideoElement;
 	let handle: number | undefined;
 
-	return new ReadableStream<Stamped>({
+	return new ReadableStream<Timed>({
 		async start() {
 			video = document.createElement("video") as HTMLVideoElement;
 			video.srcObject = new MediaStream([track]);
@@ -240,10 +244,11 @@ function videoProcessor(track: StreamTrack): ReadableStream<Stamped> {
 			// performance.now() to whole milliseconds, which can't express a 33.333ms period.
 			await new Promise<void>((resolve) => {
 				handle = video.requestVideoFrameCallback((now, metadata) => {
-					// captureTime is the frame's capture instant; both it and now are on the
-					// performance.now() timebase, so audio and video stay on one epoch.
-					const timestamp = (metadata.captureTime ?? now) as Time.Milli;
-					controller.enqueue({ frame: new VideoFrame(video), timestamp: Time.Micro.fromMilli(timestamp) });
+					// captureTime is the frame's capture instant; both it and now are DOM timestamps,
+					// which the host clock shares, so audio and video stay on one epoch.
+					const timestamp = (metadata.captureTime ?? now) as Milli;
+					const frame = new VideoFrame(video, { timestamp: Micro.fromMilli(timestamp) });
+					controller.enqueue({ frame, timestamp: frame.timestamp });
 					resolve();
 				});
 			});

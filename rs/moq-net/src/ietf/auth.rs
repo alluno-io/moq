@@ -1,28 +1,31 @@
-//! The MoQ Auth extension (draft-lcurley-moq-auth-00).
+//! The MoQ Auth extension (draft-lcurley-moq-auth-01).
 //!
 //! The moq-transport binding of the lite Auth Stream (see [`crate::auth`]): each
-//! token rides a request stream of its own, answered with the namespace prefixes it
-//! grants. Negotiated with the AUTH Setup Option on draft-17+ only, where SETUP is a
-//! Key-Value-Pair block.
-//!
-//! The wire carries prefixes, so a grant is told only when it is a union of subtrees.
-//! Anything narrower is refused with NOT_SUPPORTED rather than widened.
+//! token rides a request stream of its own, answered with the patterns it grants,
+//! encoded as lite's AUTH_OK encodes them. Negotiated with the AUTH Setup Option on
+//! draft-17+ only, where SETUP is a Key-Value-Pair block.
 
+#[cfg(feature = "async")]
+use crate::driver::Transport;
 use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::auth::{Grant, Handle, Issue, Reply, Request, Serving};
-use crate::coding::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder, Stream};
-use crate::{Error, Path, Pattern, Patterns, SessionError};
+use crate::auth::{Grant, Issue, Link, Reply, Request, Serving};
+use crate::coding::{Decode, DecodeError, Decoder, Encode, EncodeError, Encoder};
+use crate::{Error, Patterns, SessionError};
 
-use super::namespace::{decode_namespace, encode_namespace};
-use super::{Control, Message, RequestId, Version, cluster, peer};
+#[cfg(feature = "async")]
+use super::Control;
+use super::{Message, RequestId, Version, cluster, peer};
+#[cfg(feature = "async")]
+use crate::coding::Stream;
 
 /// AUTH Setup Option: the sender speaks this extension. Even, so the value is a bare
-/// varint.
-pub const AUTH: u64 = 0x40B60;
+/// varint. Draft-01's code point, so a draft-00 peer, which read prefixes, never
+/// negotiates it.
+pub const AUTH: u64 = 0x40B70;
 
 /// Whether a version negotiates this extension: draft-17+, like MoQ Cluster.
 pub fn supported(version: Version) -> bool {
@@ -93,38 +96,13 @@ pub struct AuthOk {
 /// Largest millisecond count every implementation carries losslessly.
 const MAX_EXPIRES_MS: u64 = (1 << 53) - 1;
 
-/// Encode patterns as namespace prefix tuples, refusing any that is not a subtree:
-/// sending `room` for a grant of the literal `room/alice` would hand out more than was
-/// granted.
-fn encode_prefixes(patterns: &Patterns, w: &mut Encoder<'_>) -> Result<(), EncodeError> {
-	w.varint(patterns.len() as u64)?;
-	for pattern in patterns {
-		let prefix = pattern.as_prefix().ok_or(EncodeError::Unsupported)?;
-		encode_namespace(w, &Path::new(prefix))?;
-	}
-	Ok(())
-}
-
-fn decode_prefixes(r: &mut Decoder<'_>) -> Result<Patterns, DecodeError> {
-	let count = r.varint()?;
-	let mut patterns = Patterns::new();
-	// No preallocation: the count is peer-controlled, and the message size limit bounds
-	// how many prefixes actually fit.
-	for _ in 0..count {
-		let prefix = decode_namespace(r)?;
-		let pattern = Pattern::subtree(prefix.as_str()).map_err(|_| DecodeError::InvalidValue)?;
-		patterns.insert(pattern);
-	}
-	Ok(patterns)
-}
-
 impl Message for AuthOk {
 	const ID: u64 = 0x40B62;
 
 	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
 		check_version(version).map_err(|_| EncodeError::Version)?;
-		encode_prefixes(&self.publish, w)?;
-		encode_prefixes(&self.subscribe, w)?;
+		self.publish.encode(w, version)?;
+		self.subscribe.encode(w, version)?;
 		// 0 means never, so a grant that has already lapsed rounds up to the smallest
 		// value that still reads as an expiry.
 		let expires = match self.expires {
@@ -136,8 +114,8 @@ impl Message for AuthOk {
 
 	fn decode_msg(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
 		check_version(version)?;
-		let publish = decode_prefixes(r)?;
-		let subscribe = decode_prefixes(r)?;
+		let publish = Patterns::decode(r, version)?;
+		let subscribe = Patterns::decode(r, version)?;
 		let expires = match r.varint()? {
 			0 => None,
 			ms if ms <= MAX_EXPIRES_MS => Some(Duration::from_millis(ms)),
@@ -193,23 +171,41 @@ impl Message for AuthError {
 /// The REQUEST_ERROR codes AUTH_ERROR carries.
 const UNAUTHORIZED: u64 = 0x1;
 const NOT_SUPPORTED: u64 = 0x3;
+const EXPIRED_AUTH_TOKEN: u64 = 0x5;
+/// Draft-17 assigned it, the first draft this extension negotiates on.
+const GOING_AWAY: u64 = 0x6;
 
 /// The AUTH_ERROR code for a refusal. The public API speaks session codes, and the
-/// only distinction this registry carries is unsupported versus unauthorized.
+/// actionable distinctions this registry carries are unsupported, expired, and unauthorized.
 fn to_code(code: SessionError) -> u64 {
 	match code {
 		SessionError::Version | SessionError::Unsupported => NOT_SUPPORTED,
+		SessionError::Expired => EXPIRED_AUTH_TOKEN,
 		_ => UNAUTHORIZED,
 	}
 }
 
-/// Read an AUTH_ERROR code. NOT_SUPPORTED means the acceptor could not tell the grant,
-/// not that it refused one; every other code is a refusal.
+/// Read an AUTH_ERROR code, preserving expiration so the presenter can refresh.
 fn from_code(code: u64) -> Error {
 	match code {
 		NOT_SUPPORTED => Error::Unsupported,
+		EXPIRED_AUTH_TOKEN => Error::Expired,
+		GOING_AWAY => Error::GoingAway,
 		_ => Error::Session(SessionError::Unauthorized),
 	}
+}
+
+/// Refuse an AUTH past our GOAWAY cutoff with AUTH_ERROR, the only answer its presenter reads.
+#[cfg(feature = "async")]
+pub(super) async fn refuse_going_away(mut stream: Stream<Transport, Version>) -> Result<(), Error> {
+	let reply = AuthError {
+		code: GOING_AWAY,
+		reason: "going away".to_string(),
+	};
+	stream.writer.encode_message(&reply).await?;
+	// A peer dropping the response after reading the refusal is a normal end.
+	let _ = stream.writer.close().await;
+	Ok(())
 }
 
 /// What the peer's connection credential earns by default: publishing what our
@@ -228,18 +224,16 @@ pub(super) fn peer_grant(
 /// Present every token this side adds, one AUTH request each, once the peer's SETUP
 /// says it negotiated the extension. Never returns: a session without it just fails
 /// the tokens as unsupported.
-pub(super) async fn run_present<S>(
-	runtime: crate::time::Clock,
-	session: S,
+#[cfg(feature = "async")]
+pub(super) async fn run_present(
+	runtime: crate::time::Deadlines,
+	session: Transport,
 	control: Control,
-	handle: Handle,
+	handle: Link,
 	peer_setup: peer::PeerSetup,
 	version: Version,
-	going_away: crate::goaway::GoingAway,
-) -> Result<(), Error>
-where
-	S: crate::transport::poll::Boxable,
-{
+	stats: crate::stats::Session,
+) -> Result<(), Error> {
 	if !peer_setup.get().await.auth {
 		handle.unsupported();
 		return std::future::pending().await;
@@ -260,6 +254,7 @@ where
 		.await?
 	{
 		let present = Present {
+			stats: stats.clone(),
 			runtime: runtime.clone(),
 			session: session.clone(),
 			control: control.clone(),
@@ -267,13 +262,13 @@ where
 			version,
 			id,
 		};
-		let going_away = going_away.clone();
 		let violation = violation.clone();
 		tasks.push(async move {
-			// After a GOAWAY the peer must not see new requests.
-			let err = match going_away.is_set() {
-				true => Error::GoingAway,
-				false => present.run(token).await,
+			// After a GOAWAY, sent or received, the peer must not see new requests. AUTH_ERROR
+			// carries no code that may pass, so unlike moq-lite a refusal is never presented again.
+			let err = match present.handle.active() {
+				true => present.run(token).await,
+				false => Error::GoingAway,
 			};
 			let err = crate::auth::protocol_error(err);
 			if matches!(err, Error::ProtocolViolation) {
@@ -281,7 +276,7 @@ where
 			}
 
 			match &err {
-				Error::Cancel | Error::Unsupported | Error::Transport(_) | Error::Session(_) => {
+				Error::Cancel | Error::Unsupported | Error::Transport(_) | Error::IdleTimeout | Error::Session(_) => {
 					tracing::debug!(%err, "auth token ended")
 				}
 				err => tracing::warn!(%err, "auth token ended"),
@@ -293,24 +288,29 @@ where
 }
 
 /// One token's Auth request.
-struct Present<S: crate::transport::poll::Session> {
-	runtime: crate::time::Clock,
-	session: S,
+#[cfg(feature = "async")]
+struct Present {
+	stats: crate::stats::Session,
+	runtime: crate::time::Deadlines,
+	session: Transport,
 	control: Control,
-	handle: Handle,
+	handle: Link,
 	version: Version,
 	id: u64,
 }
 
-impl<S: crate::transport::poll::Boxable> Present<S> {
+#[cfg(feature = "async")]
+impl Present {
 	/// Send the token, then track its grant until either side ends it, resolving with why.
+	#[cfg(feature = "async")]
 	async fn run(&self, token: Bytes) -> Error {
-		let request_id = match self.control.next_request_id(&self.runtime).await {
-			Ok(id) => id,
+		let mut stream = match Stream::open_request(&mut self.session.clone(), self.version).await {
+			Ok(stream) => stream,
 			Err(err) => return err,
 		};
-		let mut stream = match Stream::open(&mut self.session.clone(), self.version).await {
-			Ok(stream) => stream,
+		stream = super::request_stream::with_stats(stream, &self.stats, self.version);
+		let request_id = match self.control.next_request_id(&self.runtime).await {
+			Ok(id) => id,
 			Err(err) => return err,
 		};
 		if let Err(err) = stream.writer.encode_message(&Auth { request_id, token }).await {
@@ -318,14 +318,15 @@ impl<S: crate::transport::poll::Boxable> Present<S> {
 		}
 
 		let mut answered = false;
+		let mut messages = super::request_stream::Messages::new(self.session.clone(), self.control.client());
 		loop {
 			enum Next {
 				Withdrawn,
-				Reply(Result<Option<(u64, super::Body)>, Error>),
+				Reply(Result<Option<super::request_stream::Framed>, Error>),
 			}
 
 			let next = {
-				let mut read = std::pin::pin!(read_message(&mut stream));
+				let mut read = std::pin::pin!(messages.next(&mut stream.reader));
 				kio::wait(|waiter| {
 					if self.handle.poll_withdrawn(self.id, waiter).is_ready() {
 						return Poll::Ready(Next::Withdrawn);
@@ -338,7 +339,7 @@ impl<S: crate::transport::poll::Boxable> Present<S> {
 			let (id, body) = match next {
 				// Resetting our side is what tells the peer.
 				Next::Withdrawn => return Error::Cancel,
-				Next::Reply(Ok(Some(msg))) => msg,
+				Next::Reply(Ok(Some(super::request_stream::Framed(id, body)))) => (id, body),
 				// The peer ended the grant without revoking it.
 				Next::Reply(Ok(None)) if answered => return Error::Cancel,
 				// A peer that closes before answering could not tell us anything.
@@ -376,9 +377,9 @@ impl<S: crate::transport::poll::Boxable> Present<S> {
 					};
 					let err = from_code(refused.code);
 					tracing::warn!(%err, code = refused.code, reason = %refused.reason, "auth token refused");
-					// A grant the acceptor could not tell is unknown, not empty, so only a
-					// real refusal settles the union.
-					if !matches!(err, Error::Unsupported) {
+					// A grant the acceptor could not tell, or never judged, is unknown, not
+					// empty, so only a real refusal settles the union.
+					if !matches!(err, Error::Unsupported | Error::GoingAway) {
 						self.handle.refused(self.id);
 					}
 					return err;
@@ -399,35 +400,26 @@ fn decode_reply<T: Message>(body: &super::Body, version: Version) -> Result<T, E
 	Ok(msg)
 }
 
-/// Read one `[type][size][body]` message, or `None` once the peer finished the stream.
-async fn read_message<S: crate::transport::poll::Session>(
-	stream: &mut Stream<S, Version>,
-) -> Result<Option<(u64, super::Body)>, Error> {
-	let Some(id) = stream.reader.varint_maybe().await? else {
-		return Ok(None);
-	};
-	let body: super::Body = stream.reader.decode().await?;
-	Ok(Some((id, body)))
-}
-
 /// Answers the peer's Auth requests: the app's verdict when it took the requests,
 /// otherwise the default grant for the connection's own credential.
 #[derive(Clone)]
 pub(super) struct Serve {
-	pub runtime: crate::time::Clock,
-	pub handle: Handle,
+	pub runtime: crate::time::Deadlines,
+	pub handle: Link,
 	/// What the peer's connection credential earns by default.
 	pub peer_grant: Grant,
 }
 
 impl Serve {
 	/// Answer one Auth request. The stream lives as long as the token.
-	pub(super) async fn run<S: crate::transport::poll::Session>(
+	#[cfg(feature = "async")]
+	pub(super) async fn run(
 		self,
-		mut stream: Stream<S, Version>,
+		mut stream: Stream<Transport, Version>,
 		msg: Auth,
 		version: Version,
 	) -> Result<(), Error> {
+		let mut goaways = super::request_stream::GoAways::new(msg.request_id.0 % 2 == 1);
 		let serving = Serving::new(self.handle.clone());
 		let issue = &serving.issue;
 		let mut default = None;
@@ -451,11 +443,25 @@ impl Serve {
 			None => default = Some(crate::auth::DefaultGrant::new(self.handle.clone(), self.peer_grant)),
 		}
 
-		let err = match serve_issue(&self.runtime, issue, default.as_mut(), &mut stream, version).await {
+		let err = match serve_issue(
+			&self.runtime,
+			issue,
+			default.as_mut(),
+			&mut stream,
+			version,
+			&mut goaways,
+		)
+		.await
+		{
 			Ok(()) => Error::Cancel,
 			Err(err) => {
 				match &err {
-					Error::Cancel | Error::Unsupported | Error::Stream(_) | Error::Session(_) | Error::Transport(_) => {
+					Error::Cancel
+					| Error::Unsupported
+					| Error::Stream(_)
+					| Error::Session(_)
+					| Error::Transport(_)
+					| Error::IdleTimeout => {
 						tracing::debug!(%err, "auth request ended")
 					}
 					err => tracing::warn!(%err, "auth request error"),
@@ -472,14 +478,29 @@ impl Serve {
 	}
 }
 
+/// Anything but a GOAWAY after the presenter's Auth: refused once its type is read,
+/// rather than waiting on a body that cannot make it legal.
+#[cfg(feature = "async")]
+#[derive(Debug)]
+struct Unexpected;
+
+#[cfg(feature = "async")]
+impl crate::coding::Decode<Version> for Unexpected {
+	fn decode(r: &mut crate::coding::Decoder<'_>, _: Version) -> Result<Self, crate::coding::DecodeError> {
+		Err(crate::coding::DecodeError::InvalidMessage(r.varint()?))
+	}
+}
+
 /// Write the acceptor's replies until either side ends the token. `default` feeds
 /// the default acceptor's grant into the outbox as it changes.
-async fn serve_issue<S: crate::transport::poll::Session>(
-	runtime: &crate::time::Clock,
+#[cfg(feature = "async")]
+async fn serve_issue(
+	runtime: &crate::time::Deadlines,
 	issue: &kio::Shared<Issue>,
 	mut default: Option<&mut crate::auth::DefaultGrant>,
-	stream: &mut Stream<S, Version>,
+	stream: &mut Stream<Transport, Version>,
 	version: Version,
+	goaways: &mut super::request_stream::GoAways,
 ) -> Result<(), Error> {
 	enum Next {
 		Withdrawn(Result<(), Error>),
@@ -489,12 +510,10 @@ async fn serve_issue<S: crate::transport::poll::Session>(
 	loop {
 		let next = kio::wait(|waiter| {
 			let mut cx = std::task::Context::from_waker(waiter.waker());
-			if let Poll::Ready(res) = stream.reader.poll_read_chunk(&mut cx, 1).map(|res| {
-				res.and_then(|chunk| match chunk {
-					None => Ok(()),
-					Some(_) => Err(Error::ProtocolViolation),
-				})
-			}) {
+			if let Poll::Ready(res) = goaways
+				.poll_next::<Unexpected, _>(&mut stream.reader, &mut cx)
+				.map(|res| res.map(|_| ()))
+			{
 				return Poll::Ready(Next::Withdrawn(res));
 			}
 			if let Some(default) = default.as_deref_mut()
@@ -527,9 +546,8 @@ async fn serve_issue<S: crate::transport::poll::Session>(
 					subscribe: grant.subscribe,
 					expires: grant.expires.map(|at| at.saturating_duration_since(now)),
 				};
-				// Sized as the full message before anything is written, so a grant that cannot
-				// be encoded for any reason (not a prefix subtree, over the u16 message size)
-				// never leaves half a message on the wire. Never widen or trim it: refuse,
+				// Sized as the full message before anything is written, so a grant over the u16
+				// message size never leaves half a message on the wire. Never trim it: refuse,
 				// which revokes whatever this stream granted before.
 				if let Err(err) = ok.encode(&mut Encoder::new(&mut Vec::new(), version.into()), version) {
 					tracing::debug!(%err, "auth grant cannot be encoded as one AUTH_OK; refusing the token");
@@ -562,11 +580,39 @@ async fn serve_issue<S: crate::transport::poll::Session>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::Pattern;
+
+	#[cfg(feature = "async")]
+	#[moq_clock::test]
+	async fn auth_refused_without_credit_spends_no_request_id() {
+		for version in [Version::Draft17, Version::Draft19] {
+			for client in [false, true] {
+				let first = if client { 0 } else { 1 };
+				let control = Control::new(Some(RequestId(first + 1)), client);
+				let present = Present {
+					runtime: crate::time::sim(),
+					stats: Default::default(),
+					session: crate::driver::Transport::new(
+						crate::lite::test_transport::ScriptedSession::new(Vec::new()).without_credit(),
+					),
+					control: control.clone(),
+					handle: Link::new(false),
+					version,
+					id: 0,
+				};
+				assert!(matches!(present.run(Bytes::new()).await, Error::NoStreamCredit));
+				assert_eq!(
+					control.poll_next_request_id(&kio::Waiter::noop()),
+					Poll::Ready(RequestId(first))
+				);
+			}
+		}
+	}
 
 	const VERSION: Version = Version::Draft17;
 
-	fn patterns(prefixes: &[&str]) -> Patterns {
-		prefixes.iter().map(|p| Pattern::subtree(p).unwrap()).collect()
+	fn patterns(texts: &[&str]) -> Patterns {
+		texts.iter().map(|text| Pattern::try_from(*text).unwrap()).collect()
 	}
 
 	fn encode_msg<T: Message>(msg: &T, version: Version) -> Result<Vec<u8>, EncodeError> {
@@ -628,15 +674,16 @@ mod tests {
 		}
 	}
 
-	/// The root grant and a union of prefixes survive the trip, as distinct from the
-	/// empty grant.
+	/// `**` grants everything, the empty pattern only the root, and the empty list
+	/// nothing; literals and wildcards travel exactly, never widened to a prefix.
 	#[test]
 	fn auth_ok_round_trips() {
 		for (publish, subscribe, expires) in [
-			(patterns(&[""]), patterns(&[]), None),
+			(patterns(&["**"]), patterns(&[]), None),
+			(patterns(&[""]), patterns(&["room/**"]), None),
 			(
-				patterns(&["room/alice", "room/bob"]),
-				patterns(&["room"]),
+				patterns(&["ch1", "room/*/cam", "**/demo.hang"]),
+				patterns(&["live/*", "lobby/cam-*.hang"]),
 				Some(Duration::from_secs(60)),
 			),
 		] {
@@ -649,16 +696,17 @@ mod tests {
 		}
 	}
 
-	/// A prefix is a namespace tuple, the way SUBSCRIBE_NAMESPACE spells one.
+	/// Each pattern is its canonical text, in canonical order, as lite's AUTH_OK spells it.
+	/// The exact bytes, shared with `js/net/src/ietf/auth.test.ts` so both encoders agree.
 	#[test]
-	fn prefixes_are_namespace_tuples() {
+	fn auth_ok_golden() {
 		let msg = AuthOk {
-			publish: patterns(&["room/alice"]),
-			subscribe: Patterns::new(),
+			publish: patterns(&["room/*/cam", "ch1"]),
+			subscribe: patterns(&[""]),
 			expires: None,
 		};
 		let buf = encode_msg(&msg, VERSION).unwrap();
-		assert_eq!(&buf[..], b"\x01\x02\x04room\x05alice\x00\x00");
+		assert_eq!(&buf[..], b"\x02\x03ch1\x0aroom/*/cam\x01\x00\x00");
 	}
 
 	#[test]
@@ -679,23 +727,6 @@ mod tests {
 		w.varint(MAX_REASON as u64 + 1).unwrap();
 		let err = AuthError::decode_msg(&mut Decoder::new(&buf, VERSION.into()), VERSION).unwrap_err();
 		assert!(matches!(err, DecodeError::InvalidValue), "{err:?}");
-	}
-
-	/// Only subtrees fit the prefix encoding, alone or in a union; anything narrower is
-	/// refused, never widened to its head.
-	#[test]
-	fn unrepresentable_grants_are_refused() {
-		for union in [&["room/alice"][..], &["room/*/cam"], &["**/cam"], &["room/**", "lobby"]] {
-			let msg = AuthOk {
-				publish: union.iter().map(|p| Pattern::try_from(*p).unwrap()).collect(),
-				subscribe: Patterns::new(),
-				expires: None,
-			};
-			assert!(
-				matches!(encode_msg(&msg, VERSION), Err(EncodeError::Unsupported)),
-				"{union:?} encoded"
-			);
-		}
 	}
 
 	#[test]
@@ -750,5 +781,7 @@ mod tests {
 			Error::Session(SessionError::Unauthorized)
 		));
 		assert_eq!(to_code(SessionError::Unauthorized), UNAUTHORIZED);
+		assert!(matches!(from_code(EXPIRED_AUTH_TOKEN), Error::Expired));
+		assert_eq!(to_code(SessionError::Expired), EXPIRED_AUTH_TOKEN);
 	}
 }

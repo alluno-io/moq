@@ -37,7 +37,10 @@ stability. Both are additive and, per the freeze policy, target whichever lite
 wip is current when they land.
 
 Decided 2026-10-08: Restart and AUTH join Required, since both change the
-lite-07 wire. SUBSCRIBE_OK carrying live media time was dropped: no reader
+lite-07 wire. Compressed tracks joined on 2026-10-17 and landed
+([#5928](https://github.com/moq-dev/moq/pull/5928),
+[#6228](https://github.com/moq-dev/moq/pull/6228),
+[#6230](https://github.com/moq-dev/moq/pull/6230)). SUBSCRIBE_OK carrying live media time was dropped: no reader
 was named, and `set_live` covers it.
 
 The cut:
@@ -47,19 +50,29 @@ The cut:
   draft (whose text already names the rename), and at every site spelling
   the wip ALPN: `rs/moq-tokio/src/connect.rs` and `listen.rs`,
   `rs/moq-tokio/tests/`, `rs/moq-relay/src/cluster.rs`,
-  `rs/moq-relay/tests/smoke.rs`,
+  `rs/moq-relay/tests/integration/smoke.rs`,
   `test/interop/bare-fin.ts`, `test/interop/lite-varint.ts`, and
   `doc/concept/moq-lite.md`; grep for `moq-lite-07-wip` to catch new ones. A wip peer and a final peer refuse each other by ALPN
   rather than misparse; no compatibility shim.
 - The draft's lite-07 changelog matches the wire and `just drafts check`
   passes.
-- Preserve SETUP's rule: "a receiver MUST treat a longer SETUP as a protocol
-  violation and MAY reject it based on the length prefix alone" (65,536
-  bytes). The general cap proposed by request caps (#4820) only permits
-  rejection (MAY), so it does not replace SETUP's stronger requirement.
-  Remove the SETUP sentence only if the general rule requires the same
-  rejection. If SETUP keeps its own rule, the lite-07 changelog still names
-  that rejection, not only the cap.
+- SETUP keeps its stronger rule: #4820 put it under the general Message
+  Length cap, which only permits rejection (MAY), while "a receiver MUST
+  treat a longer SETUP as a protocol violation" stays. The lite-07 changelog
+  names that rejection, not only the cap.
+
+Decided 2026-10-20 (maintainer): [Drop set](/quest/m1/drop-set.md) joins
+Required, because it adds `Max Age` to lite-07's SUBSCRIBE_DROP. Only
+[Token in band](/quest/m1/auth/token-in-band.md) gates the cut from the auth
+line, because it is that line's lite-07 wire work; the rest is API work that
+does not block the rename.
+
+The archive line's TRACKS request (a per-broadcast track listing that
+replaced SUBSCRIBE_ALL) landed in [#6158](https://github.com/moq-dev/moq/pull/6158)
+and [#6167](https://github.com/moq-dev/moq/pull/6167), and the padding stream
+type for the m2 browser [padding probes](/quest/m2/probe/padding.md) landed in
+[#6233](https://github.com/moq-dev/moq/pull/6233).
+The `Time(pts)` range end rides in Subscribe ranges, already Required.
 
 Rust's lite-07 varints already carry the full 64 bits the draft specifies,
 so no codec work waits on the cut.
@@ -72,16 +85,19 @@ identifier. This release adopts the new routing contract end to end.
 Public API: the lite-07 version constant and ALPN lose `-wip`. Wire: lite-07
 is published; older versions are unchanged.
 
+Timestamp provenance landed in
+[#6150](https://github.com/moq-dev/moq/pull/6150), and the 2^61 - 1
+timestamp bound in [#6168](https://github.com/moq-dev/moq/pull/6168).
+
 ## Required
 
-- [In-band auth](/quest/m1/auth/README.md) - lite-07 carries the Auth Stream and UNAUTHORIZED (0x3B)
+- [Token in band](/quest/m1/auth/token-in-band.md) - lite-07 carries the Auth Stream and UNAUTHORIZED (0x3B)
+- [Identity proof](/quest/m1/cluster-routing/identity.md) - lite-07 carries the routing key and its per-session proof
 - [Routes and announces](/quest/m1/cluster-routing/routes.md) - lite-07 carries the route layer: ROUTE per origin node and path-less ANNOUNCE, with the hop list gone
-- [SUBSCRIBE_DROP](/quest/m1/subscribe-drop.md) - lite-07 restores SUBSCRIBE_DROP in place of `Stream Count`
-- [FETCH max-delay](/quest/m1/fetch-max-delay.md) - historical requests have a reader budget, carried by FETCH while present and by ranges after its removal
+- [Drop set](/quest/m1/drop-set.md) - lite-07's SUBSCRIBE_DROP carries `Max Age`, so a widening re-offers groups reported dropped
 - [Subscribe ranges](/quest/m1/subscribe-ranges/README.md) - SUBSCRIBE carries ranges and an order and lite FETCH is gone, in Rust and JS
 - [Announcement takeover](/quest/m1/announce-takeover.md) - ANNOUNCE_TAKEOVER preserves a proven instance under a new independent route
 
 ## Related
 
-- [Relay hops](/quest/m1/ietf-extension/lite.md) - the `ietf` SETUP extension targets lite-07 wip and does not gate the cut
 - [The moq.pro mesh runs lite-07](/quest/m3/lite07-mesh.md) - the deployment condition that follows this

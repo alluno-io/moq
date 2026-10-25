@@ -12,6 +12,10 @@ rust-version.workspace = true
 keywords = ["async", "producer", "consumer", "state", "sync"]
 categories = ["asynchronous", "concurrency"]
 
+[features]
+# Per-task Ready poll accounting for deterministic simulators, never production.
+_sim = []
+
 [dependencies]
 smallvec = { version = "1.15", features = ["union"] }
 
@@ -39,5 +43,9 @@ harness = false
 name = "channel"
 harness = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+[[bench]]
+name = "contended"
+harness = false
+
+[lints]
+workspace = true

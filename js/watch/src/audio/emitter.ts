@@ -1,9 +1,11 @@
-import { Time } from "@moq/net";
+import { Milli, Nano } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Decoder } from "./decoder";
 
-const FADE = Time.Milli(200);
+// How long a volume change ramps for.
+const FADE = Milli(200);
 
+/** Signals the emitter reads. */
 export type EmitterInput = {
 	volume: Getter<number>;
 
@@ -19,9 +21,6 @@ export type EmitterInput = {
 export type EmitterProps = Inputs<EmitterInput> & {
 	/** Decoder supplying PCM. */
 	source: Decoder;
-
-	/** How long a volume change ramps for. Defaults to 200 ms; 0 steps at once. */
-	fade?: Time.Milli | Signal<Time.Milli>;
 };
 
 type EmitterOutput = {
@@ -32,19 +31,19 @@ type EmitterOutput = {
 	level: Signal<number>;
 };
 
-// A helper that emits audio directly to the speakers.
+/** A helper that emits audio directly to the speakers. */
 export class Emitter {
+	/** The decoder supplying samples. */
 	readonly source: Decoder;
 
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<EmitterInput>;
-
-	/** How long a volume change ramps for. 0 steps at once; a negative or non-finite fade throws and leaves the volume as it was. */
-	fade: Signal<Time.Milli>;
 
 	readonly #out: EmitterOutput = {
 		enabled: new Signal<boolean>(false),
 		level: new Signal<number>(0),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
@@ -59,7 +58,6 @@ export class Emitter {
 			muted: getter(props?.muted ?? false),
 			paused: getter(props?.paused ?? false),
 		};
-		this.fade = Signal.from(props.fade ?? FADE);
 
 		// Only download while playing audible audio. Pausing or muting stops it.
 		this.#signals.run((effect) => {
@@ -84,12 +82,15 @@ export class Emitter {
 			const analyser = new AnalyserNode(root.context, { fftSize: 256, smoothingTimeConstant: 0.5 });
 			gain.connect(analyser);
 			const samples = new Float32Array(analyser.fftSize);
-			effect.interval(() => {
-				analyser.getFloatTimeDomainData(samples);
-				let sum = 0;
-				for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
-				this.#out.level.set(Math.sqrt(sum / samples.length));
-			}, 100);
+			effect.interval(
+				() => {
+					analyser.getFloatTimeDomainData(samples);
+					let sum = 0;
+					for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+					this.#out.level.set(Math.sqrt(sum / samples.length));
+				},
+				Nano.fromMilli(Milli(100)),
+			);
 			effect.cleanup(() => {
 				gain.disconnect(analyser);
 				this.#out.level.set(0);
@@ -119,18 +120,13 @@ export class Emitter {
 				gain.gain.setValueAtTime(level, now);
 			});
 
-			const fade = effect.get(this.fade);
-			if (!Number.isFinite(fade) || fade < 0)
-				throw new Error(`audio fade must be a finite, non-negative number of ms: ${fade}`);
-
 			// Linear, like the publisher's gain: an exponential ramp can't start from or reach silence.
 			const volume = effect.get(this.in.volume);
-			const now = gain.context.currentTime;
-			if (fade === 0) gain.gain.setValueAtTime(volume, now);
-			else gain.gain.linearRampToValueAtTime(volume, now + Time.Milli.toSecond(fade));
+			gain.gain.linearRampToValueAtTime(volume, gain.context.currentTime + Milli.toSecond(FADE));
 		});
 	}
 
+	/** Stop and release everything this holds. */
 	close() {
 		this.#signals.close();
 	}

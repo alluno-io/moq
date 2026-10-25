@@ -9,15 +9,12 @@ import type { Dispose } from "@moq/signals";
 import type { Writer } from "./stream.ts";
 import type * as track from "./track.ts";
 
-// The transport compares send orders as a single number, so the two ranks are packed into
-// disjoint ranges: the track priority takes the high bits so it always dominates, and the
-// position below it. Group data stays negative so protocol streams at the transport's default
-// order of 0 always make progress. A u8 priority and 44-bit position fill the negative half of
-// the safe integer range exactly.
-const GROUP_SPAN = 2 ** 44;
-
-/** The highest track priority the wire carries (a u8). */
-const MAX_PRIORITY = 0xff;
+// The transport compares send orders as a single number, so the ranks are packed into
+// disjoint ranges: the subscriber's priority takes the high bits so it always dominates, the
+// publisher's below it, and the position below that. Group data stays negative so protocol
+// streams at the transport's default order of 0 always make progress. Two signed byte
+// priorities and a 36-bit position fit the negative half of the safe integer range.
+const GROUP_SPAN = 2 ** 36;
 
 /**
  * What to rank a group stream by.
@@ -25,8 +22,14 @@ const MAX_PRIORITY = 0xff;
  * @internal
  */
 export interface Rank {
-	/** The subscriber's track priority, which outweighs everything below it. */
+	/** The subscriber's track priority (`-128..=127`), which outweighs everything below it. */
 	priority: number;
+
+	/**
+	 * The publisher's track priority (`-128..=127`), breaking ties between subscriptions at one
+	 * subscriber priority. Defaults to 0, the unset priority.
+	 */
+	publisher?: number;
 
 	/**
 	 * Where the group sits in the queue its own subscription wants sent, 0 being the one to
@@ -46,14 +49,15 @@ export interface Rank {
  *
  * @internal
  */
-export function sendOrder({ priority, position = 0 }: Rank): number {
-	return -((MAX_PRIORITY - clamp(priority, MAX_PRIORITY)) * GROUP_SPAN + clamp(position, GROUP_SPAN - 1) + 1);
+export function sendOrder({ priority, publisher = 0, position = 0 }: Rank): number {
+	const rank = (127 - clamp(priority, -128, 127)) * 256 + (127 - clamp(publisher, -128, 127));
+	return -(rank * GROUP_SPAN + clamp(position, 0, GROUP_SPAN - 1) + 1);
 }
 
-// Both ranks are bounded: the priority by its wire type, the position by the space left below
-// it. Anything outside is a caller bug rather than a value worth preserving.
-function clamp(value: number, max: number): number {
-	return Math.min(Math.max(Math.trunc(value), 0), max);
+// Every rank is bounded: the priorities by their wire type, the position by the space left
+// below them. Anything outside is a caller bug rather than a value worth preserving.
+function clamp(value: number, min: number, max: number): number {
+	return Math.min(Math.max(Math.trunc(value), min), max);
 }
 
 /**
@@ -72,28 +76,34 @@ function clamp(value: number, max: number): number {
  */
 export class Priority {
 	#track: track.Subscriber;
-	#streams = new Map<Writer, number>();
+	#publisher: number;
+	#streams = new Map<Writer, { sequence: number; object: number }>();
 	#dispose: Dispose;
 	#closed = false;
 
-	/** Follow `track`'s subscription until {@link close}. */
-	constructor(track: track.Subscriber) {
+	/**
+	 * Follow `track`'s subscription until {@link close}, breaking ties at one subscriber
+	 * priority by the track's `publisher` priority.
+	 */
+	constructor(track: track.Subscriber, publisher = 0) {
 		this.#track = track;
+		this.#publisher = publisher;
 		this.#dispose = track.subscription.subscribe(() => this.#rerank());
 	}
 
-	/** The send order for a group at `sequence`, whether or not it has a stream yet. */
-	rank(sequence: number): number {
+	/** The send order for a stream starting at this group and object, before it opens. */
+	rank(sequence: number, object: number): number {
 		const subscription = this.#track.subscription.peek();
 		return sendOrder({
 			priority: subscription?.priority ?? 0,
-			position: this.#position(sequence, subscription?.order),
+			publisher: this.#publisher,
+			position: this.#position(sequence, object, subscription?.order),
 		});
 	}
 
-	/** Rank a group's stream now, and again whenever the ranking changes, until {@link remove}. */
-	add(stream: Writer, sequence: number) {
-		this.#streams.set(stream, sequence);
+	/** Rank a stream by its first object now and after ranking changes, until {@link remove}. */
+	add(stream: Writer, sequence: number, object: number) {
+		this.#streams.set(stream, { sequence, object });
 
 		// Also covers the stream itself: opening one can block on transport capacity, so an
 		// update that landed while it did predates this registration.
@@ -123,13 +133,19 @@ export class Priority {
 		if (this.#streams.size === 0) this.#dispose();
 	}
 
-	// How many of this subscription's groups in flight should be sent before `sequence`.
-	// Sequences are unique within a subscription, so a group already registered never counts
-	// itself.
-	#position(sequence: number, order: track.Order = "descending"): number {
+	// Earlier objects win within one group, so a fill precedes its live rest. Group order
+	// still dominates, and identical starts tie without counting themselves.
+	#position(sequence: number, object: number, order: track.Order = "descending"): number {
 		let ahead = 0;
 		for (const other of this.#streams.values()) {
-			if (order === "ascending" ? other < sequence : other > sequence) ahead++;
+			if (
+				other.sequence === sequence
+					? other.object < object
+					: order === "ascending"
+						? other.sequence < sequence
+						: other.sequence > sequence
+			)
+				ahead++;
 		}
 		return ahead;
 	}
@@ -137,8 +153,14 @@ export class Priority {
 	#rerank() {
 		const subscription = this.#track.subscription.peek();
 		const priority = subscription?.priority ?? 0;
-		for (const [stream, sequence] of this.#streams) {
-			stream.setPriority(sendOrder({ priority, position: this.#position(sequence, subscription?.order) }));
+		for (const [stream, { sequence, object }] of this.#streams) {
+			stream.setPriority(
+				sendOrder({
+					priority,
+					publisher: this.#publisher,
+					position: this.#position(sequence, object, subscription?.order),
+				}),
+			);
 		}
 	}
 }

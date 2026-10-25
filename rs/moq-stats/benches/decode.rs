@@ -6,6 +6,11 @@
 //!
 //! Run `cargo bench -p moq-stats --bench decode` and compare the table across revisions.
 
+#![expect(
+	clippy::disallowed_methods,
+	reason = "custom timings measure the real time the work took, not the ambient clock"
+)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -71,7 +76,7 @@ fn traffic(index: usize, tick: u64, changed_percent: usize) -> Traffic {
 
 /// The compressed frames one tier's producer would publish over the run, snapshot first.
 fn frames(broadcasts: usize, tier: usize, changed_percent: usize) -> Vec<(Vec<u8>, bool)> {
-	let mut config = snapshot::Config::default().with_delta_ratio(u32::MAX);
+	let mut config = snapshot::Config::default().with_deltas(true);
 	config.compression = moq_json::Compression::Deflate;
 	let mut encoder = Encoder::<TrafficFrame>::new(config);
 	(0..TICKS + 2)

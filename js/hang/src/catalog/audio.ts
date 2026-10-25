@@ -1,23 +1,25 @@
 import * as z from "@zod/mini";
+import { compareName, compareNumber } from "./compare";
 import { ContainerSchema } from "./container";
 import { hexSchema } from "./hex";
 import { u53Schema } from "./integers";
-import { RelativeBroadcastSchema } from "./path";
+import { EpochSchema, RelativeBroadcastSchema } from "./path";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
 	name: z.string(),
 });
 
-/**
- * Schema for a single audio rendition's decoder config.
- * Mirrors WebCodecs AudioDecoderConfig (https://w3c.github.io/webcodecs/#audio-decoder-config).
- */
-export const AudioConfigSchema = z.object({
+const AudioConfigFields = z.object({
 	// Optional reference to another broadcast that publishes this track, expressed
 	// relative to the broadcast that served this catalog (e.g. "./source").
 	// If unset, the track lives in the same broadcast as the catalog.
 	broadcast: z.optional(RelativeBroadcastSchema),
+	// The publisher instance the reference names, when known. Absent accepts whichever instance
+	// resolves first. An epoch-aware route proving another instance fails the entry; an epochless
+	// route cannot prove one, so there it is best effort. Without `broadcast`, it names the
+	// catalog's own instance.
+	epoch: z.optional(EpochSchema),
 	// The track's name in its broadcast, when it differs from this entry's ID (its key in the
 	// catalog). Absent means the ID is the track name. Resolve it with `track`.
 	track: z.optional(z.string()),
@@ -43,7 +45,13 @@ export const AudioConfigSchema = z.object({
 	// The number of channels in the audio
 	numberOfChannels: u53Schema,
 
-	// The maximum bitrate of the audio in bits per second. It only rises.
+	// What the decoded channels carry. Absent means the codec's own channel order. "ambisonic" is
+	// full-sphere AmbiX (ACN order, SN3D normalization) whose order follows from numberOfChannels,
+	// a square of at least 4. Typed as a plain string so an unrecognized layout survives a
+	// republish; a consumer treats one as absent.
+	layout: z.optional(z.string()),
+
+	// The maximum bitrate of the audio in bits per second.
 	// TODO: Support up to Number.MAX_SAFE_INTEGER
 	bitrate: z.optional(u53Schema),
 
@@ -83,6 +91,22 @@ export const AudioConfigSchema = z.object({
 	),
 });
 
+/**
+ * Schema for a single audio rendition's decoder config.
+ * Mirrors WebCodecs AudioDecoderConfig (https://w3c.github.io/webcodecs/#audio-decoder-config).
+ */
+export const AudioConfigSchema = AudioConfigFields.check(
+	z.refine((c) => c.layout !== "ambisonic" || isAmbisonic(c.numberOfChannels), {
+		message: "ambisonic audio needs a square channel count of at least 4",
+	}),
+);
+
+// (order + 1)² channels for an order of at least 1.
+function isAmbisonic(channels: number): boolean {
+	const order = Math.round(Math.sqrt(channels));
+	return order >= 2 && order * order === channels;
+}
+
 /** Schema for the catalog audio section: a map of track name to rendition config. */
 export const AudioSchema = z.union([
 	z.object({
@@ -106,3 +130,15 @@ export const AudioSchema = z.union([
 export type Audio = z.infer<typeof AudioSchema>;
 /** Decoder config for a single audio rendition. */
 export type AudioConfig = z.infer<typeof AudioConfigSchema>;
+
+/** Rank audio best first: enabled, then bitrate, sample rate, channels, and name. */
+export function ranked(renditions: Record<string, AudioConfig>): [string, AudioConfig][] {
+	return Object.entries(renditions).sort(
+		(left, right) =>
+			compareNumber(Number(left[1].enabled !== false), Number(right[1].enabled !== false)) ||
+			compareNumber(left[1].bitrate, right[1].bitrate) ||
+			compareNumber(left[1].sampleRate, right[1].sampleRate) ||
+			compareNumber(left[1].numberOfChannels, right[1].numberOfChannels) ||
+			compareName(left[0], right[0]),
+	);
+}

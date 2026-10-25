@@ -13,6 +13,9 @@ import * as Path from "../src/path.ts";
 import { Reader, Stream } from "../src/stream.ts";
 import * as Varint from "../src/varint.ts";
 
+// Keep protocol diagnostics out of the measured CSV on stdout.
+console.debug = console.error;
+
 const frameSizes = [16, 100, 1000];
 const chunkSizes = [1200, 16 * 1024, 64 * 1024];
 const framesPerGroup = 50;
@@ -49,9 +52,9 @@ const lite: Protocol = {
 	async subscribe() {
 		const open: Open = (stream) => {
 			const producer = new Producer(0);
-			const done = readFrames(new Reader(stream, undefined, LiteVersion.DRAFT_06), producer, 1_000_000).then(() =>
-				producer.close(),
-			);
+			const done = readFrames(new Reader(stream, undefined, LiteVersion.DRAFT_06), producer, {
+				scale: 1_000_000,
+			}).then(() => producer.close());
 			return { group: Promise.resolve(producer.consume()), done };
 		};
 		return { open, close: () => {} };

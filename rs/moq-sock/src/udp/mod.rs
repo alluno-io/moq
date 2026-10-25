@@ -45,8 +45,6 @@ use std::{
     net::UdpSocket,
     os::fd::{AsRawFd, FromRawFd},
 };
-#[cfg(not(wasm_browser))]
-use std::{sync::Mutex, time::Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock;
 
@@ -71,9 +69,10 @@ mod imp;
 #[path = "wasi.rs"]
 mod imp;
 
-// moq-sock always logs through `tracing`, so quinn-udp's `log` and no-op
-// backends are not carried.
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "moq-sock always logs through `tracing`, so quinn-udp's `log` and no-op backends are not carried"
+)]
 mod log {
     pub(crate) use tracing::{debug, error, info, trace, warn};
 }
@@ -167,7 +166,13 @@ impl Transmit<'_> {
     /// This case is actually quite common when splitting up a prepared GSO batch
     /// again after GSO has been disabled because the last datagram in a GSO
     /// batch is allowed to be smaller than the segment size.
-    #[cfg_attr(apple_fast, allow(dead_code))] // Used by prepare_msg, which is unused when apple_fast
+    #[cfg_attr(
+        apple_fast,
+        allow(
+            dead_code,
+            reason = "used by prepare_msg, which is unused when apple_fast"
+        )
+    )]
     fn effective_segment_size(&self) -> Option<usize> {
         match self.segment_size? {
             size if size >= self.contents.len() => None,
@@ -247,34 +252,24 @@ pub fn is_msg_size_err(err: &io::Error) -> bool {
     }
 }
 
-/// Log at most 1 IO error per minute
-#[cfg(not(wasm_browser))]
-const IO_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Logs a warning message when sendmsg fails
+/// Returns true if the given send error means the local stack has no way to reach the destination
 ///
-/// Logging will only be performed if at least [`IO_ERROR_LOG_INTERVAL`]
-/// has elapsed since the last error was logged.
-#[cfg(not(wasm_browser))]
-fn log_sendmsg_error(
-    last_send_error: &Mutex<Instant>,
-    err: impl core::fmt::Debug,
-    transmit: &Transmit<'_>,
-) {
-    let now = Instant::now();
-    let last_send_error = &mut *last_send_error.lock().expect("poisend lock");
-    if now.saturating_duration_since(*last_send_error) > IO_ERROR_LOG_INTERVAL {
-        *last_send_error = now;
-        log::warn!(
-            "sendmsg error: {:?}, Transmit: {{ destination: {:?}, src_ip: {:?}, ecn: {:?}, len: {:?}, segment_size: {:?} }}",
-            err,
-            transmit.destination,
-            transmit.src_ip,
-            transmit.ecn,
-            transmit.contents.len(),
-            transmit.segment_size
-        );
-    }
+/// Most send errors are transient, so higher layers treat them as packet loss. These are not:
+/// there is no route to the address (ENETUNREACH, EHOSTUNREACH) or the interface is down
+/// (ENETDOWN), and the Windows `WSAE*` equivalents. Retransmitting cannot fix them, so a
+/// connection attempt can give up on that address at once, for example to dial the other address
+/// family.
+///
+/// They are only local for an unconnected socket with transport errors left disabled, as
+/// `UdpSocketState` sockets are by default. A `connect`ed socket, or one with `IP_RECVERR`, can
+/// report a received ICMP error here instead, which an off-path attacker can forge.
+pub fn is_unreachable_err(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkDown
+    )
 }
 
 /// A borrowed UDP socket
@@ -356,6 +351,27 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unreachable_errors_are_only_the_routing_failures() {
+        for code in [libc::ENETUNREACH, libc::EHOSTUNREACH, libc::ENETDOWN] {
+            let err = io::Error::from_raw_os_error(code);
+            assert!(is_unreachable_err(&err), "{err}");
+        }
+        // Loss, readiness, MTU probes, the GSO fallback, and ICMP noise all stay retryable.
+        for code in [
+            libc::ENOBUFS,
+            libc::EAGAIN,
+            libc::EMSGSIZE,
+            libc::EINVAL,
+            libc::EIO,
+            libc::ECONNREFUSED,
+        ] {
+            let err = io::Error::from_raw_os_error(code);
+            assert!(!is_unreachable_err(&err), "{err}");
+        }
+    }
 
     #[test]
     fn effective_segment_size() {

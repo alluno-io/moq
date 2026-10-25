@@ -18,15 +18,19 @@ use hang::catalog::VP9;
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// The frame header has an invalid frame marker.
 	#[error("invalid VP9 frame marker")]
 	InvalidFrameMarker,
 
+	/// The frame header has an invalid sync code.
 	#[error("invalid VP9 sync code")]
 	InvalidSyncCode,
 
+	/// The frame ends before its required header fields.
 	#[error("VP9 header truncated")]
 	Truncated,
 
+	/// The frame contains no bytes.
 	#[error("empty VP9 frame")]
 	EmptyFrame,
 }
@@ -172,6 +176,17 @@ impl KeyFrame {
 	}
 }
 
+/// The neutral colour a VP9 codec string carries, for one read from a key frame or a `vpcC`, whose
+/// every field is explicit. A placeholder codec string must not come through here.
+pub(crate) fn color(vp9: &VP9) -> Option<hang::catalog::Color> {
+	crate::codec::color::cicp(
+		vp9.color_primaries,
+		vp9.transfer_characteristics,
+		vp9.matrix_coefficients,
+		Some(vp9.full_range),
+	)
+}
+
 /// Build a catalog [`VideoConfig`](hang::catalog::VideoConfig) from a VP9 frame,
 /// or `None` if the frame is not a key frame.
 ///
@@ -184,7 +199,9 @@ pub(crate) fn config_from_keyframe(data: &[u8]) -> Result<Option<hang::catalog::
 		return Ok(None);
 	};
 	let (width, height) = (key.width, key.height);
-	let mut config = hang::catalog::VideoConfig::new(key.to_catalog());
+	let vp9 = key.to_catalog();
+	let mut config = hang::catalog::VideoConfig::new(vp9.clone());
+	config.color = color(&vp9);
 	config.coded_width = Some(width as u32);
 	config.coded_height = Some(height as u32);
 	Ok(Some(config))
@@ -341,24 +358,5 @@ mod tests {
 		let mut frame = KEYFRAME_320X240.to_vec();
 		frame[1] = 0x00; // corrupt the sync code
 		assert!(FrameHeader::parse(&frame).is_err());
-	}
-
-	#[test]
-	fn vpcc_round_trips_catalog() {
-		let vp9 = VP9 {
-			profile: 2,
-			level: 31,
-			bit_depth: 10,
-			chroma_subsampling: 1,
-			color_primaries: 9,
-			transfer_characteristics: 16,
-			matrix_coefficients: 9,
-			full_range: true,
-		};
-		let vpcc = vpcc(&vp9);
-		assert_eq!(vpcc.profile, 2);
-		assert_eq!(vpcc.bit_depth, 10);
-		assert_eq!(vpcc.matrix_coefficients, 9);
-		assert!(vpcc.video_full_range_flag);
 	}
 }

@@ -6,8 +6,12 @@
 //! One estimate covers a whole connection, so senders sharing one divide it with
 //! an [Allocator] rather than each targeting the whole thing. How a sender then
 //! *follows* its share is shared media policy: see `moq_mux::rate`.
+//!
+//! The same reservations set the connection's probe target: their ceilings summed,
+//! which the session hands to its transport's [`Probe`](crate::transport::Probe) so
+//! the estimate can rise to fund them.
 
-use std::task::Poll;
+use std::{collections::BTreeMap, task::Poll};
 
 use crate::{Error, Result, track};
 
@@ -50,8 +54,8 @@ impl Rate {
 
 	/// This rate scaled by `factor`, saturating at both ends.
 	///
-	/// For the fractional arithmetic rate control does (a ramp allowance, a hysteresis
-	/// band) without spreading `as` casts across the callers.
+	/// For fractional arithmetic, such as halving a rate, without spreading `as`
+	/// casts across the callers.
 	pub fn scaled(self, factor: f64) -> Self {
 		let scaled = self.0 as f64 * factor.max(0.0);
 		if scaled >= u64::MAX as f64 {
@@ -105,7 +109,8 @@ impl Producer {
 	}
 
 	/// A handle that mints consumers without being one, so holding it is not demand.
-	pub(crate) fn weak(&self) -> Weak {
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+	pub fn weak(&self) -> Weak {
 		Weak(self.state.weak())
 	}
 
@@ -118,12 +123,14 @@ impl Producer {
 	}
 
 	/// Block until the channel is closed, returning the cause.
+	#[cfg(feature = "async")]
 	pub async fn closed(&self) -> Error {
 		self.state.closed().await;
 		self.close_error()
 	}
 
 	/// Block until there are no active consumers.
+	#[cfg(feature = "async")]
 	pub async fn unused(&self) -> Result<()> {
 		kio::wait(|waiter| self.poll_unused(waiter)).await
 	}
@@ -139,6 +146,7 @@ impl Producer {
 	}
 
 	/// Block until there is at least one active consumer.
+	#[cfg(feature = "async")]
 	pub async fn used(&self) -> Result<()> {
 		kio::wait(|waiter| self.poll_used(waiter)).await
 	}
@@ -168,11 +176,13 @@ impl Default for Producer {
 
 /// Mints [`Consumer`]s on demand without counting as one, nor keeping the channel open.
 #[derive(Clone)]
-pub(crate) struct Weak(kio::ProducerWeak<State>);
+#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+pub struct Weak(kio::ProducerWeak<State>);
 
 impl Weak {
 	/// A new consumer, which reports the closure once the producer is gone.
-	pub(crate) fn consume(&self) -> Consumer {
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+	pub fn consume(&self) -> Consumer {
 		Consumer {
 			inner: Inner::Whole(self.0.consume()),
 			last: None,
@@ -192,6 +202,13 @@ impl Weak {
 /// sheds the excess by dropping groups. Rate estimation isn't exact enough
 /// for the difference to be worth policing.
 ///
+/// The reservations also set the session's probe target: the sum of every live
+/// reservation's ceiling, demanded or not, so a sender that stopped for lack of
+/// bandwidth keeps asking the connection for its room. A session probes for its own
+/// allocator, so take it from `Session::bandwidth` (with the `async` feature) rather
+/// than building one: an allocator from [`new`](Self::new) divides an estimate but
+/// probes for nothing.
+///
 /// Clones share one registry, so hand a clone to each sender.
 #[derive(Clone)]
 pub struct Allocator {
@@ -200,12 +217,51 @@ pub struct Allocator {
 }
 
 impl Allocator {
-	/// Divide `estimate`, normally a connection's
-	/// [`Session::send_bandwidth`](crate::Session::send_bandwidth).
+	/// Divide `estimate`, with no session probing for the reservations.
+	///
+	/// For an estimate that is not a session's, such as a test's or another
+	/// reservation's slice. A session's own comes from
+	/// `Session::bandwidth` with the `async` feature.
 	pub fn new(estimate: Consumer) -> Self {
 		Self {
 			estimate,
 			registry: kio::Producer::default(),
+		}
+	}
+
+	/// The same registry dividing `estimate` instead, or nothing when it is `None`.
+	#[cfg(feature = "async")]
+	// Sessions follow their allocator's target; a custom session has no public way to yet.
+	pub(crate) fn with_estimate(&self, estimate: Option<Consumer>) -> Self {
+		Self {
+			estimate: estimate.unwrap_or(Consumer {
+				inner: Inner::Unavailable,
+				last: None,
+			}),
+			registry: self.registry.clone(),
+		}
+	}
+
+	/// Probe up to `target` instead of the sum of the reservations, or `None` to follow them again.
+	///
+	/// `Some(Rate::ZERO)` turns probing off. The override is the registry's, so it holds
+	/// for every clone and across the reconnects a persistent allocator spans.
+	pub fn set_target(&self, target: Option<Rate>) {
+		let Ok(mut registry) = self.registry.write() else {
+			unreachable!("the allocator holds its own registry producer")
+		};
+		if registry.target != target {
+			registry.target = target;
+		}
+	}
+
+	/// Follow the probe target, for the session that probes on the reservations' behalf.
+	#[cfg(any(feature = "async", test))]
+	// Sessions follow their allocator's target; a custom session has no public way to yet.
+	pub(crate) fn target(&self) -> Target {
+		Target {
+			registry: Some(self.registry.consume()),
+			last: None,
 		}
 	}
 
@@ -238,12 +294,13 @@ impl Allocator {
 	/// bit; within a tier the split is max-min fair, so a share asking for less
 	/// than an even cut takes all of it and leaves the difference to the others.
 	///
-	/// That is the *publisher's* priority, which is not what orders the local send
-	/// queue: that ranks by each subscription's own priority, so a subscriber
-	/// asking for video ahead of audio is served that way whatever this decides.
-	/// The publisher's is still the right one to divide by, since allocation is a
-	/// decision about what to *produce*, and there is no single subscriber
-	/// priority to read when several are watching one track.
+	/// That is the *publisher's* priority, which the send order only falls back on:
+	/// it ranks by each subscription's own priority first, so a subscriber asking for
+	/// video ahead of audio is served that way whatever this decides, and this one
+	/// breaks the ties (or alone orders a broadcast's tracks on a session scheduled
+	/// per broadcast). The publisher's is still the right one to divide by, since
+	/// allocation is a decision about what to *produce*, and there is no single
+	/// subscriber priority to read when several are watching one track.
 	///
 	/// That last part carries a publisher that leaves `priority` at its default:
 	/// one tier of audio and video still serves audio's small reservation in full
@@ -272,16 +329,20 @@ impl Allocator {
 			};
 			// Closed tracks can't be demanded again; drop them rather than walking
 			// them on every poll for the rest of the connection.
-			registry.entries.retain(|entry| !entry.demand.is_closed());
+			let closed: Vec<u64> = registry
+				.entries
+				.iter()
+				.filter(|(_, entry)| entry.demand.is_closed())
+				.map(|(id, _)| *id)
+				.collect();
+			for id in closed {
+				registry.remove(id);
+			}
 
 			let id = registry.next_id;
 			registry.next_id += 1;
-			registry.entries.push(Entry {
-				id,
-				demand,
-				priority,
-				max,
-			});
+			registry.reserved += u128::from(max.as_bps());
+			registry.entries.insert(id, Entry { demand, priority, max });
 			id
 		};
 
@@ -313,7 +374,7 @@ pub struct Reservation {
 impl Reservation {
 	/// This reservation's slice right now.
 	///
-	/// Stateless, unlike [`Consumer::changed`], which carries a cursor over what it last
+	/// Stateless, unlike [`Consumer::poll_changed`], which carries a cursor over what it last
 	/// reported and so needs a handle of its own.
 	pub fn peek(&self) -> Option<Rate> {
 		self.share.grant()
@@ -347,7 +408,9 @@ impl Reservation {
 		let Ok(mut registry) = registry.write() else {
 			return;
 		};
-		if let Some(entry) = registry.entries.iter_mut().find(|entry| entry.id == self.share.id) {
+		let registry = &mut *registry;
+		if let Some(entry) = registry.entries.get_mut(&self.share.id) {
+			registry.reserved = registry.reserved - u128::from(entry.max.as_bps()) + u128::from(max.as_bps());
 			entry.max = max;
 		}
 	}
@@ -361,7 +424,7 @@ impl Drop for Reservation {
 		let Ok(mut registry) = registry.write() else {
 			return;
 		};
-		registry.entries.retain(|entry| entry.id != self.share.id);
+		registry.remove(self.share.id);
 	}
 }
 
@@ -386,16 +449,78 @@ impl std::fmt::Debug for Allocator {
 /// Every track registered with one [`Allocator`].
 #[derive(Default)]
 struct Registry {
-	entries: Vec<Entry>,
+	/// Keyed by registration order, which [`allocate`] keeps as its tie-break.
+	entries: BTreeMap<u64, Entry>,
 	next_id: u64,
+	/// The entries' ceilings summed, kept as they change so following the target
+	/// never walks the table. Wide enough that no number of `u64` ceilings overflows.
+	reserved: u128,
+	/// The application's override of `reserved` as the probe target.
+	target: Option<Rate>,
+}
+
+impl Registry {
+	fn remove(&mut self, id: u64) {
+		if let Some(entry) = self.entries.remove(&id) {
+			self.reserved -= u128::from(entry.max.as_bps());
+		}
+	}
+
+	/// What the session probes up to.
+	#[cfg(any(feature = "async", test))]
+	fn target(&self) -> Rate {
+		self.target
+			.unwrap_or_else(|| Rate::from_bps(u64::try_from(self.reserved).unwrap_or(u64::MAX)))
+	}
 }
 
 /// One registered track's standing reservation.
 struct Entry {
-	id: u64,
 	demand: track::Demand,
-	priority: u8,
+	priority: i8,
 	max: Rate,
+}
+
+/// An [`Allocator`]'s probe target, followed by the session that probes for it.
+#[cfg(any(feature = "async", test))]
+// Sessions follow their allocator's target; a custom session has no public way to yet.
+pub(crate) struct Target {
+	/// `None` once every allocator is gone.
+	registry: Option<kio::Consumer<Registry>>,
+	last: Option<Rate>,
+}
+
+#[cfg(any(feature = "async", test))]
+impl Target {
+	/// The target once it differs from the last one returned, arming `waiter` otherwise.
+	///
+	/// Zero once every allocator is gone, since nothing is left reserving.
+	// Sessions follow their allocator's target; a custom session has no public way to yet.
+	pub(crate) fn poll_changed(&mut self, waiter: &kio::Waiter) -> Poll<Rate> {
+		let Some(registry) = &self.registry else {
+			return Poll::Pending;
+		};
+		let last = self.last;
+		let polled = registry
+			.poll(waiter, |registry| match registry.target() {
+				target if Some(target) == last => Poll::Pending,
+				target => Poll::Ready(target),
+			})
+			.map(|res| res.ok());
+		let target = match polled {
+			Poll::Ready(Some(target)) => target,
+			Poll::Ready(None) => {
+				self.registry = None;
+				Rate::ZERO
+			}
+			Poll::Pending => return Poll::Pending,
+		};
+		if Some(target) == last {
+			return Poll::Pending;
+		}
+		self.last = Some(target);
+		Poll::Ready(target)
+	}
 }
 
 /// A share's view of the estimate it divides.
@@ -412,7 +537,7 @@ struct Share {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct Want {
 	id: u64,
-	priority: u8,
+	priority: i8,
 	max: Rate,
 }
 
@@ -481,10 +606,10 @@ impl Share {
 			.read()
 			.entries
 			.iter()
-			.map(|entry| {
+			.map(|(id, entry)| {
 				(
 					Want {
-						id: entry.id,
+						id: *id,
 						priority: entry.priority,
 						max: entry.max,
 					},
@@ -620,6 +745,7 @@ impl Consumer {
 	///
 	/// Returns an error once the producer is closed or dropped, so a caller can
 	/// stop watching. See [`poll_changed`](Self::poll_changed).
+	#[cfg(feature = "async")]
 	pub async fn changed(&mut self) -> Result<Option<Rate>> {
 		kio::wait(|waiter| self.poll_changed(waiter)).await
 	}
@@ -631,15 +757,15 @@ mod tests {
 	use crate::broadcast;
 
 	/// Priorities matching `hang`'s, which is what the allocator sees in practice.
-	const AUDIO: u8 = 80;
-	const VIDEO: u8 = 60;
+	const AUDIO: i8 = 80;
+	const VIDEO: i8 = 60;
 
 	/// Bits per second, so the tables below stay readable.
 	fn bps(bps: u64) -> Rate {
 		Rate::from_bps(bps)
 	}
 
-	fn want(id: u64, priority: u8, max: u64) -> Want {
+	fn want(id: u64, priority: i8, max: u64) -> Want {
 		Want {
 			id,
 			priority,
@@ -648,7 +774,7 @@ mod tests {
 	}
 
 	/// A standalone track at `priority`, plus the broadcast keeping it alive.
-	fn track(priority: u8) -> (broadcast::Producer, track::Producer) {
+	fn track(priority: i8) -> (broadcast::Producer, track::Producer) {
 		let broadcast = broadcast::Info::default().produce();
 		let track = broadcast
 			.create_track("t", track::Info::timed().with_priority(priority))
@@ -729,13 +855,14 @@ mod tests {
 
 	/// The headline case: two encoders on one connection must not each target the
 	/// whole estimate.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn concurrent_tracks_split_the_estimate() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 
 		let (_first_broadcast, first) = track(VIDEO);
-		let _first_sub = first.consume();
+		let _first_sub = first.subscribe(None);
 		let first = allocator.reserve(&first.demand(), bps(4_000_000));
 		let mut first_share = first.consumer();
 
@@ -746,7 +873,7 @@ mod tests {
 		// A second encoder starts. The first must give half back without anyone
 		// telling it to, or the two together target 200% of the uplink.
 		let (_second_broadcast, second) = track(VIDEO);
-		let _second_sub = second.consume();
+		let _second_sub = second.subscribe(None);
 		let second_share = allocator.reserve(&second.demand(), bps(4_000_000));
 
 		assert_eq!(first_share.changed().await.unwrap(), Some(bps(1_000_000)));
@@ -762,7 +889,7 @@ mod tests {
 		estimate.set(Some(bps(2_000_000))).unwrap();
 
 		let (_watched_broadcast, watched) = track(VIDEO);
-		let _watched_sub = watched.consume();
+		let _watched_sub = watched.subscribe(None);
 		let watched_share = allocator.reserve(&watched.demand(), bps(4_000_000));
 
 		let (_idle_broadcast, idle) = track(VIDEO);
@@ -774,26 +901,27 @@ mod tests {
 		assert_eq!(idle_share.peek(), None);
 
 		// It joins, and the split happens.
-		let _idle_sub = idle.consume();
+		let _idle_sub = idle.subscribe(None);
 		assert_eq!(watched_share.peek(), Some(bps(1_000_000)));
 		assert_eq!(idle_share.peek(), Some(bps(1_000_000)));
 	}
 
 	/// Demand transitions have to wake a parked share, not just change what a later
 	/// `peek` would see; the encoder is sitting in a `select!` on `changed`.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn a_share_wakes_when_a_sibling_goes_idle() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 		estimate.set(Some(bps(2_000_000))).unwrap();
 
 		let (_mine_broadcast, mine) = track(VIDEO);
-		let _mine_sub = mine.consume();
+		let _mine_sub = mine.subscribe(None);
 		let mine_share_reserved = allocator.reserve(&mine.demand(), bps(4_000_000));
 		let mut mine_share = mine_share_reserved.consumer();
 
 		let (_sibling_broadcast, sibling) = track(VIDEO);
-		let sibling_sub = sibling.consume();
+		let sibling_sub = sibling.subscribe(None);
 		let _sibling_share = allocator.reserve(&sibling.demand(), bps(4_000_000));
 
 		assert_eq!(mine_share.changed().await.unwrap(), Some(bps(1_000_000)));
@@ -807,8 +935,10 @@ mod tests {
 	/// fresh `poll` can't tell you: a lost wakeup still looks correct on the next poll
 	/// and only shows up as a task that never runs again.
 	#[derive(Default)]
+	#[cfg(feature = "async")]
 	struct Woken(std::sync::atomic::AtomicBool);
 
+	#[cfg(feature = "async")]
 	impl std::task::Wake for Woken {
 		fn wake(self: std::sync::Arc<Self>) {
 			self.wake_by_ref();
@@ -819,6 +949,7 @@ mod tests {
 		}
 	}
 
+	#[cfg(feature = "async")]
 	impl Woken {
 		/// A flag and its waiter. Both are returned because a [`kio::WaiterList`]
 		/// holds only a `Weak`, so a waiter dropped at the end of the calling
@@ -838,13 +969,14 @@ mod tests {
 	/// waker armed. Reservations cap the slice, so most estimate changes don't reach
 	/// it, and a poll that returned the value without arming anything would park the
 	/// encoder with nothing left to wake it.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn an_unchanged_slice_keeps_watching_the_estimate() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 
 		let (_broadcast, track) = track(VIDEO);
-		let _sub = track.consume();
+		let _sub = track.subscribe(None);
 		let share_reserved = allocator.reserve(&track.demand(), bps(4_000_000));
 		let mut share = share_reserved.consumer();
 
@@ -864,19 +996,20 @@ mod tests {
 	}
 
 	/// The same, for the other input: a sibling's demand.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn a_parked_share_is_woken_by_sibling_demand() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 		estimate.set(Some(bps(2_000_000))).unwrap();
 
 		let (_mine_broadcast, mine) = track(VIDEO);
-		let _mine_sub = mine.consume();
+		let _mine_sub = mine.subscribe(None);
 		let share_reserved = allocator.reserve(&mine.demand(), bps(4_000_000));
 		let mut share = share_reserved.consumer();
 
 		let (_sibling_broadcast, sibling) = track(VIDEO);
-		let sibling_sub = sibling.consume();
+		let sibling_sub = sibling.subscribe(None);
 		let _sibling_share = allocator.reserve(&sibling.demand(), bps(4_000_000));
 
 		assert_eq!(share.changed().await.unwrap(), Some(bps(1_000_000)));
@@ -889,13 +1022,14 @@ mod tests {
 
 	/// A share follows the estimate's own lifecycle: unavailable while disconnected
 	/// (hold the current rate), terminal once the session is gone for good.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn a_share_follows_the_estimate_lifecycle() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 
 		let (_broadcast, track) = track(VIDEO);
-		let _sub = track.consume();
+		let _sub = track.subscribe(None);
 		let share_reserved = allocator.reserve(&track.demand(), bps(4_000_000));
 		let mut share = share_reserved.consumer();
 
@@ -932,18 +1066,19 @@ mod tests {
 	/// Dropping the reservation hands the room back. The registry only ever prunes
 	/// tracks that have *closed*, so a claim left behind by a track that is still
 	/// publishing would stand for the rest of the connection.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn dropping_a_reservation_releases_it() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 		estimate.set(Some(bps(2_000_000))).unwrap();
 
 		let (_first_broadcast, first) = track(VIDEO);
-		let _first_sub = first.consume();
+		let _first_sub = first.subscribe(None);
 		let first_reserved = allocator.reserve(&first.demand(), bps(4_000_000));
 
 		let (_second_broadcast, second) = track(VIDEO);
-		let _second_sub = second.consume();
+		let _second_sub = second.subscribe(None);
 		let second_reserved = allocator.reserve(&second.demand(), bps(4_000_000));
 		assert_eq!(second_reserved.peek(), Some(bps(1_000_000)));
 
@@ -973,11 +1108,11 @@ mod tests {
 		estimate.set(Some(bps(6_000_000))).unwrap();
 
 		let (_small_broadcast, small) = track(VIDEO);
-		let _small_sub = small.consume();
+		let _small_sub = small.subscribe(None);
 		let small_reserved = allocator.reserve(&small.demand(), bps(1_000_000));
 
 		let (_large_broadcast, large) = track(VIDEO);
-		let _large_sub = large.consume();
+		let _large_sub = large.subscribe(None);
 		let large_reserved = allocator.reserve(&large.demand(), bps(8_000_000));
 
 		// Max-min fair: the small claim is satisfied in full, the rest goes to the other.
@@ -996,16 +1131,52 @@ mod tests {
 		assert_eq!(large_reserved.peek(), Some(bps(5_000_000)));
 	}
 
+	/// Collected-language callers can relinquish a ceiling before their retained
+	/// handle is finalized, without ending the track or waiting for its subscribers.
+	#[test]
+	fn zero_ceiling_releases_share_and_probe_target() {
+		let estimate = Producer::new();
+		let allocator = Allocator::new(estimate.consume());
+		estimate.set(Some(bps(3_000_000))).unwrap();
+		let mut target = allocator.target();
+		let waiter = kio::Waiter::noop();
+
+		let (_encoder_broadcast, encoder) = track(VIDEO);
+		let _encoder_sub = encoder.subscribe(None);
+		let retired = allocator.reserve(&encoder.demand(), bps(4_000_000));
+		let replacement = allocator.reserve(&encoder.demand(), bps(4_000_000));
+		let (_sibling_broadcast, sibling) = track(VIDEO);
+		let _sibling_sub = sibling.subscribe(None);
+		let sibling = allocator.reserve(&sibling.demand(), bps(4_000_000));
+		assert_eq!(sibling.peek(), Some(bps(1_000_000)));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(12_000_000)));
+
+		retired.update(Rate::ZERO);
+		assert_eq!(retired.peek(), Some(Rate::ZERO));
+		assert_eq!(replacement.peek(), Some(bps(1_500_000)));
+		assert_eq!(sibling.peek(), Some(bps(1_500_000)));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(8_000_000)));
+		retired.update(Rate::ZERO);
+		assert!(target.poll_changed(&waiter).is_pending());
+
+		// The registration remains usable, so an encoder may resume in place.
+		retired.update(bps(4_000_000));
+		assert_eq!(sibling.peek(), Some(bps(1_000_000)));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(12_000_000)));
+		assert!(encoder.demand().is_used());
+	}
+
 	/// A reader parked on `changed` has to be woken by its own reservation moving, not
 	/// just by the estimate or a sibling: the encoder is sitting in a `select!` on it.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn update_wakes_a_parked_reader() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 		estimate.set(Some(bps(6_000_000))).unwrap();
 
 		let (_broadcast, producer) = track(VIDEO);
-		let _sub = producer.consume();
+		let _sub = producer.subscribe(None);
 		let reserved = allocator.reserve(&producer.demand(), bps(1_000_000));
 		let mut share = reserved.consumer();
 		assert_eq!(share.changed().await.unwrap(), Some(bps(1_000_000)));
@@ -1020,13 +1191,14 @@ mod tests {
 
 	/// The registry is the allocator's, not a share's: a share that outlives every
 	/// allocator reports the estimate as gone rather than keeping the channel open.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn a_share_outliving_the_allocator_reports_closed() {
 		let estimate = Producer::new();
 		let allocator = Allocator::new(estimate.consume());
 
 		let (_broadcast, producer) = track(VIDEO);
-		let _sub = producer.consume();
+		let _sub = producer.subscribe(None);
 		let share_reserved = allocator.reserve(&producer.demand(), bps(4_000_000));
 		let mut share = share_reserved.consumer();
 
@@ -1039,7 +1211,8 @@ mod tests {
 	/// holds its rate for the former and stops watching for the latter.
 	/// Reporting closure as `Ok(None)` would spin any `select!` over `changed()`,
 	/// because a closed channel is always immediately ready.
-	#[moq_net_sim::test]
+	#[moq_clock::test]
+	#[cfg(feature = "async")]
 	async fn closed_is_distinct_from_unavailable() {
 		let producer = Producer::new();
 		let mut consumer = producer.consume();
@@ -1056,5 +1229,65 @@ mod tests {
 		assert!(consumer.changed().await.is_err());
 		// And it stays terminal rather than flapping back to a value.
 		assert!(consumer.changed().await.is_err());
+	}
+
+	/// The target sums every reservation, demanded or not, and follows each one
+	/// being added, moved, released, or pruned with its track, waking the session
+	/// that follows it.
+	#[test]
+	#[cfg(feature = "async")]
+	fn the_target_sums_every_reservation() {
+		let allocator = Allocator::unlimited();
+		let mut target = allocator.target();
+		let (woken, waiter) = Woken::new();
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(Rate::ZERO));
+		assert!(target.poll_changed(&waiter).is_pending());
+
+		let (_watched_broadcast, watched) = track(VIDEO);
+		let _sub = watched.subscribe(None);
+		let watched = allocator.reserve(&watched.demand(), bps(4_000_000));
+		assert!(woken.woken(), "a reservation must wake the session");
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(4_000_000)));
+
+		// Nobody watches this one, which is exactly the rung that must still be funded.
+		let (_idle_broadcast, idle_track) = track(VIDEO);
+		let idle = allocator.reserve(&idle_track.demand(), bps(1_000_000));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(5_000_000)));
+
+		idle.update(bps(2_000_000));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(6_000_000)));
+
+		drop(watched);
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(2_000_000)));
+
+		// A closed track's claim leaves with the next registration, even while its
+		// reservation is still held.
+		idle_track.abort(Error::Cancel).unwrap();
+		let (_other_broadcast, other) = track(VIDEO);
+		let _other = allocator.reserve(&other.demand(), bps(500_000));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(500_000)));
+		drop(idle);
+		assert!(
+			target.poll_changed(&waiter).is_pending(),
+			"a pruned claim is not released twice"
+		);
+	}
+
+	/// The override replaces the sum for every clone until it is cleared.
+	#[test]
+	fn an_override_replaces_the_sum() {
+		let allocator = Allocator::unlimited();
+		let mut target = allocator.target();
+		let waiter = kio::Waiter::noop();
+
+		let (_broadcast, producer) = track(VIDEO);
+		let _reserved = allocator.reserve(&producer.demand(), bps(4_000_000));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(4_000_000)));
+
+		allocator.clone().set_target(Some(Rate::ZERO));
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(Rate::ZERO));
+
+		allocator.set_target(None);
+		assert_eq!(target.poll_changed(&waiter), Poll::Ready(bps(4_000_000)));
 	}
 }

@@ -1,14 +1,15 @@
 //! Hand-written HLS media playlist generation.
 //!
-//! Rendered purely from timeline records: each record is one complete aligned segment
-//! (numbered by the broadcast's shared segment sequence, so renditions cut at the same
-//! boundaries) carrying its own duration. URIs are relative to the media playlist
+//! Each reference record defines one complete aligned segment with its own duration.
+//! URLs carry the source reference and record number, and that number is the segment's
+//! `EXT-X-MEDIA-SEQUENCE`, so every edge derives it alone. URIs are relative to the media playlist
 //! (`/<broadcast>/<kind>/<rendition>/media.m3u8`), so they resolve against the rendition
 //! directory.
 
+use moq_clock::Wall;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// fMP4 segments via `EXT-X-MAP` require protocol version 6.
 const VERSION: u32 = 6;
@@ -23,20 +24,22 @@ pub(crate) struct Snapshot {
 	pub target_duration: u64,
 	/// `EXT-X-MEDIA-SEQUENCE` of the first listed segment.
 	pub media_sequence: u64,
+	/// `EXT-X-DISCONTINUITY-SEQUENCE` of the first listed segment.
+	pub discontinuity_sequence: u64,
 	/// Listed segments, oldest first.
 	pub segments: Vec<Segment>,
 	/// Whether the broadcast ended (`EXT-X-ENDLIST`).
 	pub finished: bool,
 	/// Wall-clock time of the first listed segment (`EXT-X-PROGRAM-DATE-TIME`), when the
 	/// catalog advertises its root broadcast clock.
-	pub program_date_time: Option<SystemTime>,
+	pub program_date_time: Option<Wall>,
 	/// The publisher run every segment URL carries (`seg/{generation}.{tag}.{segment}.m4s`).
 	pub generation: Option<Arc<str>>,
 }
 
 /// One listed segment.
 pub(crate) struct Segment {
-	/// The aligned segment number; the URI is `seg/{tag}.{segment}.m4s`.
+	/// The source segment number; the URI is `seg/{tag}.{segment}.m4s`.
 	pub segment: u64,
 	/// The [`tag`](super::segments::tag) of the reference numbering the segment.
 	pub tag: String,
@@ -74,6 +77,9 @@ pub(crate) fn render_media(snapshot: &Snapshot, init: &str, query: Option<&str>)
 	let _ = writeln!(out, "#EXT-X-VERSION:{version}");
 	let _ = writeln!(out, "#EXT-X-TARGETDURATION:{}", snapshot.target_duration);
 	let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{}", snapshot.media_sequence);
+	if snapshot.discontinuity_sequence > 0 {
+		let _ = writeln!(out, "#EXT-X-DISCONTINUITY-SEQUENCE:{}", snapshot.discontinuity_sequence);
+	}
 	let _ = writeln!(out, "#EXT-X-MAP:URI=\"init.{init}.mp4{suffix}\"");
 
 	for (index, segment) in snapshot.segments.iter().enumerate() {
@@ -83,7 +89,7 @@ pub(crate) fn render_media(snapshot: &Snapshot, init: &str, query: Option<&str>)
 			let _ = writeln!(
 				out,
 				"#EXT-X-PROGRAM-DATE-TIME:{}",
-				humantime::format_rfc3339_millis(pdt)
+				humantime::format_rfc3339_millis(pdt.into())
 			);
 		}
 		if segment.discontinuity {
@@ -114,6 +120,7 @@ mod tests {
 		let snapshot = Snapshot {
 			target_duration: 2,
 			media_sequence: 10,
+			discontinuity_sequence: 0,
 			segments: vec![
 				Segment {
 					segment: 10,
@@ -131,7 +138,7 @@ mod tests {
 				},
 			],
 			finished: false,
-			program_date_time: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_751_846_400_123)),
+			program_date_time: Some(Wall::UNIX_EPOCH + Duration::from_millis(1_751_846_400_123)),
 			generation: None,
 		};
 
@@ -157,6 +164,7 @@ mod tests {
 		let snapshot = Snapshot {
 			target_duration: 2,
 			media_sequence: 0,
+			discontinuity_sequence: 0,
 			segments: vec![Segment {
 				segment: 0,
 				tag: "ab12cd34".into(),
@@ -179,6 +187,7 @@ mod tests {
 		let snapshot = Snapshot {
 			target_duration: 4,
 			media_sequence: 0,
+			discontinuity_sequence: 0,
 			segments: vec![Segment {
 				segment: 0,
 				tag: "ab12cd34".into(),

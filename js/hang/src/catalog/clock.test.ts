@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ClockSchema, MOQ_EPOCH_UNIX_MILLIS, u53, wallClockTime } from "./index.ts";
+import { ClockSchema, MOQ_EPOCH_UNIX_MILLIS, wallClockTime } from "./index.ts";
 import { RootSchema } from "./root.ts";
 
 // Mirrors rs/hang/fixtures/catalog-clock.json: the canonical new shape, a root clock plus an
@@ -17,12 +17,11 @@ const FIXTURE = {
 		},
 	},
 	clock: { wall: 1_751_846_400_000_000, timescale: 1_000_000 },
-	archive: { timelines: { video: "video.timeline.z" }, timescale: 1000, durationMax: 2000 },
+	archive: { timelines: { video: { track: "video.timeline.z", duration: 2000 } }, timescale: 1000 },
 };
 
-test("timescale defaults to microseconds", () => {
-	const parsed = ClockSchema.parse({ wall: 1000 });
-	expect(parsed.timescale).toBe(u53(1_000_000));
+test("an omitted timescale means microseconds on the wire", () => {
+	expect(Number(ClockSchema.parse({ wall: 1000 }).timescale)).toBe(1_000_000);
 });
 
 test("a zero timescale is refused", () => {

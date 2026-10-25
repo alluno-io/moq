@@ -19,6 +19,7 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::ffi::OnStatus;
+use crate::task::Task;
 use crate::{Error, Id, NonZeroSlab, Shared, State, ffi};
 
 // ---- C-visible types ----
@@ -32,16 +33,24 @@ use crate::{Error, Id, NonZeroSlab, Shared, State, ffi};
 ///
 /// <https://developer.mozilla.org/en-US/docs/Web/API/AudioData/format>
 #[repr(C)]
-#[allow(non_camel_case_types)]
+#[expect(non_camel_case_types, reason = "C ABI type names match moq.h")]
 #[derive(Clone, Copy, Debug)]
 pub enum moq_audio_sample_format {
+	/// Unsigned 8-bit PCM samples, interleaved by channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_U8 = 0,
+	/// Signed 16-bit PCM samples, interleaved by channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_S16 = 1,
+	/// Signed 32-bit PCM samples, interleaved by channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_S32 = 2,
+	/// 32-bit floating-point PCM samples, interleaved by channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_F32 = 3,
+	/// Unsigned 8-bit PCM samples, one plane per channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_U8_PLANAR = 4,
+	/// Signed 16-bit PCM samples, one plane per channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_S16_PLANAR = 5,
+	/// Signed 32-bit PCM samples, one plane per channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_S32_PLANAR = 6,
+	/// 32-bit floating-point PCM samples, one plane per channel.
 	MOQ_AUDIO_SAMPLE_FORMAT_F32_PLANAR = 7,
 }
 
@@ -62,12 +71,12 @@ fn audio_format_from_u32(value: u32) -> Result<moq_audio::Format, Error> {
 
 /// PCM layout the caller hands to [`moq_encode_audio_frame`].
 #[repr(C)]
-#[allow(non_camel_case_types)]
 pub struct moq_audio_encoder_input {
 	/// `moq_audio_sample_format` discriminant.
 	pub format: u32,
+	/// The number of PCM samples per second.
 	pub sample_rate: u32,
-	/// Interleaved channel count, which also names the speaker layout by the
+	/// The channel count, which also names the speaker layout by the
 	/// WAVE convention: 1 mono, 2 stereo, 3 2.1, 4 quad, 5 5.0, 6 5.1, 7 6.1,
 	/// 8 7.1, in front left, front right, center, LFE, back, side order.
 	pub channels: u32,
@@ -77,11 +86,11 @@ pub struct moq_audio_encoder_input {
 /// "match the input (snapping the rate up to a libopus-supported
 /// value if necessary)".
 #[repr(C)]
-#[allow(non_camel_case_types)]
 pub struct moq_audio_encoder_output {
 	/// Codec id, UTF-8: "opus", "pcm", or "aac". AAC encodes through the
 	/// platform's encoder, so a host without one refuses it.
 	pub codec: *const c_char,
+	/// The length in bytes of `codec`.
 	pub codec_len: usize,
 	/// 0 = derive from input.
 	pub sample_rate: u32,
@@ -97,8 +106,8 @@ pub struct moq_audio_encoder_output {
 
 /// PCM layout the caller wants out of [`moq_decode_audio`].
 #[repr(C)]
-#[allow(non_camel_case_types)]
 pub struct moq_audio_decoder_output {
+	/// The moq_audio_sample_format discriminant.
 	pub format: u32,
 	/// 0 = deliver at the codec's native sample rate.
 	pub sample_rate: u32,
@@ -110,9 +119,8 @@ pub struct moq_audio_decoder_output {
 	/// microseconds. Same congestion-control knob as
 	/// `moq_consume_audio`'s `max_delay_us`. 0 = skip
 	/// aggressively (the moq-mux default); set to your playout
-	/// buffer (tens to a few hundred ms) for a softer skip. Named
-	/// `_max` to leave room for a future `min_buffer_us`, a
-	/// jitter-buffer floor rather than a staleness bound.
+	/// buffer (tens to a few hundred ms) for a softer skip. This bounds
+	/// group staleness rather than setting a minimum playout delay.
 	pub max_delay_us: u64,
 }
 
@@ -122,10 +130,12 @@ pub struct moq_audio_decoder_output {
 /// [`moq_decode_audio_frame_free`]) or borrowed by the publish call
 /// (the publisher copies before returning).
 #[repr(C)]
-#[allow(non_camel_case_types)]
 pub struct moq_audio_frame {
+	/// The presentation timestamp in microseconds.
 	pub timestamp_us: u64,
+	/// The raw frame bytes in the configured layout.
 	pub data: *const u8,
+	/// The length in bytes of `data`.
 	pub data_size: usize,
 }
 
@@ -134,42 +144,37 @@ pub struct moq_audio_frame {
 /// An audio producer, shared so the Opus encode in `write` runs with the global
 /// lock released. See [`Shared`].
 pub(crate) struct AudioEncoder {
-	producer: moq_audio::encode::Producer<moq_mux::catalog::hang::Extra>,
+	producer: moq_audio::encode::Producer,
 	reservation: Option<Arc<moq_net::bandwidth::Reservation>>,
+	finished: crate::publish::Finished,
 }
 
 type AudioProducer = Shared<AudioEncoder>;
 
 #[derive(Default)]
+/// The audio encoder, decoder, and decoded frame handle tables.
 pub struct Audio {
 	producers: NonZeroSlab<AudioProducer>,
-	consumer_tasks: NonZeroSlab<Option<AudioTaskEntry>>,
+	consumer_tasks: NonZeroSlab<Task>,
 	frames: NonZeroSlab<moq_audio::Frame>,
 }
 
-/// A spawned task entry: `close` signals shutdown, `callback` delivers status.
-///
-/// `close` is an `Option` so `consume_close` can drop just the sender without
-/// removing the entry. The task delivers one final terminal callback and then
-/// removes itself, so `user_data` stays valid until that callback fires.
-struct AudioTaskEntry {
-	close: Option<oneshot::Sender<()>>,
-	callback: OnStatus,
-}
-
 impl Audio {
+	/// Encode PCM frames into an audio track and return its handle.
 	pub fn publish(
 		&mut self,
-		broadcast: &mut moq_net::broadcast::Producer,
-		catalog: moq_mux::catalog::Producer<moq_mux::catalog::hang::Extra>,
+		target: crate::publish::Target<'_>,
 		input: moq_audio::encode::Input,
 		options: moq_audio::encode::Options,
 		reserve: bool,
 	) -> Result<Id, Error> {
-		let producer = moq_audio::encode::Producer::new(broadcast, catalog, input, &options)?;
+		let producer = moq_audio::encode::Producer::new(target.producer, target.catalog.clone(), input, &options)?;
 		let reservation = reserve.then(|| Arc::new(options.bandwidth.reserve(&producer.demand(), producer.bitrate())));
-		self.producers
-			.insert(Shared::new(AudioEncoder { producer, reservation }))
+		self.producers.insert(Shared::new(AudioEncoder {
+			producer,
+			reservation,
+			finished: target.finished.clone(),
+		}))
 	}
 
 	pub(crate) fn reservation(&self, id: Id) -> Result<Option<Arc<moq_net::bandwidth::Reservation>>, Error> {
@@ -208,43 +213,34 @@ impl Audio {
 		self.producers.remove(id).ok_or(Error::MediaNotFound)
 	}
 
+	/// Decode a rendition and deliver frame handles to the callback.
 	pub fn consume(
 		&mut self,
-		broadcast: &moq_net::broadcast::Consumer,
-		catalog: &hang::catalog::AudioConfig,
-		name: &str,
+		rendition: crate::consume::Rendition<hang::catalog::AudioConfig>,
 		config: moq_audio::decode::Options,
 		on_frame: OnStatus,
 	) -> Result<Id, Error> {
-		let broadcast = broadcast.clone();
-		let catalog = catalog.clone();
-		let name = name.to_string();
-
-		let channel = oneshot::channel();
-		let entry = AudioTaskEntry {
-			close: Some(channel.0),
-			callback: on_frame,
-		};
-		let id = self.consumer_tasks.insert(Some(entry))?;
+		let crate::consume::Rendition {
+			broadcast,
+			config: catalog,
+			name,
+			driver,
+		} = rendition;
 
 		// `decode::Consumer::new` subscribes (blocking on SUBSCRIBE_OK), so run it
 		// inside the task to keep this entrypoint non-blocking.
-		tokio::spawn(async move {
-			let res = async move {
-				let consumer = moq_audio::decode::Consumer::new(&broadcast, &catalog, name, config).await?;
-				Self::run(on_frame, consumer, channel.1).await
-			}
-			.await;
-
-			// Deliver one final terminal callback (code <= 0), then drop the entry.
-			// Pull it out from under the lock so the callback never runs while held.
-			let entry = State::lock().audio.consumer_tasks.remove(id).flatten();
-			if let Some(entry) = entry {
-				entry.callback.call(res);
-			}
-		});
-
-		Ok(id)
+		self.consumer_tasks.spawn(
+			on_frame,
+			|state| &mut state.audio.consumer_tasks,
+			|close| async move {
+				driver
+					.watch(async move {
+						let consumer = moq_audio::decode::Consumer::new(&broadcast, &catalog, name, config).await?;
+						Self::run(on_frame, consumer, close).await
+					})
+					.await
+			},
+		)
 	}
 
 	async fn run(
@@ -258,7 +254,9 @@ impl Audio {
 				biased;
 				_ = &mut close => return Ok(()),
 				frame = consumer.read() => match frame {
-					Ok(Some(frame)) => frame,
+					Ok(Some(moq_audio::decode::Read::Frame(frame))) => frame,
+					// The C ABI hands over PCM only.
+					Ok(Some(moq_audio::decode::Read::Gap { .. } | moq_audio::decode::Read::End { .. })) => continue,
 					Ok(None) => return Ok(()),
 					// One packet the codec rejected is that packet's problem: the
 					// decoder stays usable, so drop it and keep the subscription rather
@@ -277,18 +275,12 @@ impl Audio {
 		}
 	}
 
+	/// Stop decoding and release the consumer handle.
 	pub fn consume_close(&mut self, id: Id) -> Result<(), Error> {
-		// Signal shutdown; the task delivers a final callback and removes itself.
-		self.consumer_tasks
-			.get_mut(id)
-			.and_then(|entry| entry.as_mut())
-			.ok_or(Error::TrackNotFound)?
-			.close
-			.take()
-			.ok_or(Error::TrackNotFound)?;
-		Ok(())
+		self.consumer_tasks.close(id, Error::TrackNotFound)
 	}
 
+	/// Borrow a decoded frame and its metadata until its handle is freed.
 	pub fn frame_info(&self, id: Id, dst: &mut moq_audio_frame) -> Result<(), Error> {
 		let frame = self.frames.get(id).ok_or(Error::FrameNotFound)?;
 		*dst = moq_audio_frame {
@@ -303,6 +295,7 @@ impl Audio {
 		Ok(())
 	}
 
+	/// Release a decoded frame handle.
 	pub fn frame_free(&mut self, id: Id) -> Result<(), Error> {
 		self.frames.remove(id).ok_or(Error::FrameNotFound)?;
 		Ok(())
@@ -352,17 +345,16 @@ pub unsafe extern "C" fn moq_encode_audio(
 		let codec = codec_str
 			.parse()
 			.map_err(|_| Error::UnknownFormat(codec_str.to_string()))?;
-		options.settings = moq_audio::encode::Settings::from_input(codec, &encoder_input);
+		options.config = moq_audio::encode::Config::from_input(codec, &encoder_input);
 		if let Some(sample_rate) = zeroable(raw_output.sample_rate) {
-			options.settings.sample_rate = sample_rate;
+			options.config.sample_rate = sample_rate;
 		}
 		if let Some(channels) = zeroable(raw_output.channels) {
-			options.settings.layout = moq_audio::Layout::from_channels(channels)?;
+			options.config.layout = moq_audio::Layout::from_channels(channels)?;
 		}
-		options.settings.bitrate =
-			zeroable(raw_output.bitrate).map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
+		options.config.bitrate = zeroable(raw_output.bitrate).map(|bps| moq_net::bandwidth::Rate::from_bps(bps.into()));
 		if let Some(micros) = zeroable(raw_output.frame_duration_us) {
-			options.settings.frame_duration = Duration::from_micros(micros.into());
+			options.config.frame_duration = Duration::from_micros(micros.into());
 		}
 
 		let bandwidth = ffi::parse_id_optional(bandwidth)?;
@@ -371,15 +363,7 @@ pub unsafe extern "C" fn moq_encode_audio(
 			options.bandwidth = state.bandwidth.allocator(id)?;
 		}
 		let State { publish, audio, .. } = &mut *state;
-		let (broadcast_producer, catalog) = publish.pair_mut(broadcast)?;
-
-		audio.publish(
-			broadcast_producer,
-			catalog.clone(),
-			encoder_input,
-			options,
-			bandwidth.is_some(),
-		)
+		audio.publish(publish.target(broadcast)?, encoder_input, options, bandwidth.is_some())
 	})
 }
 
@@ -460,6 +444,9 @@ pub unsafe extern "C" fn moq_encode_audio_frame(producer: u32, frame: *const moq
 }
 
 /// Flush any pending samples and finalize an audio producer.
+///
+/// The broadcast keeps the finished track, catalog rendition included, until it closes or its
+/// `moq_publish_finish` linger ends, so a late subscriber can still drain it.
 #[unsafe(no_mangle)]
 pub extern "C" fn moq_encode_audio_finish(producer: u32) -> i32 {
 	ffi::enter(move || {
@@ -467,8 +454,12 @@ pub extern "C" fn moq_encode_audio_finish(producer: u32) -> i32 {
 		// The id is dropped first, so nothing new queues behind the flush; whatever
 		// is mid-encode still finishes before this takes the producer.
 		let producer = State::lock().audio.remove(producer)?;
-		let mut producer = producer.take().ok_or(Error::MediaNotFound)?.producer;
+		let AudioEncoder {
+			mut producer, finished, ..
+		} = producer.take().ok_or(Error::MediaNotFound)?;
 		producer.finish()?;
+		// The broadcast keeps the finished track, so its finish still holds it.
+		finished.keep(producer);
 		Ok(())
 	})
 }
@@ -520,10 +511,10 @@ pub unsafe extern "C" fn moq_decode_audio(
 		let on_frame = unsafe { OnStatus::new(user_data, on_frame)? };
 
 		let mut state = State::lock();
-		let (broadcast, audio_cfg, name) = state.consume.audio_rendition(catalog, index as usize)?;
+		let rendition = state.consume.rendition(catalog, index as usize)?;
 
 		let State { audio, .. } = &mut *state;
-		audio.consume(&broadcast, &audio_cfg, &name, config, on_frame)
+		audio.consume(rendition, config, on_frame)
 	})
 }
 

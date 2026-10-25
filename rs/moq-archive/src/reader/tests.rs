@@ -28,34 +28,37 @@ struct Encoder {
 /// Writes archive objects the way a recording writer lays them out.
 struct Archive {
 	store: Store<Mock>,
-	op_ratio: u32,
+	ops: bool,
 	encoders: HashMap<String, Encoder>,
 }
 
 impl Archive {
 	async fn new() -> Self {
-		Self::with_op_ratio(0).await
+		Self::with_ops(false).await
 	}
 
-	/// `op_ratio` 0 makes every window edit its own checkpoint group.
-	async fn with_op_ratio(op_ratio: u32) -> Self {
+	/// Without ops every window edit is its own checkpoint group.
+	async fn with_ops(ops: bool) -> Self {
 		Self {
 			store: Store::new(Mock::memory(), "rec"),
-			op_ratio,
+			ops,
 			encoders: HashMap::new(),
 		}
 	}
 
 	async fn encoder(&mut self, track: &str) -> &mut Encoder {
 		if !self.encoders.contains_key(track) {
-			self.store.put_info(track, &Info::new(1, 1000).unwrap()).await.unwrap();
 			self.store
-				.put_info(&timeline(track), &Info::new(0, 1000).unwrap())
+				.put_info(track, &Info::new(1, Some(1000)).unwrap())
+				.await
+				.unwrap();
+			self.store
+				.put_info(&timeline(track), &Info::new(0, Some(1000)).unwrap())
 				.await
 				.unwrap();
 			let config = window::ProducerConfig::default()
 				.with_compression(true)
-				.with_op_ratio(self.op_ratio);
+				.with_ops(self.ops);
 			self.encoders.insert(
 				track.to_string(),
 				Encoder {
@@ -175,7 +178,7 @@ impl Archive {
 
 fn frame(track: &str, sequence: u64, index: u64) -> Frame {
 	Frame {
-		timestamp: sequence * 100 + index,
+		timestamp: Some(sequence * 100 + index),
 		payload: Bytes::from(format!("{track}/{sequence}/{index}")),
 	}
 }
@@ -212,7 +215,7 @@ fn expected(track: &str, sequence: u64, frames: std::ops::Range<u64>) -> Vec<(u6
 	frames
 		.map(|i| {
 			let frame = frame(track, sequence, i);
-			(frame.timestamp, frame.payload)
+			(frame.timestamp.unwrap(), frame.payload)
 		})
 		.collect()
 }
@@ -642,7 +645,7 @@ async fn a_track_without_usable_info_is_not_found() {
 	archive
 		.raw(
 			&Key::info("future").unwrap(),
-			br#"{"version":3,"priority":0,"timescale":1000}"#,
+			br#"{"version":4,"priority":0,"timescale":1000}"#,
 		)
 		.await;
 
@@ -658,7 +661,7 @@ async fn a_track_without_usable_info_is_not_found() {
 
 #[tokio::test]
 async fn multi_frame_timeline_groups_decode() {
-	let mut archive = Archive::with_op_ratio(64).await;
+	let mut archive = Archive::with_ops(true).await;
 	let first = archive.record("video", Position::group(0), Position::group(1), 1).await;
 	let second = archive.record("video", Position::group(1), Position::group(2), 1).await;
 	let mut groups = archive.edit("video", &first, 0).await;
@@ -691,11 +694,33 @@ async fn timeline_tracks_are_republished_and_finished_on_request() {
 
 	let mut records = Vec::new();
 	while let Some(event) = timeline.next().await.unwrap() {
-		if let window::Event::Push { value, .. } = event {
+		if let window::Event::Push { value, .. } = event.value {
 			records.push(value.sequence);
 		}
 	}
 	assert_eq!(records, vec![0, 1]);
+}
+
+/// A record whose timing contradicts its timeline is not indexed, though its object is stored.
+#[tokio::test]
+async fn a_record_contradicting_its_timeline_is_not_indexed() {
+	let mut archive = Archive::new().await;
+	archive.add("video", 0..1, 1).await;
+	let stored = archive.record("video", Position::group(1), Position::group(2), 1).await;
+	let untimed = Record::untimed(stored.sequence, stored.start, stored.end);
+	let mut groups = archive.edit("video", &untimed, 0).await;
+	// The timeline envelope stays timed, as its `.info` declares.
+	for frame in groups.iter_mut().flat_map(|group| &mut group.frames) {
+		frame.timestamp = Some(100);
+	}
+	archive.timeline("video", untimed.sequence, groups).await;
+
+	let (broadcast, _reader) = open(&archive).await;
+	assert_eq!(
+		fetch(&broadcast, "video", 0, 0).await.unwrap(),
+		expected("video", 0, 0..1)
+	);
+	not_found(fetch(&broadcast, "video", 1, 0).await);
 }
 
 #[tokio::test]
@@ -722,12 +747,12 @@ async fn evicted_timeline_groups_remain_fetchable() {
 	let serve = tokio::spawn(reader.serve());
 	let expected = fetch(&broadcast, &timeline("video"), 0, 0).await.unwrap();
 	let now = moq_net::time::Instant::now();
-	pool.gc(now);
-	pool.gc(now + Duration::from_secs(1));
+	pool.poll(now, &kio::Waiter::noop());
+	pool.poll(now + Duration::from_secs(1), &kio::Waiter::noop());
 	assert_eq!(fetch(&broadcast, &timeline("video"), 0, 0).await.unwrap(), expected);
 	// Past the end of an evicted complete group is EOF, as it is for a cached one.
-	pool.gc(now + Duration::from_secs(2));
-	pool.gc(now + Duration::from_secs(3));
+	pool.poll(now + Duration::from_secs(2), &kio::Waiter::noop());
+	pool.poll(now + Duration::from_secs(3), &kio::Waiter::noop());
 	assert!(
 		fetch(&broadcast, &timeline("video"), 0, expected.len() as u64 + 1)
 			.await
@@ -736,6 +761,75 @@ async fn evicted_timeline_groups_remain_fetchable() {
 	);
 	serve.abort();
 	let _ = serve.await;
+}
+
+/// A timeline group every reader narrowed past stops its GET, so the groups the fill still
+/// owes are read rather than waiting behind it.
+#[tokio::test(start_paused = true)]
+async fn a_narrowed_timeline_read_skips_the_group_it_left() {
+	let mut archive = Archive::new().await;
+	for group in 0..3 {
+		archive.add("video", group..group + 1, 1).await;
+	}
+	let mut info = broadcast::Info::new();
+	info.pool = moq_net::cache::Pool::new(moq_net::cache::Config::default().with_expiry(Duration::from_millis(100)));
+	let pool = info.pool.clone();
+	let broadcast = info.produce();
+	let reader = Reader::open(archive.store.clone(), &broadcast, archive.config())
+		.await
+		.unwrap();
+	let serve = tokio::spawn(reader.serve());
+	let now = moq_net::time::Instant::now();
+	pool.poll(now, &kio::Waiter::noop());
+	pool.poll(now + Duration::from_secs(1), &kio::Waiter::noop());
+
+	let mock = archive.store.inner().clone();
+	mock.take();
+	let gate = mock.stall_gets("video%2Etimeline%2Ez/segments/");
+	let ascending = |groups| {
+		moq_net::track::Subscription::default()
+			.with_max_delay(None)
+			.with_range(groups)
+			.with_order(moq_net::track::Order::Ascending)
+	};
+	let mut subscriber = broadcast
+		.consume()
+		.track(&timeline("video"))
+		.unwrap()
+		.subscribe(ascending(0..))
+		.await
+		.unwrap();
+	let waiter = kio::Waiter::noop();
+	let mut gets = Vec::new();
+	let _ = subscriber.poll_recv_group(&waiter);
+	assert!(
+		segment_read(&mock, &mut gets, 0).await,
+		"group 0 is read from its segment"
+	);
+
+	subscriber.update(ascending(1..)).unwrap();
+	let _ = subscriber.poll_recv_group(&waiter);
+	assert!(
+		segment_read(&mock, &mut gets, 1).await,
+		"group 1 waited behind group 0, which nobody reads"
+	);
+	gate.add_permits(16);
+	serve.abort();
+	let _ = serve.await;
+}
+
+/// Whether the video timeline's `segment` is requested once the runtime settles, collecting
+/// GETs. Bounded by yields rather than time, so the paused clock stays put.
+async fn segment_read(mock: &Mock, gets: &mut Vec<String>, segment: u64) -> bool {
+	let path = format!("rec/video%2Etimeline%2Ez/segments/{segment:019}");
+	for _ in 0..1000 {
+		gets.extend(mock.gets());
+		if gets.contains(&path) {
+			return true;
+		}
+		tokio::task::yield_now().await;
+	}
+	false
 }
 
 #[tokio::test(start_paused = true)]
@@ -756,8 +850,11 @@ async fn enrolled_timeline_fetch_survives_finish() {
 	let expected = fetch(&broadcast, &timeline("audio"), 0, 0).await.unwrap();
 	reader.finish().unwrap();
 	let now = moq_net::time::Instant::now();
-	broadcast.info().pool.gc(now);
-	broadcast.info().pool.gc(now + Duration::from_secs(31));
+	broadcast.info().pool.poll(now, &kio::Waiter::noop());
+	broadcast
+		.info()
+		.pool
+		.poll(now + Duration::from_secs(31), &kio::Waiter::noop());
 	assert_eq!(fetch(&broadcast, &timeline("audio"), 0, 0).await.unwrap(), expected);
 	let missing = fetch(&broadcast, &timeline("audio"), 2, 0).await;
 	assert!(
@@ -796,16 +893,16 @@ async fn benchmark_timeline_fetch_fanout() {
 			let serving = tokio::spawn(reader.serve());
 			let name = timeline("video-0");
 			let mut now = moq_net::time::Instant::now();
-			broadcast.info().pool.gc(now);
+			broadcast.info().pool.poll(now, &kio::Waiter::noop());
 			let mut elapsed = Duration::ZERO;
 			for _ in 0..20 {
 				// One sweep dates recent reads; the next expires them.
 				for _ in 0..2 {
 					now += Duration::from_secs(31);
-					broadcast.info().pool.gc(now);
+					broadcast.info().pool.poll(now, &kio::Waiter::noop());
 				}
 				let subscription = moq_net::track::Subscription::default()
-					.with_start(moq_net::track::Position::group(0))
+					.with_range(0..)
 					.with_max_delay(Duration::from_secs(60));
 				let mut retained = broadcast
 					.consume()

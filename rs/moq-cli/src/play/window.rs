@@ -3,7 +3,9 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use moq_clock::Instant;
 
 use anyhow::Context;
 use hang::moq_net;
@@ -307,14 +309,16 @@ impl ApplicationHandler<Event> for App {
 			return;
 		}
 
+		let now = moq_clock::now();
 		match self.next_redraw {
-			Some(deadline) if deadline <= Instant::now() => {
+			Some(deadline) if deadline <= now => {
 				self.next_redraw = None;
 				if let Some(display) = &self.display {
 					display.window.request_redraw();
 				}
 			}
-			Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
+			// winit waits on std's clock.
+			Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline.into_std())),
 			None => event_loop.set_control_flow(ControlFlow::Wait),
 		}
 	}

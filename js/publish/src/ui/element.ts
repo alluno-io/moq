@@ -5,6 +5,8 @@
  *
  * @module
  */
+
+import { Milli, Nano } from "@moq/clock";
 import { Effect, Signal } from "@moq/signals";
 import * as DOM from "@moq/signals/dom";
 import type MoqPublish from "../element";
@@ -15,8 +17,9 @@ import type { Tab, UiState } from "./state";
 import styles from "./styles/index.css?inline";
 
 // How long the chrome lingers after the pointer stops moving while previewing.
-const HIDE_MS = 2800;
+const HIDE = Nano.fromMilli(Milli(2800));
 
+/** The `<moq-publish-ui>` element: capture controls around the `<moq-publish>` it wraps. */
 export default class MoqPublishUi extends HTMLElement {
 	#signals?: Effect;
 	#root: ShadowRoot;
@@ -143,7 +146,7 @@ export default class MoqPublishUi extends HTMLElement {
 			e.get(activity);
 			state.chrome.set(true);
 			if (isPinned) return;
-			e.timer(() => state.chrome.set(false), HIDE_MS);
+			e.timer(() => state.chrome.set(false), HIDE);
 		});
 
 		effect.event(this, "pointerleave", () => {

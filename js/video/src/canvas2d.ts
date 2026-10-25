@@ -27,7 +27,18 @@ export class Canvas2D {
 			const [a, b, c, d, e, f] = transform.matrix;
 			if (view) ctx.imageSmoothingQuality = "high";
 			ctx.setTransform(a, b, c, d, e + area.x, f + area.y);
-			ctx.drawImage(frame, 0, 0, transform.source.width, transform.source.height);
+			const { width: w, height: h } = transform.source;
+			ctx.drawImage(frame, 0, 0, w, h);
+
+			if (presentation?.interlaced) {
+				// The [1 2 1] line blend the WebGPU shader applies, built by compositing: a third of the
+				// line above gives (2c + a) / 3, then a quarter of the line below gives (a + 2c + b) / 4.
+				const line = h / (frame.visibleRect?.height ?? frame.codedHeight);
+				ctx.globalAlpha = 1 / 3;
+				ctx.drawImage(frame, 0, line, w, h);
+				ctx.globalAlpha = 1 / 4;
+				ctx.drawImage(frame, 0, -line, w, h);
+			}
 		}
 
 		ctx.restore();

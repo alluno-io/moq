@@ -17,7 +17,9 @@ pub struct Fetch<'a> {
 	/// Lite07+ only.
 	pub epoch: Option<crate::Epoch>,
 	pub track: Cow<'a, str>,
-	pub priority: u8,
+	pub priority: i8,
+	/// Reader freshness budget. Lite07+ only; omission uses publisher retention alone.
+	pub max_delay: Option<std::time::Duration>,
 	pub group: u64,
 	/// Index of the first frame to return; 0 is the start of the group. Lite06+ only.
 	pub start_frame: u64,
@@ -27,6 +29,7 @@ pub struct Fetch<'a> {
 }
 
 impl Message for Fetch<'_> {
+	const CONTROL: Option<crate::stats::Control> = Some(crate::stats::Control::Fetch);
 	fn decode_msg(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
 		match version {
 			Version::Lite01 | Version::Lite02 => {
@@ -38,7 +41,11 @@ impl Message for Fetch<'_> {
 		let broadcast = Path::decode(r, version)?;
 		let epoch = super::epoch::decode_epoch(r, version)?;
 		let track = Cow::Owned(r.string()?);
-		let priority = r.u8()?;
+		let priority = super::priority::from_wire(r.u8()?);
+		let max_delay = match version.has_fetch_max_delay() {
+			true => r.varint_opt()?.map(std::time::Duration::from_millis),
+			false => None,
+		};
 		let group = r.varint()?;
 
 		let (start_frame, end_frame) = match version.has_frame_bounds() {
@@ -55,6 +62,7 @@ impl Message for Fetch<'_> {
 			epoch,
 			track,
 			priority,
+			max_delay,
 			group,
 			start_frame,
 			end_frame,
@@ -72,7 +80,17 @@ impl Message for Fetch<'_> {
 		self.broadcast.encode(w, version)?;
 		super::epoch::encode_epoch(w, version, self.epoch.as_ref())?;
 		w.string(&self.track)?;
-		w.u8(self.priority);
+		w.u8(super::priority::to_wire(self.priority));
+		match version.has_fetch_max_delay() {
+			true => w.varint_opt(
+				self.max_delay
+					.map(|delay| u64::try_from(delay.as_nanos().div_ceil(1_000_000)))
+					.transpose()
+					.map_err(|_| EncodeError::BoundsExceeded)?,
+			)?,
+			false if self.max_delay.is_some() => return Err(EncodeError::Version),
+			false => {}
+		}
 		w.varint(self.group)?;
 
 		if version.has_frame_bounds() {
@@ -97,10 +115,34 @@ mod test {
 			broadcast: Path::new("room").to_owned(),
 			track: Cow::Borrowed("video"),
 			priority: 3,
+			max_delay: None,
 			group: 7,
 			start_frame: 0,
 			end_frame: None,
 		}
+	}
+
+	#[test]
+	fn fetch_max_delay_roundtrips_on_lite07() {
+		let mut msg = fetch_sample();
+		msg.max_delay = Some(std::time::Duration::ZERO);
+		assert_eq!(
+			fetch_roundtrip(Version::Lite07, &msg).max_delay,
+			Some(std::time::Duration::ZERO)
+		);
+
+		msg.max_delay = Some(std::time::Duration::from_millis(250));
+		assert_eq!(
+			fetch_roundtrip(Version::Lite07, &msg).max_delay,
+			Some(std::time::Duration::from_millis(250))
+		);
+		assert!(
+			msg.encode_msg(
+				&mut Encoder::new(&mut Vec::new(), Version::Lite06.into()),
+				Version::Lite06
+			)
+			.is_err()
+		);
 	}
 
 	fn fetch_roundtrip(version: Version, msg: &Fetch<'_>) -> Fetch<'static> {

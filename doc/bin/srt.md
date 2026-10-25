@@ -8,8 +8,8 @@ description: SRT contribution and playback
 `moq import srt` accepts SRT pushes (`--listen`) or pulls from a remote SRT
 source (`--connect`); `moq export srt` serves SRT to players or pushes to a
 remote. The payload is MPEG-TS, so the same codecs and behavior as
-[`import ts`](/bin/cli) apply: H.264/H.265 video and AAC, MP2, AC-3, or E-AC-3
-audio. A damaged unit is dropped and the session stays up; video resumes at its
+[`import ts`](/bin/cli) apply: H.264/H.265 video and AAC, MP2, AC-3, E-AC-3, or
+Opus audio. A damaged unit is dropped and the session stays up; video resumes at its
 next keyframe, freezing for up to one GOP.
 
 ```bash
@@ -44,7 +44,8 @@ moq --connect https://relay.example.com/anon --broadcast event.hang import srt -
 ```
 
 `--latency` (default 500 ms) sets the SRT receive buffer and doubles as the
-export's jitter buffer, like `export ts --delay` in the [CLI](/bin/cli#export):
-a frame arriving later than that is dropped. A `--connect` URL needs a
+export's delay, like `export ts --delay` in the [CLI](/bin/cli#export), but no
+less than that flag's 1 s default: the send-ahead that fills a receiver's
+buffers comes out of the delay. A frame arriving later than that is dropped. A `--connect` URL needs a
 `streamid` query or a path; a listener bridges one `--broadcast` and ignores
 the stream id it is offered. The library is [`moq-srt`](https://docs.rs/moq-srt).

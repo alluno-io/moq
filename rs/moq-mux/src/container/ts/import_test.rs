@@ -474,7 +474,7 @@ async fn import_export_import_roundtrip() {
 
 	// Re-export to TS. `import` and `catalog` stay alive so the exporter can
 	// subscribe to the finished, retained tracks.
-	let mut exporter = crate::container::ts::Export::new(crate::source::announced(&consumer).await)
+	let mut exporter = crate::container::ts::export_test::open_export(crate::source::announced(&consumer).await)
 		.await
 		.unwrap()
 		.with_delay(RECORDING_MAX_AGE)
@@ -615,7 +615,7 @@ async fn kyrion_dirtystart_extracts_real_cues() {
 	assert_eq!(distinct.len(), 6, "six distinct cue sections");
 	assert!(
 		cues.iter().all(|(_, ts)| *ts != moq_net::Timestamp::ZERO),
-		"cues stamped with the video PTS, not zero"
+		"cues stamped with their PCR placement"
 	);
 }
 
@@ -703,7 +703,7 @@ struct Imported {
 	published: std::collections::BTreeMap<String, Vec<u128>>,
 	/// The root clock the catalog advertised.
 	clock: hang::catalog::Clock,
-	arrival: std::ops::RangeInclusive<std::time::SystemTime>,
+	arrival: std::ops::RangeInclusive<moq_clock::Wall>,
 }
 
 /// Import `data` on a catalog with the default clock.
@@ -713,9 +713,9 @@ async fn import_stream(data: &[u8]) -> Imported {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut import = crate::container::ts::Import::new(broadcast, catalog.reserve());
 
-	let before = std::time::SystemTime::now();
+	let before = moq_clock::wall();
 	import.decode(data).unwrap();
-	let after = std::time::SystemTime::now();
+	let after = moq_clock::wall();
 	import.finish().unwrap();
 
 	let snapshot = catalog.snapshot();

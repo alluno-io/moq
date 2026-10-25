@@ -1,7 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { Effect, Signal } from "@moq/signals";
 import { bestTurn, reportsRotation, watchRotation } from "./orientation";
 import type { StreamTrack } from "./types";
+
+mock.module("./capture-worker.ts?worklet", () => ({ default: async () => "blob:fake-worker" }));
+const { Capture } = await import("./capture");
 
 const SIZE = 16;
 
@@ -118,9 +121,16 @@ function page(turn: number, video: { width: number; height: number }) {
 	class Frame {
 		displayWidth = 1280;
 		displayHeight = 720;
+		codedWidth = 1280;
+		codedHeight = 720;
+		timestamp: number;
 		closed = false;
-		constructor() {
+		constructor(_source?: unknown, init?: { timestamp?: number }) {
+			this.timestamp = init?.timestamp ?? 0;
 			frames.push(this);
+		}
+		clone() {
+			return new Frame(this, { timestamp: this.timestamp });
 		}
 		close() {
 			this.closed = true;
@@ -137,6 +147,7 @@ function page(turn: number, video: { width: number; height: number }) {
 	return {
 		element,
 		frames,
+		Frame,
 		[Symbol.dispose]() {
 			globals.forEach((name, i) => {
 				const descriptor = saved[i];
@@ -150,7 +161,7 @@ function page(turn: number, video: { width: number; height: number }) {
 test("the rotation follows how the engine paints the camera", () => {
 	using engine = page(90, { width: 720, height: 1280 });
 	const effect = new Effect();
-	const rotation = new Signal(0);
+	const rotation = new Signal<number | undefined>(undefined);
 
 	watchRotation(effect, {} as StreamTrack, rotation);
 	engine.element.dispatchEvent(new Event("loadeddata"));
@@ -165,11 +176,46 @@ test("the rotation follows how the engine paints the camera", () => {
 test("a painting that disagrees with the element's size is ignored", () => {
 	using engine = page(90, { width: 1280, height: 720 });
 	const effect = new Effect();
-	const rotation = new Signal(0);
+	const rotation = new Signal<number | undefined>(undefined);
 
 	watchRotation(effect, {} as StreamTrack, rotation);
 	engine.element.dispatchEvent(new Event("loadeddata"));
-	expect(rotation.peek()).toBe(0);
+	expect(rotation.peek()).toBeUndefined();
 
 	effect.close();
+});
+
+test("a capture takes the turn the engine paints its camera with over the screen's", async () => {
+	using engine = page(180, { width: 1280, height: 720 });
+	const processor = Object.getOwnPropertyDescriptor(globalThis, "MediaStreamTrackProcessor");
+	let controller!: ReadableStreamDefaultController<VideoFrame>;
+	const readable = new ReadableStream<VideoFrame>({
+		start: (value) => {
+			controller = value;
+		},
+	});
+	Object.defineProperty(globalThis, "MediaStreamTrackProcessor", {
+		configurable: true,
+		value: class {
+			readonly readable = readable;
+		},
+	});
+
+	const capture = new Capture({ source: {} as StreamTrack, orientation: new Signal(0) });
+	try {
+		const display = capture.out.display.changed();
+		controller.enqueue(new engine.Frame() as unknown as VideoFrame);
+		expect(await display).toMatchObject({ width: 1280, height: 720 });
+		expect(capture.out.rotation.peek()).toBe(0);
+
+		const rotation = capture.out.rotation.changed();
+		engine.element.dispatchEvent(new Event("loadeddata"));
+		expect(await rotation).toBe(180);
+	} finally {
+		capture.close();
+		if (processor) Object.defineProperty(globalThis, "MediaStreamTrackProcessor", processor);
+		else Reflect.deleteProperty(globalThis, "MediaStreamTrackProcessor");
+	}
+	expect(capture.out.rotation.peek()).toBe(0);
+	expect(engine.element.srcObject).toBeNull();
 });

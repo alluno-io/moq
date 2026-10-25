@@ -15,6 +15,8 @@ struct Params {
 	x: vec4<f32>,
 	y: vec4<f32>,
 	tone: vec4<f32>,
+	// Nonzero when the frame weaves two fields.
+	interlaced: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -27,7 +29,17 @@ fn fragment(in: Vertex) -> @location(0) vec4<f32> {
 	if (params.tone.z > 0.5 && (any(in.uv < vec2<f32>(0.0)) || any(in.uv > vec2<f32>(1.0)))) {
 		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 	}
-	return present(textureSampleBaseClampToEdge(frame, samp, in.uv).rgb, params.tone);
+	let center = textureSampleBaseClampToEdge(frame, samp, in.uv).rgb;
+	if (params.interlaced == 0.0) {
+		return present(center, params.tone);
+	}
+
+	// Adjacent lines come from different fields, so anything that moved between them combs. A
+	// [1 2 1] vertical blend hides it at the cost of some vertical detail.
+	let line = vec2<f32>(0.0, 1.0 / f32(textureDimensions(frame).y));
+	let above = textureSampleBaseClampToEdge(frame, samp, in.uv - line).rgb;
+	let below = textureSampleBaseClampToEdge(frame, samp, in.uv + line).rgb;
+	return present((above + 2.0 * center + below) * 0.25, params.tone);
 }
 `;
 
@@ -138,7 +150,7 @@ async function calibrate(device: GPUDevice): Promise<ImportModel | undefined> {
 		const module = device.createShaderModule({ code: SHADER });
 		const pipeline = createPipeline(device, module, "rgba16float");
 		const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
-		params = device.createBuffer({ size: 48, usage: UNIFORM | COPY_DST });
+		params = device.createBuffer({ size: 64, usage: UNIFORM | COPY_DST });
 		readback = device.createBuffer({ size: 512, usage: MAP_READ | COPY_DST });
 		target = device.createTexture({
 			size: [2, 2],
@@ -148,7 +160,7 @@ async function calibrate(device: GPUDevice): Promise<ImportModel | undefined> {
 		device.queue.writeBuffer(
 			params,
 			0,
-			new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, PASSTHROUGH, PQ_REFERENCE_WHITE, 0, 0]),
+			new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, PASSTHROUGH, PQ_REFERENCE_WHITE, 0, 0, 0, 0, 0, 0]),
 		);
 
 		for (const patch of PQ_CALIBRATION) {
@@ -249,7 +261,7 @@ export class Gpu {
 
 		this.#module = device.createShaderModule({ code: SHADER });
 		this.#sampler = device.createSampler({ magFilter: "linear", minFilter: "linear" });
-		this.#params = device.createBuffer({ size: 48, usage: UNIFORM | COPY_DST });
+		this.#params = device.createBuffer({ size: 64, usage: UNIFORM | COPY_DST });
 
 		this.#configure("srgb", false);
 	}
@@ -344,10 +356,11 @@ export class Gpu {
 			const { x, y } = view
 				? viewPresentationTransform(output, view, presentation)
 				: texturePresentationTransform(output, presentation);
+			const interlaced = presentation?.interlaced ? 1 : 0;
 			this.#device.queue.writeBuffer(
 				this.#params,
 				0,
-				new Float32Array([...x, 0, ...y, 0, tone, PQ_REFERENCE_WHITE, view ? 1 : 0, 0]),
+				new Float32Array([...x, 0, ...y, 0, tone, PQ_REFERENCE_WHITE, view ? 1 : 0, 0, interlaced, 0, 0, 0]),
 			);
 
 			const pipeline = this.#pipeline(format);

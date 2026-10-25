@@ -1,4 +1,5 @@
-import { type Getter, Once, Signal } from "@moq/signals";
+import { Nano, Second } from "@moq/clock";
+import { type Getter, Once, race, Signal } from "@moq/signals";
 import type * as announce from "../announced.ts";
 import type * as Auth from "../auth.ts";
 import { AuthSession } from "../auth_session.ts";
@@ -6,39 +7,45 @@ import type { Established } from "../connection/established.ts";
 import type { Drain } from "../connection/goaway.ts";
 import { type Probe, type Stats, transportStats } from "../connection/stats.ts";
 import { type Transport, transportOf } from "../connection/transport.ts";
-import { error, fromClose, ProtocolViolation, StreamCode, StreamError } from "../error.ts";
+import { error, fromClose, ProtocolViolation, SessionCode, StreamCode, StreamError, sessionClosed } from "../error.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
 import { type Reader, Readers, type Stream } from "../stream.ts";
 import { withTimeout } from "../util/timeout.ts";
 import { registerWire } from "../wire.ts";
 import { ControlStreamAdapter, NativeSession, RequestWindowError, type Session } from "./adapter.ts";
-import { AuthMessage, supported as authSupported, IetfAuthWire } from "./auth.ts";
+import { AuthMessage, IetfAuthWire } from "./auth.ts";
+import { supported as authSupported } from "./auth_setup.ts";
 import * as Cluster from "./cluster.ts";
-import { type RequestKind, toRequestCode } from "./error.ts";
-import { Fetch, FetchError, FetchHeader } from "./fetch.ts";
+import type { RequestKind } from "./error.ts";
+import { Fetch, FetchHeader } from "./fetch.ts";
 import { GoAway } from "./goaway.ts";
-import * as Message from "./message.ts";
 import { Group } from "./object.ts";
-import { Publish, PublishError } from "./publish.ts";
-import { PublishNamespace, PublishNamespaceError } from "./publish_namespace.ts";
+import { Publish } from "./publish.ts";
+import { PublishNamespace } from "./publish_namespace.ts";
 import { Publisher } from "./publisher.ts";
-import { RequestError } from "./request.ts";
-import { Subscribe, SubscribeError, SubscribeUpdate } from "./subscribe.ts";
+import { malformed, refuse } from "./request_stream.ts";
+import { Subscribe, SubscribeUpdate } from "./subscribe.ts";
 import {
 	SUBSCRIBE_TRACKS_ID,
 	SubscribeNamespace,
-	SubscribeNamespaceError,
 	SubscribeNamespaceLegacy,
 	SubscribeOptions,
 } from "./subscribe_namespace.ts";
+import { SubscribeTracks } from "./subscribe_tracks.ts";
 import { Subscriber } from "./subscriber.ts";
 import { MalformedAuthToken } from "./token.ts";
-import { TRACK_STATUS_ERROR_14, TrackStatusRequest } from "./track.ts";
+import { TrackStatusRequest } from "./track.ts";
 import { type IetfVersion, Version, versionName } from "./version.ts";
 
 // The PADDING stream type (draft-18+): bytes a peer sends to probe for bandwidth.
 const PADDING = 0x132b3e28n;
+
+// A handler owns its request stream, and ending the request (closing the session over a
+// violation) is its job: closing again here could only send a competing code.
+function handed(task: Promise<void>): Promise<void> {
+	return task.catch((err: unknown) => console.error("error processing bidi stream", err));
+}
 
 /**
  * Represents a connection to a MoQ server using moq-transport protocol.
@@ -60,8 +67,8 @@ export class Connection implements Established {
 	readonly probe: Getter<Probe> = new Signal<Probe>({});
 
 	/** Our tokens and grants, when the peer negotiated MoQ Auth; see {@link Established.auth}. */
-	get auth(): Auth.Auth {
-		return this.#auth;
+	get auth(): Auth.Handle {
+		return this.#auth.handle;
 	}
 
 	// Our tokens and grants, and the answers to the peer's (MoQ Auth).
@@ -91,11 +98,17 @@ export class Connection implements Established {
 	// The Hop IDs this session declared; see {@link Cluster}.
 	#cluster?: Cluster.Hops;
 
+	// Whether both SETUPs offered MoQ Epoch, so advertisements and requests may carry EPOCH.
+	#epoch: boolean;
+
 	// The peer's GOAWAY: read here on v17+, by the control stream adapter before that.
 	#goaway: Once<Drain>;
 
 	// Just to avoid logging when `close()` is called.
 	#closed = false;
+
+	/** The implementation the peer advertised; see {@link Established.peerImplementation}. */
+	readonly peerImplementation: Promise<string | undefined>;
 
 	/**
 	 * Creates a new Connection instance.
@@ -120,11 +133,16 @@ export class Connection implements Established {
 		publish,
 		solicit,
 		hidden = false,
+		maxAge = false,
+		activeCount = false,
 		cluster,
 		auth = false,
+		handle,
+		epoch = false,
 		early = [],
 		requestWindow,
 		extensions,
+		peerImplementation,
 	}: {
 		url: URL;
 		quic: WebTransport;
@@ -142,6 +160,10 @@ export class Connection implements Established {
 		solicit?: boolean;
 		/** Whether the peer understands the HIDDEN parameter (MoQ Hidden). */
 		hidden?: boolean;
+		/** Whether the peer accepts subscriber max age. */
+		maxAge?: boolean;
+		/** Whether both SETUPs declared MoQ Active Count. */
+		activeCount?: boolean;
 		/**
 		 * The Hop IDs this session declared (MoQ Cluster). `undefined` on a version that
 		 * cannot negotiate the extension, as is a `peer` the peer never declared.
@@ -149,18 +171,25 @@ export class Connection implements Established {
 		cluster?: Cluster.Hops;
 		/** Whether MoQ Auth is negotiated (draft-17+): offered by both SETUPs. */
 		auth?: boolean;
+		/** The auth handle to build the session on, or undefined for one of its own. */
+		handle?: Auth.Handle;
+		/** Whether MoQ Epoch is negotiated (draft-17+): offered by both SETUPs. */
+		epoch?: boolean;
 		/** Uni streams that arrived before the peer's SETUP, type unread (v17+). */
 		early?: Reader[];
 		/** Requests the peer may hold open on drafts 14 to 16, the window our SETUP advertised (default `REQUEST_WINDOW`). */
 		requestWindow?: bigint;
 		/** What our own SETUP offered; every extension when omitted. */
 		extensions?: { solicit: boolean };
+		/** The implementation the peer's SETUP advertised, read before the session starts. */
+		peerImplementation?: string;
 	}) {
 		this.url = url;
 		this.version = versionName(version);
 		this.transport = transportOf(quic);
 		this.#quic = quic;
 		this.#client = client;
+		this.peerImplementation = Promise.resolve(peerImplementation);
 
 		// Two-path dispatch: v14-v16 uses adapter, v17+ uses native bidi streams
 		if (version >= Version.DRAFT_17) {
@@ -179,8 +208,15 @@ export class Connection implements Established {
 					this.#close({ closeCode: err.code, reason: err.message });
 					return;
 				}
-				console.error("adapter error", err);
-				this.#close();
+				if (sessionClosed(err)) {
+					this.#close();
+					return;
+				}
+				this.#violated(
+					err instanceof ProtocolViolation
+						? err
+						: new ProtocolViolation("control stream failed", { cause: err }),
+				);
 			});
 		}
 
@@ -189,11 +225,18 @@ export class Connection implements Established {
 		const session = this.#session;
 		this.#auth = new AuthSession({
 			wire: auth && authSupported(version) ? new IetfAuthWire(session) : undefined,
+			requests: true,
 			peerGrant: {
 				publish: new Path.Patterns([Path.Pattern.all()]),
 				subscribe: new Path.Patterns(publish ? [Path.Pattern.all()] : []),
 			},
+			handle,
+			draining: () => this.#goaway.peek() !== undefined,
 		});
+		// Left before anything observes the close, so a successor on the same handle never
+		// finds this session still active.
+		const leave = () => this.#auth.close();
+		void quic.closed.then(leave, leave);
 		this.#client = client;
 
 		this.#auth.violated.subscribe((err) => {
@@ -206,23 +249,35 @@ export class Connection implements Established {
 			publish,
 			requiresSolicitation: solicit ?? false,
 			hidden,
+			activeCount,
 			cluster,
-			grant: this.#auth.grant,
+			epoch,
+			grant: this.#auth.scope,
+			auth: this.#auth,
 			ready: this.#auth.setupAnswered(),
 		});
 		this.#solicit = solicit;
 		this.#declaredSolicit = extensions?.solicit ?? true;
 		this.#cluster = cluster;
+		this.#epoch = epoch;
 		this.#subscriber = new Subscriber({
+			maxAge,
 			session: this.#session,
 			quic,
 			cluster,
+			epoch,
 			hidden,
+			activeCount,
 			solicit,
 			goaway: this.#goaway,
-			grant: this.#auth.grant,
+			grant: this.#auth.scope,
+			auth: this.#auth,
 		});
-		registerWire(this, { consume: (path) => this.#subscriber.consume(path), goaway: this.#goaway });
+		registerWire(this, {
+			consume: (path) => this.#subscriber.consume(path),
+			goaway: this.#goaway,
+			auth: this.#auth,
+		});
 
 		void this.#run(early);
 	}
@@ -234,9 +289,11 @@ export class Connection implements Established {
 
 	/** Withdraw announcements and wait up to one second for delivery before closing. */
 	close(): Promise<void> {
-		this.#closing ??= withTimeout(this.#publisher.withdraw(), 1000, "session close timed out").finally(() =>
-			this.abort(),
-		);
+		this.#closing ??= withTimeout(
+			this.#publisher.withdraw(),
+			Nano.fromSecond(Second(1)),
+			"session close timed out",
+		).finally(() => this.abort());
 		return this.#closing;
 	}
 
@@ -286,7 +343,7 @@ export class Connection implements Established {
 			];
 			// Fail loud on a publication our grant never covers, once the peer has answered the
 			// credential we presented at setup.
-			if (this.#client) tasks.push(this.#publisher.runEnforce(this.#auth.setupAnswered()));
+			if (this.#client) tasks.push(this.#publisher.runEnforce(this.#auth.setupAnswered(), this.#auth));
 			await Promise.all(tasks);
 		} catch (err) {
 			if (!this.#closed) {
@@ -341,7 +398,7 @@ export class Connection implements Established {
 			case BigInt(SubscribeNamespace.id): {
 				const decoded = SubscribeNamespace.decode(stream.reader, this.#session.version);
 				const msg = await this.#request(stream, "subscribe_namespace", decoded);
-				if (msg) await this.#publisher.runSubscribeNamespace(msg, stream);
+				if (msg) await handed(this.#publisher.runSubscribeNamespace(msg, stream));
 				break;
 			}
 			case BigInt(SubscribeNamespaceLegacy.id): {
@@ -356,7 +413,8 @@ export class Connection implements Established {
 				try {
 					legacy = await SubscribeNamespaceLegacy.decode(stream.reader, this.#session.version);
 				} catch (err) {
-					if (!(err instanceof MalformedAuthToken) || err.requestId === undefined) throw err;
+					if (!(err instanceof MalformedAuthToken) || err.requestId === undefined)
+						throw malformed(err, "subscribe_namespace");
 					adapter?.admitRequest(err.requestId);
 					this.#spend(err.requestId);
 					try {
@@ -370,14 +428,14 @@ export class Connection implements Established {
 				this.#spend(legacy.requestId);
 				try {
 					if (legacy.subscribeOptions === SubscribeOptions.PUBLISH) {
-						await this.#publisher.refuseSubscribeNamespace(legacy.requestId, stream);
+						await handed(this.#publisher.refuseSubscribeNamespace(legacy.requestId, stream));
 					} else {
 						const msg = new SubscribeNamespace({
 							requestId: legacy.requestId,
 							namespace: legacy.namespace,
 							hidden: legacy.hidden,
 						});
-						await this.#publisher.runSubscribeNamespace(msg, stream);
+						await handed(this.#publisher.runSubscribeNamespace(msg, stream));
 					}
 				} finally {
 					adapter?.releaseRequest(legacy.requestId);
@@ -393,7 +451,7 @@ export class Connection implements Established {
 			case BigInt(Subscribe.id): {
 				const decoded = Subscribe.decode(stream.reader, this.#session.version);
 				const msg = await this.#request(stream, "subscribe", decoded);
-				if (msg) await this.#publisher.runSubscribe(msg, stream);
+				if (msg) await handed(this.#publisher.runSubscribe(msg, stream));
 				break;
 			}
 			case BigInt(SUBSCRIBE_TRACKS_ID): {
@@ -401,35 +459,30 @@ export class Connection implements Established {
 				if (this.#session.version < Version.DRAFT_18) {
 					throw new ProtocolViolation("SUBSCRIBE_TRACKS before draft-18");
 				}
-				const requestId = await Message.decode(stream.reader, async (reader) => {
-					const id = await reader.u62();
-					await reader.readAll();
-					return id;
-				});
-				this.#session.spendRequest(requestId);
-				await this.#publisher.runSubscribeTracks(stream);
+				const decoded = SubscribeTracks.decode(stream.reader, this.#session.version);
+				const msg = await this.#request(stream, "subscribe_namespace", decoded);
+				if (msg) await handed(this.#publisher.runSubscribeTracks(msg, stream));
 				break;
 			}
 			case BigInt(TrackStatusRequest.id): {
 				const decoded = TrackStatusRequest.decode(stream.reader, this.#session.version);
 				const msg = await this.#request(stream, "track_status", decoded);
-				if (msg) await this.#publisher.runTrackStatusRequest(msg, stream);
+				if (msg) await handed(this.#publisher.runTrackStatusRequest(msg, stream));
 				break;
 			}
 			case BigInt(Fetch.id): {
 				const decoded = Fetch.decode(stream.reader, this.#session.version);
 				const msg = await this.#request(stream, "fetch", decoded);
-				if (msg) await this.#publisher.runFetch(msg, stream);
+				if (msg) await handed(this.#publisher.runFetch(msg, stream));
 				break;
 			}
 
 			// Subscriber handles incoming notifications
 			case BigInt(PublishNamespace.id): {
-				const decoded = PublishNamespace.decode(
-					stream.reader,
-					this.#session.version,
-					Cluster.negotiated(this.#cluster),
-				);
+				const decoded = PublishNamespace.decode(stream.reader, this.#session.version, {
+					cluster: Cluster.negotiated(this.#cluster),
+					epoch: this.#epoch,
+				});
 				const msg = await this.#request(stream, "publish_namespace", decoded);
 				if (!msg) break;
 
@@ -453,7 +506,7 @@ export class Connection implements Established {
 					break;
 				}
 
-				await this.#subscriber.runPublishNamespace(msg, stream);
+				await handed(this.#subscriber.runPublishNamespace(msg, stream));
 				break;
 			}
 			case BigInt(AuthMessage.id): {
@@ -465,7 +518,7 @@ export class Connection implements Established {
 			case BigInt(Publish.id): {
 				const decoded = Publish.decode(stream.reader, this.#session.version);
 				const msg = await this.#request(stream, "publish", decoded);
-				if (msg) await this.#subscriber.runPublish(msg, stream);
+				if (msg) await handed(this.#subscriber.runPublish(msg, stream));
 				break;
 			}
 
@@ -489,7 +542,7 @@ export class Connection implements Established {
 		try {
 			msg = await decoded;
 		} catch (err) {
-			if (!(err instanceof MalformedAuthToken) || err.requestId === undefined) throw err;
+			if (!(err instanceof MalformedAuthToken) || err.requestId === undefined) throw malformed(err, kind);
 			this.#spend(err.requestId);
 			await this.#refuseToken(stream, kind, err.requestId);
 			return undefined;
@@ -505,24 +558,11 @@ export class Connection implements Established {
 
 	/** Refuse a request MALFORMED_AUTH_TOKEN, ending its stream. Mirrors Rust's `token::reject`. */
 	async #refuseToken(stream: Stream, kind: RequestKind, requestId: bigint) {
-		const version = this.#session.version;
-		// Each draft-14 error message has the REQUEST_ERROR body that draft-15 folded them into.
-		const id14 = {
-			subscribe: SubscribeError.id,
-			fetch: FetchError.id,
-			publish: PublishError.id,
-			publish_namespace: PublishNamespaceError.id,
-			subscribe_namespace: SubscribeNamespaceError.id,
-			track_status: TRACK_STATUS_ERROR_14,
-		}[kind];
-		const legacy = version === Version.DRAFT_14 || version === Version.DRAFT_15 || version === Version.DRAFT_16;
-		await stream.writer.u53(version === Version.DRAFT_14 ? id14 : RequestError.id);
-		await new RequestError({
-			requestId: legacy ? requestId : undefined,
-			errorCode: toRequestCode("malformed_auth_token", kind, version),
+		await refuse(stream, this.#session.version, kind, {
+			requestId,
+			condition: "malformed_auth_token",
 			reasonPhrase: "repeated AUTHORIZATION TOKEN",
-		}).encode(stream.writer, version);
-		stream.close();
+		});
 	}
 
 	// A malformed OBJECT_DATAGRAM is the peer breaking the protocol, like an invalid stream type.
@@ -557,7 +597,8 @@ export class Connection implements Established {
 				stream.stop(new StreamError(StreamCode.Cancel, { message: "cancel" }));
 			})
 			.catch((err: unknown) => {
-				console.error("error processing object stream", err);
+				// A peer resetting a stream it no longer wants to send is routine, not an error;
+				// only a violation is, and that one closes the session with its code.
 				stream.stop(err);
 
 				// An unknown or invalid stream type MUST close the session, not just the stream.
@@ -599,31 +640,58 @@ export class Connection implements Established {
 	 */
 	async #runGoAway(controlStream: Stream, version: IetfVersion) {
 		try {
-			for (;;) {
-				const done = await controlStream.reader.done();
-				if (done) return;
+			const read = async () => {
+				for (;;) {
+					const done = await controlStream.reader.done();
+					if (done) throw new ProtocolViolation("control stream closed");
 
-				const typeId = await controlStream.reader.u53();
-				if (typeId !== GoAway.id) {
-					console.warn(`unexpected message on setup stream: 0x${typeId.toString(16)}`);
-					return;
+					const msg = await this.#readGoAway(controlStream, version).catch((err: unknown) => {
+						throw malformed(err, "setup stream message");
+					});
+					if (this.#goaway.peek() !== undefined) throw new ProtocolViolation("duplicate GOAWAY");
+					// A client may leave, but only the server may name where to go.
+					if (!this.#client && msg.newSessionUri !== "") {
+						throw new ProtocolViolation("client GOAWAY must not name a redirect");
+					}
+					// Draft-18's Request ID names our IDs: even when we are the client, odd for a server.
+					// It is required here, on the control stream.
+					if (version === Version.DRAFT_18 && msg.requestId === undefined) {
+						throw new ProtocolViolation("draft-18 GOAWAY on the control stream lacks a Request ID");
+					}
+					if (msg.requestId !== undefined && msg.requestId % 2n !== (this.#client ? 0n : 1n)) {
+						throw new ProtocolViolation("GOAWAY Request ID has the wrong parity", {
+							code: SessionCode.InvalidRequestId,
+						});
+					}
+					// Reject bytes already behind GOAWAY before a caller can close on the drain.
+					if (controlStream.reader.tryDecode((c) => c.u8()) !== undefined)
+						throw new ProtocolViolation("message after control stream GOAWAY");
+					this.#goaway.set(msg.drain());
 				}
-
-				const msg = await GoAway.decode(controlStream.reader, version);
-				if (this.#goaway.peek() !== undefined) throw new ProtocolViolation("duplicate GOAWAY");
-				// A client may leave, but only the server may name where to go.
-				if (!this.#client && msg.newSessionUri !== "") {
-					throw new ProtocolViolation("client GOAWAY must not name a redirect");
-				}
-				this.#goaway.set(msg.drain());
-			}
+			};
+			const stopped = controlStream.writer.closed.then(() => {
+				throw new ProtocolViolation("control stream stopped");
+			});
+			await race([read(), stopped]);
 		} catch (err) {
-			if (!this.#closed) {
-				console.error("error reading setup stream", err);
-			}
+			if (!this.#closed && !sessionClosed(err))
+				this.#violated(
+					err instanceof ProtocolViolation
+						? err
+						: new ProtocolViolation("control stream failed", { cause: err }),
+				);
 		} finally {
 			this.#close();
 		}
+	}
+
+	// The setup stream carries nothing but GOAWAY after SETUP.
+	async #readGoAway(controlStream: Stream, version: IetfVersion): Promise<GoAway> {
+		const typeId = await controlStream.reader.u53();
+		if (typeId !== GoAway.id) {
+			throw new ProtocolViolation(`unexpected message on setup stream: 0x${typeId.toString(16)}`);
+		}
+		return GoAway.decode(controlStream.reader, version);
 	}
 
 	/** Resolves when the session closes, decoding the peer's close code; see {@link Established.closed}. */

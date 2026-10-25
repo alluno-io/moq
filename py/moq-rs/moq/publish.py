@@ -2,39 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Coroutine, Generator
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from moq_ffi import (
-    MoqAudioProducer,
     MoqBroadcastDynamic,
+    MoqBroadcastFinish,
     MoqBroadcastProducer,
-    MoqGroupDemand,
+    MoqFill,
     MoqGroupProducer,
-    MoqGroupRequest,
+    MoqOrder,
     MoqTrackDemand,
     MoqTrackDynamic,
     MoqTrackProducer,
     MoqTrackRequest,
-    MoqVideoProducer,
 )
 
-from ._records import _subscription, _track_info
+from ._records import _from_us, _opt_from_us, _subscription, _track_info
+from ._stream import _Stream
 from .types import (
-    AudioEncoderInput,
-    AudioEncoderOutput,
-    AudioFrame,
+    AnnounceRoute,
     Frame,
-    Route,
     Subscription,
     TrackInfo,
-    VideoEncoderInput,
-    VideoEncoderOutput,
-    VideoFrame,
 )
 
 if TYPE_CHECKING:
-    from .session import Bandwidth, Reservation
     from .subscribe import BroadcastConsumer, GroupConsumer, TrackConsumer
 
 
@@ -55,7 +50,7 @@ class GroupProducer:
 
         return GroupConsumer(self._inner.consume())
 
-    def write_frame(self, payload: bytes, timestamp: timedelta = timedelta(0)) -> None:
+    def write_frame(self, payload: bytes, timestamp: timedelta | None = None) -> None:
         """Write a frame with its presentation timestamp."""
         self._inner.write_frame(Frame(payload, timestamp)._ffi())
 
@@ -72,7 +67,7 @@ class GroupProducer:
 
 
 class TrackDemand:
-    """A watch-only handle to whether a published track has subscribers.
+    """A watch-only handle to the group a published track's subscribers want next.
 
     Returned by a producer's ``demand()``. Weak: holding it neither keeps the
     track open nor locks the producer, so a wait can park here while the
@@ -88,17 +83,16 @@ class TrackDemand:
         """The name of the track this watches."""
         return self._inner.name()
 
-    def is_used(self) -> bool:
-        """Whether the track has at least one active subscriber right now."""
-        return self._inner.is_used()
+    def wanted(self) -> int | None:
+        """The group subscribers want next, or None while nobody subscribes.
 
-    async def used(self) -> None:
-        """Wait until the track has at least one active subscriber."""
-        await self._inner.used()
+        A value past the newest group asks for a new group now, typically a keyframe.
+        """
+        return self._inner.wanted()
 
-    async def unused(self) -> None:
-        """Wait until the track has no active subscribers."""
-        await self._inner.unused()
+    async def wanted_changed(self) -> int | None:
+        """Wait for ``wanted`` to change and return it. The first call returns at once."""
+        return await self._inner.wanted_changed()
 
 
 class TrackProducer:
@@ -126,11 +120,11 @@ class TrackProducer:
         """Create a group with an explicit sequence number."""
         return GroupProducer(self._inner.create_group(sequence))
 
-    def write_frame(self, payload: bytes, timestamp: timedelta = timedelta(0)) -> None:
+    def write_frame(self, payload: bytes, timestamp: timedelta | None = None) -> None:
         """Write a single-frame group with its presentation timestamp."""
         self._inner.write_frame(Frame(payload, timestamp)._ffi())
 
-    def append_datagram(self, payload: bytes, timestamp: timedelta = timedelta(0)) -> int:
+    def append_datagram(self, payload: bytes, timestamp: timedelta | None = None) -> int:
         """Send a best-effort datagram and return its sequence number.
 
         Payloads are capped at 1200 bytes. Datagram delivery requires a datagram-capable
@@ -199,68 +193,86 @@ class TrackRequest:
         self._inner.abort(error_code)
 
 
-class GroupDemand:
-    """A watch-only handle to the callers waiting on a requested group.
+class Fill:
+    """A run of groups readers miss, for a :class:`TrackDynamic` to serve.
 
-    Returned by ``GroupRequest.demand()``. Weak: holding it does not keep the
-    request alive. The last caller to leave withdraws the request, so once
-    unused, demand never returns: drop the request. Waits raise once the
-    request is answered: ``moq.Error.Closed`` if it was dropped, otherwise the
-    error the accept or reject left for the waiting fetches.
+    Call :meth:`accept` for each group you have and :meth:`drop_groups` for the rest;
+    :meth:`next` names what is still owed, in the fill's order. Dropping the fill names
+    whatever is left as dropped while a reader still wants it; once nobody does, it is
+    withdrawn, so stop serving it when :meth:`unused` returns. Stop serving a single group
+    when :meth:`unwanted` returns for it, and move on to :meth:`next`.
     """
 
-    def __init__(self, inner: MoqGroupDemand) -> None:
+    def __init__(self, inner: MoqFill) -> None:
         self._inner = inner
 
     @property
-    def sequence(self) -> int:
-        """The sequence of the group this watches."""
-        return self._inner.sequence()
-
-    def is_used(self) -> bool:
-        """Whether the group has at least one waiting caller right now."""
-        return self._inner.is_used()
-
-    async def used(self) -> None:
-        """Wait until the group has at least one waiting caller."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until the group has no waiting callers."""
-        await self._inner.unused()
-
-
-class GroupRequest:
-    """A request to produce one uncached group for a fetch consumer."""
-
-    def __init__(self, inner: MoqGroupRequest) -> None:
-        self._inner = inner
+    def start_group(self) -> int:
+        """The first group to fill."""
+        return self._inner.start_group()
 
     @property
-    def sequence(self) -> int:
-        """The requested group sequence within the track."""
-        return self._inner.sequence()
+    def start_frame(self) -> int:
+        """The frame within the first group to start from."""
+        return self._inner.start_frame()
+
+    @property
+    def end_group(self) -> int:
+        """The exclusive end group."""
+        return self._inner.end_group()
 
     @property
     def priority(self) -> int:
-        """The consumer's delivery priority for this fetch."""
+        """The most urgent delivery priority among the readers waiting on it."""
         return self._inner.priority()
 
-    def demand(self) -> GroupDemand:
-        """A watch-only handle to whether any caller still wants this group."""
-        return GroupDemand(self._inner.demand())
+    @property
+    def max_delay(self) -> timedelta | None:
+        """The most tolerant age budget among its readers, ``None`` for the publisher's max age alone."""
+        return _opt_from_us(self._inner.max_delay_us())
 
-    def accept(self) -> GroupProducer:
-        """Accept the request and return a producer for the group."""
-        return GroupProducer(self._inner.accept())
+    @property
+    def order(self) -> MoqOrder:
+        """Which end to fill first."""
+        return self._inner.order()
 
-    def abort(self, error_code: int) -> None:
-        """Reject the fetch with an application error code."""
-        self._inner.abort(error_code)
+    def next(self) -> int | None:
+        """The next group still owed in the fill's order, ``None`` once every group is answered."""
+        return self._inner.next()
+
+    def accept(self, sequence: int) -> GroupProducer:
+        """Insert group ``sequence`` and return a producer for it.
+
+        The first group starts at :attr:`start_frame`, so its frames keep their indices.
+        """
+        return GroupProducer(self._inner.accept(sequence))
+
+    def drop_groups(self, start: int, end: int) -> None:
+        """Name groups ``start`` up to the exclusive ``end`` as never to be delivered."""
+        self._inner.drop_groups(start, end)
+
+    def is_used(self) -> bool:
+        """Whether a reader still waits on this fill."""
+        return self._inner.is_used()
+
+    async def unused(self) -> None:
+        """Wait until no reader waits on this fill."""
+        await self._inner.unused()
+
+    def is_wanted(self, sequence: int) -> bool:
+        """Whether a reader still waits for group ``sequence`` from this fill.
+
+        False once every reader took it or narrowed past it, or nobody waits on the fill.
+        """
+        return self._inner.is_wanted(sequence)
+
+    async def unwanted(self, sequence: int) -> None:
+        """Wait until no reader waits for group ``sequence`` from this fill, so stop serving it."""
+        await self._inner.unwanted(sequence)
 
 
-class TrackDynamic:
-    """Async source of uncached group requests for one track.
+class TrackDynamic(_Stream[Fill]):
+    """Async source of the fills readers of one track need: runs of groups the cache lacks.
 
     Usable as an async context manager that cancels on exit.
     """
@@ -268,149 +280,19 @@ class TrackDynamic:
     def __init__(self, inner: MoqTrackDynamic) -> None:
         self._inner = inner
 
-    async def __aenter__(self):
-        return self
+    async def _next(self) -> Fill:
+        return await self.requested_fill()
 
-    async def __aexit__(self, *exc) -> None:
-        self.cancel()
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> GroupRequest:
-        return await self.requested_group()
-
-    async def requested_group(self) -> GroupRequest:
-        """Wait for the next uncached group request."""
-        return GroupRequest(await self._inner.requested_group())
+    async def requested_fill(self) -> Fill:
+        """Wait for the next fill."""
+        return Fill(await self._inner.requested_fill())
 
     def cancel(self) -> None:
-        """Cancel current and future group request waits."""
+        """Cancel current and future fill waits."""
         self._inner.cancel()
 
 
-class AudioProducer:
-    """Publish raw PCM and let libopus encode it on the way out.
-
-    Built via :meth:`BroadcastProducer.encode_audio`. PCM layout
-    (format / sample rate / channels / bitrate / frame duration) is
-    fixed at construction; each :meth:`write` call passes only bytes
-    and a presentation timestamp.
-    """
-
-    def __init__(self, inner: MoqAudioProducer) -> None:
-        self._inner = inner
-
-    @property
-    def name(self) -> str:
-        """The audio track name."""
-        return self._inner.name()
-
-    def demand(self) -> TrackDemand:
-        """A watch-only handle to whether this audio track has subscribers."""
-        return TrackDemand(self._inner.demand())
-
-    async def used(self) -> None:
-        """Wait until this audio track has at least one active subscriber. Prefer :meth:`demand`."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this audio track has no active subscribers. Prefer :meth:`demand`."""
-        await self._inner.unused()
-
-    def reanchor(self) -> None:
-        """Re-anchor the timeline to the next frame after an idle gap."""
-        self._inner.reanchor()
-
-    def write(self, frame: AudioFrame) -> None:
-        """Push one frame of PCM in the configured input format."""
-        self._inner.write(frame)
-
-    def reservation(self) -> Reservation | None:
-        """This encoder's bandwidth reservation, if published against a session allocator."""
-        inner = self._inner.reservation()
-        if inner is None:
-            return None
-        from .session import Reservation as ReservationType
-
-        return ReservationType(inner)
-
-    def finish(self) -> None:
-        """Flush any pending samples and finalize the track."""
-        self._inner.finish()
-
-
-class VideoProducer:
-    """Publish raw pictures and let a native encoder compress them on the way out.
-
-    Built via :meth:`BroadcastProducer.encode_video`. Pixel format,
-    resolution, and framerate are fixed at construction; each
-    :meth:`write` call passes only pixels and a presentation timestamp.
-    """
-
-    def __init__(self, inner: MoqVideoProducer) -> None:
-        self._inner = inner
-
-    @property
-    def name(self) -> str:
-        """The video track name."""
-        return self._inner.name()
-
-    def demand(self) -> TrackDemand:
-        """A watch-only handle to whether this video track has subscribers."""
-        return TrackDemand(self._inner.demand())
-
-    async def used(self) -> None:
-        """Wait until this video track has at least one active subscriber. Prefer :meth:`demand`."""
-        await self._inner.used()
-
-    async def unused(self) -> None:
-        """Wait until this video track has no active subscribers. Prefer :meth:`demand`."""
-        await self._inner.unused()
-
-    def write(self, frame: VideoFrame) -> None:
-        """Encode and publish one frame in the configured input format.
-
-        A hardware encoder pipelines, so a call that puts nothing on the wire
-        is normal rather than an error.
-        """
-        self._inner.write(frame)
-
-    def cut(self) -> None:
-        """Start a new group at the next written frame.
-
-        Optional: the encoder keyframes every ``gop`` frames on its own, and
-        each of those cuts a group, so a subscriber can always join without
-        this. Reach for it only to place the boundaries yourself. Raises if
-        the selected encoder cannot force a keyframe; nothing is queued then
-        and groups keep their interval.
-        """
-        self._inner.cut()
-
-    def set_bitrate(self, bitrate: int) -> None:
-        """Retune the live encoder, in bits per second.
-
-        Cheap enough to drive from a congestion controller: no keyframe is
-        forced. Raises if this backend cannot retune while running. That is
-        not fatal: the encoder keeps its current rate.
-        """
-        self._inner.set_bitrate(bitrate)
-
-    def reservation(self) -> Reservation | None:
-        """This encoder's bandwidth reservation, if published against a session allocator."""
-        inner = self._inner.reservation()
-        if inner is None:
-            return None
-        from .session import Reservation as ReservationType
-
-        return ReservationType(inner)
-
-    def finish(self) -> None:
-        """Flush any frames the codec is holding and finalize the track."""
-        self._inner.finish()
-
-
-class BroadcastDynamic:
+class BroadcastDynamic(_Stream[TrackRequest]):
     """Async source of tracks requested by subscribers.
 
     Hold this object while subscriptions to unknown tracks should be accepted.
@@ -420,16 +302,7 @@ class BroadcastDynamic:
     def __init__(self, inner: MoqBroadcastDynamic) -> None:
         self._inner = inner
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc) -> None:
-        self.cancel()
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> TrackRequest:
+    async def _next(self) -> TrackRequest:
         return await self.requested_track()
 
     async def requested_track(self) -> TrackRequest:
@@ -463,56 +336,17 @@ class BroadcastProducer:
         """Accept subscriptions to tracks that are not published yet."""
         return BroadcastDynamic(self._inner.dynamic())
 
-    def announce(self, route: Route | None = None) -> None:
+    def announce(self, route: AnnounceRoute | None = None) -> None:
         """Advertise this broadcast's exact path as a route.
 
         Announcing again re-prices the route in place. Until announced, the
         broadcast is invisible and unroutable for local consumers and peers alike.
         """
-        self._inner.announce(route if route is not None else Route())
+        self._inner.announce(route if route is not None else AnnounceRoute())
 
     def unannounce(self) -> None:
         """Retract this broadcast's advertisement, if any, from local consumers and peers alike."""
         self._inner.unannounce()
-
-    def encode_audio(
-        self,
-        name: str,
-        input: AudioEncoderInput,
-        output: AudioEncoderOutput,
-        *,
-        bandwidth: Bandwidth | None = None,
-    ) -> AudioProducer:
-        """Publish a raw-audio track with an in-process encoder.
-
-        Select the codec with ``moq.AudioCodec.opus()`` or
-        ``moq.AudioCodec.aac()``, placed in ``output``.
-
-        Pass ``bandwidth`` to reserve this track's bitrate against the session's
-        allocator so a co-resident video encoder sizes itself against what is left.
-        """
-        return AudioProducer(
-            self._inner.encode_audio(name, input, output, None if bandwidth is None else bandwidth._inner)
-        )
-
-    def encode_video(
-        self,
-        input: VideoEncoderInput,
-        output: VideoEncoderOutput,
-        *,
-        bandwidth: Bandwidth | None = None,
-    ) -> VideoProducer:
-        """Publish a raw-video track with an in-process H.264/H.265 encoder.
-
-        Set ``output.track`` to choose the track name; otherwise one is derived
-        from the codec (``.avc3`` / ``.hev1``). The catalog rendition is
-        published immediately so subscribers can discover it before the first
-        frame exists.
-
-        Pass ``bandwidth`` to reserve this track's configured bitrate and follow
-        the grant.
-        """
-        return VideoProducer(self._inner.encode_video(input, output, None if bandwidth is None else bandwidth._inner))
 
     def publish_track(self, name: str, info: TrackInfo | None = None) -> TrackProducer:
         """Create a track. Send any bytes, no codec validation. ``info`` sets track
@@ -531,3 +365,74 @@ class BroadcastProducer:
         Tracks already subscribed carry on to their own end. Closing again is a no-op.
         """
         self._inner.close()
+
+    def finish(self) -> BroadcastFinish:
+        """End the broadcast cleanly, keeping it servable until its media goes stale.
+
+        Finish every track first: the returned handle holds the tracks finished by now and
+        keeps the broadcast announced, so a subscriber still catching up can drain them. A
+        track still live is not held. Every later call on this producer fails, as after
+        :meth:`close`.
+        """
+        return BroadcastFinish(self._inner.finish())
+
+
+class BroadcastFinish:
+    """A cleanly ended broadcast, still announced and serving its finished tracks.
+
+    Await :meth:`wait` to keep it up for its :attr:`linger`. Cancelling the wait, or
+    :meth:`close`, closes the broadcast at once.
+    """
+
+    def __init__(self, inner: MoqBroadcastFinish) -> None:
+        self._inner = inner
+
+    @property
+    def linger(self) -> timedelta:
+        """How long to keep the broadcast: the longest max age of the held tracks."""
+        return _from_us(self._inner.linger_us())
+
+    def wait(self) -> Coroutine[Any, Any, None]:
+        """Keep the broadcast up for its linger, or until :meth:`close`, then close it."""
+        return _FinishWait(self._inner)
+
+    def close(self) -> None:
+        """Close the broadcast now, ending the linger and any wait. Closing again is a no-op."""
+        self._inner.close()
+
+
+class _FinishWait(Coroutine[Any, Any, None]):
+    """A finish's wait that closes the broadcast when cancelled.
+
+    A coroutine body never runs when its task is cancelled before the first step, so the
+    close hooks the cancellation thrown in rather than an ``except`` inside the body.
+    """
+
+    def __init__(self, inner: MoqBroadcastFinish) -> None:
+        self._inner = inner
+        self._wait = inner.wait()
+
+    def __await__(self) -> Generator[Any, None, None]:
+        return self
+
+    def __iter__(self) -> Generator[Any, None, None]:
+        return self
+
+    def __next__(self) -> Any:
+        return self.send(None)
+
+    def send(self, value: Any) -> Any:
+        return self._wait.send(value)
+
+    def throw(self, typ: Any, val: Any = None, tb: Any = None) -> Any:
+        error = typ if val is None else val
+        if isinstance(error, asyncio.CancelledError) or (
+            isinstance(error, type) and issubclass(error, asyncio.CancelledError)
+        ):
+            self._inner.close()
+        if val is None and tb is None:
+            return self._wait.throw(typ)
+        return self._wait.throw(typ, val, tb)
+
+    def close(self) -> None:
+        self._wait.close()

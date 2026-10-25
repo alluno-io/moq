@@ -35,7 +35,7 @@ Then, only where the profile shows a cost:
 - `sendmmsg` in `moq_sock::udp` behind the existing GSO path, submitting every
   train ready across connections in one call, falling back to per-train
   `sendmsg` on partial failure the way the GSO fallback does.
-- A `BufFactory`-style seam on `SendBuffer` in the fork that takes buffers
+- A `BufFactory`-style seam on `SendBuffer` in `moq-quic` that takes buffers
   from a pool sized from the send window and returns them on ACK. Design it
   with [the I/O boundary redesign](/quest/m2/quic-io-boundary.md), which
   reworks the same transmit buffers.
@@ -45,13 +45,14 @@ Then, only where the profile shows a cost:
   per-connection pacing. Measure on a real NIC as well as loopback, since
   `etf` needs hardware offload to be exact.
 
-Report CPU per Gbps, RSS, loss, and p99 latency via `just bench BASE` on
-Linux. The verdict names which levers ship and which qdisc, if any, relay
+Report CPU per Gbps, RSS, loss, and p99 latency on Linux: `just bench BASE`
+for tokio, and `just bench-runtime` at both revisions for the ring, since
+`just bench BASE` runs only tokio. The verdict names which levers ship and which qdisc, if any, relay
 hosts need.
 
 ## Required
 
-- [Hard fork](/quest/m1/quic/fork/README.md) - the change lands in `moq-quic`, not the frozen fork
+- [Profile the io_uring workers](/quest/m2/perf/uring-profile.md) - the ring half of the profile
 
 ## Related
 

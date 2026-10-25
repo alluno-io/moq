@@ -10,9 +10,9 @@ description: RAII objects, futures, and moq::expected over the Rust core
 `<moq/moq.hpp>`: every `moq-ffi` object as a `std::shared_ptr`, every async
 call as a cancellable future, and every error as a returned `moq::expected`
 value, so it builds with exceptions and RTTI disabled (Unreal's defaults).
-C++17 is the floor; C++20 adds `co_await` on a future, and C++23 makes
-`moq::expected` a `std::expected`. The bindings are generated from the same
-[UniFFI](https://mozilla.github.io/uniffi-rs/) crate as the other wrappers, so
+C++17 is the floor, and C++20 adds `co_await` on a future. The bindings are
+generated from the same [UniFFI](https://mozilla.github.io/uniffi-rs/) crate as
+the other wrappers, so
 a method means the same thing here as in Python or Go. For a plain C ABI, use
 [moq-c](/lib/c/).
 
@@ -25,7 +25,6 @@ and `moq-cpp.pc`. Targets: Linux x86\_64 and aarch64, macOS arm64, Windows x64.
 No Rust toolchain is needed to consume it.
 
 ```cmake ignore
-set(CMAKE_CXX_STANDARD 23)       # optional; see "C++ standard" below
 find_package(moq-cpp REQUIRED)   # with CMAKE_PREFIX_PATH at the unpacked archive
 target_link_libraries(app PRIVATE moq::cpp)
 ```
@@ -38,27 +37,21 @@ c++ -std=c++17 app.cpp $(pkg-config --variable=sources moq-cpp) $(pkg-config --c
 The Windows archive is built for MSVC, so use the CMake package there.
 
 The generated bindings ship as source (`share/moq-cpp/moq.cpp`) and compile inside
-your build, because `uniffi::expected` is `std::expected` or a bundled
-`tl::expected` depending on the standard. On MSVC, link the release runtime
+your build, with your compiler and flags. On MSVC, link the release runtime
 (`/MD`), which the Rust library uses in every configuration.
-
-### C++ standard
-
-The bindings compile at your project's `CMAKE_CXX_STANDARD`, or the compiler's
-default (at least C++17) when it is unset, and must match the code that
-includes `<moq/moq.hpp>`. To use C++23, set it before `find_package`, or pass
-`-DCMAKE_CXX_STANDARD=23`. Raising the standard only on your own target
-(`target_compile_features(app PRIVATE cxx_std_23)`) does not reach the
-bindings, so the two disagree on `moq::expected` and the link fails with an
-undefined `moq_abi_std_expected` or `moq_abi_tl_expected` symbol rather than
-corrupting memory. With pkg-config, pass the same `-std` to the bindings
-source and to your code.
 
 From source, `add_subdirectory(cpp/moq)` in a checkout builds `moq-ffi` with
 cargo and renders the bindings with the pinned `uniffi-bindgen-cpp` (see
 [`cpp/moq`](https://github.com/moq-dev/moq/tree/main/cpp/moq)), then exposes
-the same `moq::cpp` target. The package is `moq-cpp`, so it installs beside
-the C package, `moq-c`, without colliding.
+the same `moq::cpp` target. To build from an explicitly staged default-feature
+FFI package instead, set `MOQ_FFI_DIR` to its extracted directory, or pass
+`--ffi-dir DIR` to `just cpp package`. This renders bindings from the supplied
+metadata library and links its static library without compiling Rust. Without
+an explicit directory, a release pin in `cpp/moq/FFI_VERSION` selects the default
+input; `just cpp package` fetches it with the checked-in SHA-256 hashes and fails
+if it cannot verify it. Direct CMake builds and `just cpp check` build the
+current checkout unless given an explicit native directory. The package is
+`moq-cpp`, so it installs beside the C package, `moq-c`, without colliding.
 
 ## Example
 
@@ -97,18 +90,26 @@ auto announced = ok(session->consume()->announced_broadcast("my-stream.hang"));
 auto broadcast = ok(announced->available().get());
 auto catalogs = ok(moq::MediaCatalogConsumer::subscribe(broadcast).get());
 if (auto catalog = ok(catalogs->next().get())) {   // std::nullopt once the catalog ends
-    for (const auto &[name, video] : catalog->video) {
-        // The track is the rendition's `track` when set, otherwise its catalog key.
-        auto track = video.track.value_or(name);
-        auto media = ok(moq::MediaTrackConsumer::subscribe(broadcast, {track, video.container}).get());
+    for (const auto &[id, video] : catalog->video) {
+        // The rendition carries its own broadcast and track, which the subscribe follows.
+        auto media = ok(moq::MediaTrackConsumer::subscribe(broadcast, {moq::Rendition::kVideo{id, video}}).get());
         auto frame = ok(media->next().get());   // std::nullopt once the track ends
     }
 }
 ```
 
+Call `available()` again to wait for the next publisher instance at that path, such as a
+restarted publisher, and drop what was read from the previous one then: its tracks end
+when its session does.
+
 `MediaTrackConsumer` reads in decode order. For arrival-order reads, decode each group
 from `TrackConsumer::recv_group` with `moq::MediaGroupConsumer::init(group, container)`;
 frames carry container media time as they land.
+Share `moq::MediaTimebase::init(broadcast)` through `ContainerInit` when several imports
+use one source timeline; omitting it keeps an independent offset. A timebase belongs to
+its broadcast and does not keep it open. `MediaContainerProducer` takes chunks split
+anywhere, so a raw byte stream needs no other importer.
+`moq::ContainerFormat::kFmp4` splits each fragment into one frame per sample.
 
 ```cpp
 // Publish encoded frames, or raw pixels with the codec inside the binding.
@@ -118,14 +119,17 @@ auto broadcast = ok(session->publish()->create_broadcast("my-stream.hang"));
 auto audio = ok(moq::MediaTrackProducer::audio(broadcast, moq::MediaTarget::kNamed{}, {moq::AudioFormat::kOpus, opus_init}));
 ok(audio->write_frame({packet, 20'000}));
 
-moq::VideoEncoderOutput output{moq::VideoCodec::kH264, "camera", std::nullopt, std::nullopt, moq::VideoEncoderKind::kAuto{}};
-auto video = ok(broadcast->encode_video({moq::VideoPixelFormat::kRgba, 1280, 720, 30}, output, nullptr));
+moq::VideoEncoderOutput output{moq::VideoCodec::kH264, std::nullopt, std::nullopt, moq::VideoEncoderKind::kAuto{}};
+auto catalog = ok(moq::MediaCatalogProducer::init(broadcast));
+auto video = ok(moq::VideoProducer::init(catalog, {{moq::VideoPixelFormat::kRgba, 1280, 720, {30000, 1001}}, output, "camera", nullptr}));
 ok(video->write({0, rgba}));
-moq::Route route;
+moq::AnnounceRoute route;
 route.epoch = moq::mint_epoch(); // a fresh epoch per run
 ok(broadcast->announce(route));
 ok(broadcast->close());    // keep the producer alive while publishing, then close explicitly
 ```
+
+Raw video encoders take an exact numerator/denominator frame rate, such as 30000/1001. Producer options hold input, codec settings, track naming, and optional session bandwidth ownership; standalone encoders take only codec settings.
 
 ## Futures
 
@@ -183,13 +187,43 @@ future completed, which is the executor thread.
 
 ## Disabled renditions
 
-Audio and video convenience decoders reject a catalog configuration with `enabled: false`. Select an enabled rendition from the latest catalog before opening a decoder.
+Audio and video convenience decoders reject a catalog configuration with `enabled: false`. Select an enabled rendition from the latest catalog before opening a decoder. Among the video renditions you can decode, prefer the highest `preference`; `0` is the default and `-1` marks a compatibility transcode.
+
+## Bandwidth estimates
+
+Hold the owned `BandwidthConsumer` returned by `session->recv_bandwidth()` to receive bandwidth estimates. `rate()` reads the current estimate in bits per second and `rate_changed()` waits for a new one. Releasing the last consumer stops PROBE; the session and stats snapshots do not request it. Client consumers survive reconnects and report no estimate while disconnected.
+
+## Compressed tracks
+
+`moq::TrackInfo::compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.
 
 ## Track demand
 
+`demand()->wanted()` is the group subscribers want, or `std::nullopt` while nobody subscribes, and `wanted_changed()` waits for it to move: start a new group once it passes your largest. Set `TrackInfo::refresh` to have a joining subscriber ask for a new group once the newest has grown past `refresh` times its first frame.
+
 Obtain a dynamic track request’s `demand()` before accepting it to watch subscribers through the handoff to its producer. The watch does not keep the track alive and ends when the track closes or the request is rejected.
 
+## Authorization
+
+On `moq-lite-07-wip` (opt in with `ClientConfig::versions`) and on moq-transport draft-17+ with the [MoQ Auth extension](/draft/moq-auth), `session->auth()->grant()` is the `Grant` the relay sent back, empty until it answers and while a client session reconnects; `grant_changed()` waits for the next one. `add(token)` presents a fresh token without reconnecting and resolves to an `AuthToken` whose grant joins the union until `cancel()`; it is presented again on every reconnect. A refusal resolves to an `Error` carrying the relay's code.
+
+## Stats
+
+`session->stats()` reports the transport counters, each a `std::optional` that is empty when the transport does not report it, plus the negotiated protocol in `version`. Connect returns a connecting session. Read `session->state()` and wait with `state_changed(state.revision)` to observe its first-dial failures and reconnects; independent watchers keep their own revisions.
+
 ## Shutdown
+
+`session->shutdown()` requests a drain immediately; `session->closed().get()` waits up to one second and reports its result.
+Application delivery requires explicitly selecting `moq-lite-07-wip` on both
+peers; older Lite versions (including default lite-06) and IETF wait only for
+transport ACKs. Finish or abort live tracks first.
+
+To end a broadcast cleanly, finish every track, then call `broadcast->finish()`.
+The returned `moq::BroadcastFinish` keeps the broadcast announced and serving the
+finished tracks for `linger_us()`, their longest max age, so a subscriber still
+catching up can drain them. `finish->wait()` resolves once the linger passes, and
+`finish->close()` closes the broadcast at once, resolving the wait.
+`broadcast->close()` stays the abrupt end.
 
 `moq::shutdown()` stops the `moq-ffi` runtime workers, then the executor.
 Pending calls resolve `Cancelled`, and every object stays safe to drop. Call
@@ -206,22 +240,26 @@ Error cases carrying a diagnostic expose it as `reason`; protocol failures expos
 rejections are their own cases, so you don't retry them. `error.to_string()`
 gives the message Rust's `Display` does, for logs; branch on the case, not the
 text. A Rust panic inside a call, or a misused future (`get()` twice), aborts
-with a message on stderr instead of throwing. A panic in a session's background
-work closes only that session.
+with a message on stderr instead of throwing. A panic in owned background work reaches the next call on that object as a task error;
+other objects keep running.
 
 A session closed for exceeding the relay's request caps reports the protocol
 kind `ProtocolKind::kTooManyRequests`. Reduce
 the simultaneous announcements or subscriptions, or ask the relay operator
 to adjust the [session limits](/bin/relay/config#session-and-peer), before
 reconnecting with the same workload.
+A session closed because its credential expired reports `ProtocolKind::kExpired`, and a request refused for an expired token is `moq::Error::kExpired`; refresh the token before retrying.
+A catalog that needs a newer moq-hang draft than this build reads is `moq::Error::kUnsupportedCatalog`; upgrade the library to read it.
 
-Check a result before reading it. With exceptions off below C++23, reading the
-value of an error is undefined, through `*result` and `value()` alike, since
-the bundled `tl::expected` has nothing to throw.
+Check a result before reading it. `moq::expected` is a bundled `tl::expected`
+at every standard, with the same members as `std::expected`. With exceptions
+off, `value()` on an error aborts with a message, while `*result` on an error
+is undefined.
 
 Everything else maps one to one onto the
-[shared feature list](/lib/#what-every-binding-can-do): each generated
-`moq::MoqFoo` is also `moq::Foo`, and each Rust method keeps its name. The
+[shared feature list](/lib/#what-every-binding-can-do): moq-ffi's `MoqFoo` is
+`moq::Foo`, and each Rust method keeps its name.
+[Layers](/lib/layers) maps each wrapped Rust layer to its `moq::` types. The
 header is the reference; every method carries its doc comment.
 
 - Source: [`cpp/moq`](https://github.com/moq-dev/moq/tree/main/cpp/moq); `just cpp check` builds, installs, and tests it locally

@@ -6,7 +6,9 @@ description: Ready-to-run tools built on MoQ
 # Applications
 
 Everything here is a binary or plugin you can run without writing code. See
-[Install](/setup/install) for packages.
+[Install](/setup/install) for packages. For a complete local session, start
+with [Quick start](/setup/); to adapt an integration, see [Examples](/setup/examples).
+Once connected, [Inspect a relay](/bin/inspect) shows what it is receiving.
 
 ## Core
 
@@ -17,7 +19,7 @@ Everything here is a binary or plugin you can run without writing code. See
 
 ## Gateways
 
-All four ship inside `moq-cli` as `moq import <gateway>` and `moq export <gateway>`.
+Each ships inside `moq-cli` as `moq import <gateway>`, and all but RTSP as `moq export <gateway>`.
 
 | Gateway | Direction |
 | --- | --- |
@@ -25,6 +27,7 @@ All four ship inside `moq-cli` as `moq import <gateway>` and `moq export <gatewa
 | [SRT](/bin/srt) | Accept SRT contribution; serve SRT to players; pull from or push to a remote SRT endpoint. |
 | [WebRTC](/bin/rtc) | WHIP ingest and WHEP playback in either HTTP role. |
 | [HLS](/bin/hls) | Serve any broadcast as HLS from the relay cache; import a remote HLS playlist. |
+| [RTSP](/bin/cli#import) | Pull an IP camera's H.264/H.265 and AAC from its own network. |
 
 ## Plugins
 

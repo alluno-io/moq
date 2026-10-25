@@ -180,11 +180,6 @@ pub enum Error {
 		composition_time_ms: i32,
 	},
 
-	/// [`timeline::Producer::resume`](crate::timeline::Producer::resume) received a checkpoint
-	/// whose record at this window index has a different sequence.
-	#[error("timeline checkpoint record at index {0} has a different sequence")]
-	TimelineCheckpoint(u64),
-
 	/// [`timeline::Producer::push`](crate::timeline::Producer::push) received a record out of order.
 	#[error("timeline record {actual} pushed where {expected} was next")]
 	TimelineSequence {
@@ -207,7 +202,16 @@ pub enum Error {
 	#[error("no timeline for track {0}")]
 	TimelineMissing(String),
 
-	/// Error from a muxer/demuxer that reports via `anyhow` (currently MPEG-TS).
+	/// A timeline frame report is timed differently from the track's earlier ones: a track is all
+	/// timed or all untimed.
+	#[error("timeline report at {0:?} does not match the track's timing")]
+	TimelineTiming(hang::timeline::Position),
+
+	/// A timeline record has no `pts` or `duration` to decode, as on an untimed track.
+	#[error("timeline record {0} is untimed")]
+	TimelineUntimed(u64),
+
+	/// Error from a muxer/demuxer that reports via `anyhow` (currently the MPEG-TS demuxer).
 	/// Boxed in an `Arc` so the enum stays `Clone` (`anyhow::Error` is not).
 	#[error("{0}")]
 	Other(std::sync::Arc<anyhow::Error>),
@@ -242,6 +246,20 @@ pub enum Error {
 	#[error("broadcast reference escapes the root: {0}")]
 	EscapingBroadcast(String),
 
+	/// A reference's `epoch` names another publisher instance than the one serving its broadcast.
+	///
+	/// The served instance is the one the source resolved first for that path, so a later
+	/// reference cannot move it; the reference fails instead of reading other content.
+	#[error("broadcast {path} serves epoch {actual}, not the referenced {expected}")]
+	EpochMismatch {
+		/// The broadcast's path, relative to the origin root.
+		path: String,
+		/// The epoch the reference names.
+		expected: moq_net::Epoch,
+		/// The epoch the resolved broadcast serves.
+		actual: moq_net::Epoch,
+	},
+
 	/// A rendition tried to lower jitter already advertised to subscribers.
 	#[error("catalog jitter cannot decrease for a published rendition")]
 	JitterDecreased,
@@ -254,9 +272,69 @@ pub enum Error {
 	#[error("capture time is outside the broadcast clock")]
 	InvalidCapture,
 
+	/// A transport stream passthrough was fed packets other than 188 bytes.
+	///
+	/// A 192-byte source (BDAV M2TS, a four-byte timestamp before each packet) or a 204-byte one
+	/// (Reed-Solomon parity after each) is refused rather than reframed, since dropping those bytes
+	/// would break the byte identity passthrough exists for.
+	#[error("transport stream uses {0}-byte packets; passthrough carries 188-byte packets only")]
+	TsPacketSize(usize),
+
+	/// The clock PID's PCR went backwards without `discontinuity_indicator`.
+	///
+	/// The source broke its own timebase without saying so, which leaves no timestamp that both
+	/// follows the PCR and stays on one timeline.
+	#[error("PCR on PID {pid} went back from {from} to {to} without a discontinuity_indicator")]
+	PcrRewind {
+		/// The clock PID.
+		pid: u16,
+		/// The previous PCR, raw 27 MHz ticks.
+		from: u64,
+		/// The PCR that stepped back, raw 27 MHz ticks.
+		to: u64,
+	},
+
+	/// The clock PID's PCR went backwards with `discontinuity_indicator`: the source restarted.
+	///
+	/// What follows is new content, which belongs in a new broadcast rather than on a timeline that
+	/// steps back, so the import ends here.
+	#[error("PCR on PID {pid} restarted from {from} back to {to}; a restart needs a new broadcast")]
+	PcrRestart {
+		/// The clock PID.
+		pid: u16,
+		/// The previous PCR, raw 27 MHz ticks.
+		from: u64,
+		/// The flagged PCR, raw 27 MHz ticks.
+		to: u64,
+	},
+
+	/// The clock PID carried no PCR across more bytes than a group may hold.
+	///
+	/// Those bytes cannot be timed, and holding them for a PCR that may never come is unbounded.
+	#[error("no PCR on PID {pid} for {bytes} bytes")]
+	PcrGap {
+		/// The clock PID.
+		pid: u16,
+		/// The bytes waiting on a PCR.
+		bytes: u64,
+	},
+
 	/// Another publisher instance replaced a followed broadcast, and stitching was off.
 	#[error("another publisher instance replaced broadcast `{0}`; enable stitch to follow it as a program switch")]
 	Replaced(String),
+
+	/// A rendition moved to a track whose media goes back before what the export already read for it.
+	#[error(
+		"rendition {rendition} moved to a track that goes back in time: a group starts at {start:?}, not past {read:?}"
+	)]
+	RenditionRewound {
+		/// The rendition's ID in the catalog.
+		rendition: String,
+		/// Where the new track's group starts.
+		start: std::time::Duration,
+		/// The latest media the export read from the rendition's previous track.
+		read: std::time::Duration,
+	},
 }
 
 impl Error {

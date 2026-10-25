@@ -31,18 +31,18 @@ broadcast, which #4510 replaced with these tracks (the relay's own
 
 Guidance, to be settled while building:
 
-- Inputs are the snapshot types from [the schema](/quest/m2/stats/schema.md):
+- Inputs are the snapshot types from [the schema](/doc/concept/stats.md#media-reports):
   `transport` (rtt, rate, cumulative bytes and packets lost, sample age) and
   the per-rendition counters. Decided in the 2026-10-10 audit: rendition
   rates and transport loss use deltas of cumulative counters over the two
   snapshots' interval. RTT and estimated rate remain gauges read as reported.
   A reset is detected by a counter decreasing or by the
   reporting broadcast's path or epoch changing
-  ([Broadcast epochs](/quest/m0/broadcast-epoch/README.md)); the sample then
+  ([Broadcasts](/doc/concept/stats.md#broadcasts)); the sample then
   starts over rather than going negative.
 - Container sections such as `mpegts` are excluded from the verdict; their
   counters are read by their own consumers
-  ([TS health counters](/quest/m2/ts-health-stats.md)).
+  ([MPEG-TS sections](/doc/concept/stats.md#mpeg-ts-sections)).
 - Thresholds are a documented default the caller can override, not policy
   baked into the types. Start from a few measured cases rather than guesses.
 - A verdict carries its evidence: which inputs drove it and who observed them.
@@ -61,12 +61,6 @@ change, from shared fixtures in both languages. Docs: the media section of `doc/
 
 Public API: new health types in `hang` and `@moq/hang`. Wire: none.
 
-## Required
-
-- [Schema](/quest/m2/stats/schema.md) - the snapshot types the model reads
-
 ## Related
 
-- [QoS](/quest/m1/qos/README.md) - the relay's delivery counters, which a combined downstream verdict also reads
-- [Broadcast epochs](/quest/m0/broadcast-epoch/README.md) - a new epoch is one way a counter reset shows
-- [TS health counters](/quest/m2/ts-health-stats.md) - container counters kept out of the verdict
+- [QoS](/quest/m2/qos/README.md) - the relay's delivery counters, which a combined downstream verdict also reads

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Run `just rs check|check-test|fix|test` on the crates a diff touches, plus
+# Run `just rs check|check-test|lint|fix|test` on the crates a diff touches, plus
 # their dependents. `platform` is the Windows and macOS compile.
 #
-# Usage: sh/rs/select.sh check|check-test|fix|test|platform LISTFILE|--all
+# Usage: sh/rs/select.sh check|check-test|lint|fix|test|platform|uring LISTFILE|--all
 #
 # LISTFILE holds the changed paths, one per line. `--all` is the whole
 # workspace, as is a change to anything every crate is built or tested by.
 set -euo pipefail
 
-usage="usage: sh/rs/select.sh check|check-test|fix|test|platform LISTFILE|--all"
+usage="usage: sh/rs/select.sh check|check-test|lint|fix|test|platform|uring LISTFILE|--all"
 action=${1:?$usage}
 list=${2:?$usage}
 
@@ -16,12 +16,16 @@ cd "$(git rev-parse --show-toplevel)"
 
 # Print `ALL`, nothing (no crate affected), or cargo package ids.
 select_packages() {
+    if [[ "$action" == uring && -f "$list" ]] && grep -qE '^(justfile|flake\.(nix|lock)|sh/changed\.sh|\.github/workflows/uring\.yml|\.cargo/.*|\.github/actions/.*)$' "$list"; then
+        echo ALL
+        return
+    fi
     if [[ "$list" == --all ]] || grep -qE '^(Cargo\.(toml|lock)|rust-toolchain\.toml|rs/justfile|sh/rs/(select|platform|nextest)\.sh|\.config/nextest\.toml)$' "$list"; then
         echo ALL
         return
     fi
 
-    grep -q '^rs/' "$list" || return 0
+    grep -qE '^(rs|demo)/' "$list" || return 0
 
     # `--no-deps` keeps this to workspace members and off the network.
     local metadata
@@ -29,21 +33,32 @@ select_packages() {
 
     # A seed is the first path segment under `rs/`, so only a crate whose
     # manifest sits directly at `rs/<dir>/Cargo.toml` can be one. That drops
-    # `moq-net-fuzz` (at `rs/moq-net/fuzz`), which a moq-net diff would
-    # otherwise select as a dependent and compile libFuzzer for. The separator
-    # is normalized first so Windows paths split too.
-    metadata=$(jq '.packages |= map((.manifest_path |= gsub("\\\\"; "/")) | select(.manifest_path | split("/")[-3] == "rs"))' <<<"$metadata")
+    # the `*-fuzz` crates (at `rs/<crate>/fuzz`), which a diff to their crate would
+    # otherwise select as a dependent and compile libFuzzer for. A demo's crate
+    # sits at `demo/<demo>/<dir>/Cargo.toml` and is a seed for its directory.
+    # The separator is normalized first so Windows paths split too.
+    metadata=$(jq '.packages |= map((.manifest_path |= gsub("\\\\"; "/")) | select((.manifest_path | split("/")) as $p | $p[-3] == "rs" or $p[-4] == "demo"))' <<<"$metadata")
 
-    # A changed path is a seed only because every crate directory is named
-    # after its crate. Under-selecting checks nothing, so fall back to all.
-    if jq -e '.packages[] | select((.manifest_path | split("/")[-2]) != .name)' <<<"$metadata" >/dev/null; then
+    # A changed path under `rs/` is a seed only because every crate directory
+    # there is named after its crate. Under-selecting checks nothing, so fall
+    # back to all.
+    if jq -e '.packages[] | (.manifest_path | split("/")) as $p | select($p[-3] == "rs" and $p[-2] != .name)' <<<"$metadata" >/dev/null; then
         echo "rs: a crate directory no longer matches its crate name; selecting everything." >&2
         echo ALL
         return
     fi
 
-    local seeds edges selected
-    seeds=$(sed -n 's|^rs/\([^/]*\)/.*|\1|p' "$list" | sort -u)
+    local seeds benches edges selected
+    # A crate's `benches/` builds only its own bench targets, which no other crate can
+    # depend on and the test build never compiles, so it selects that crate alone
+    # (for its lint) rather than every dependent's tests.
+    benches=$(sed -n 's|^rs/\([^/]*\)/benches/.*|\1|p' "$list")
+    seeds=$({
+        sed -n '\|^rs/[^/]*/benches/|d; s|^rs/\([^/]*\)/.*|\1|p' "$list"
+        jq -r --rawfile list "$list" '($list | split("\n")) as $paths | .packages[]
+            | (.manifest_path | split("/")) as $p | select($p[-4] == "demo")
+            | select(any($paths[]; startswith("demo/\($p[-3])/\($p[-2])/"))) | .name' <<<"$metadata"
+    } | sort -u)
     edges=$(jq -r '.packages[] | .name as $name | .dependencies[] | "\($name) \(.name)"' <<<"$metadata")
 
     # A crate is rebuilt when anything it depends on changed, so walk the edges
@@ -63,7 +78,8 @@ select_packages() {
 			} while (grew)
 			for (name in want) if (want[name]) print name
 		}
-	' <<<"$edges" | sort -u)
+	' <<<"$edges")
+    selected=$(printf '%s\n%s\n' "$selected" "$benches" | sed '/^$/d' | sort -u)
 
     [[ -n "$selected" ]] || return 0
 
@@ -88,27 +104,18 @@ wants() {
     [[ "$packages" == ALL ]] || grep -qwE "$1" <<<"$names"
 }
 
-# The media feature contract script is no crate, so its own diff selects
-# nothing and still has to reach the gate below.
-media_script=
-if [[ -f "$list" ]] && grep -qx 'sh/rs/media-features.sh' "$list"; then media_script=1; fi
-
 case "$packages" in
     "")
-        if [[ "$action" == check* && -n "$media_script" ]]; then
-            just rs media-features
-        else
-            echo "rs: no crates affected; skipping."
-        fi
+        echo "rs: no crates affected; skipping."
         exit 0
         ;;
     ALL) echo "rs: selecting the workspace" ;;
     *) echo "rs: selecting $names" ;;
 esac
 
-# `moq-net-fuzz` needs a nightly toolchain; only `just rs fuzz` compiles it.
+# The `*-fuzz` crates need a nightly toolchain; only `just rs fuzz` compiles them.
 if [[ "$packages" == ALL ]]; then
-    flags=(--workspace --exclude moq-net-fuzz)
+    flags=(--workspace --exclude moq-net-fuzz --exclude moq-quic-fuzz)
 else
     # Space-separated `--package <id>` pairs; ids contain no spaces.
     # shellcheck disable=SC2206
@@ -116,26 +123,24 @@ else
 fi
 
 case "$action" in
-    check | check-test)
+    uring)
+        if wants '(moq-uring|moq-relay)'; then just rs uring; fi
+        ;;
+    check | check-test | lint)
         just rs "$action" "${flags[@]}"
-        # Workspace feature unification hides a broken moq-tokio feature set
-        # whenever any dependent enables a transport.
-        if wants moq-tokio; then just rs tokio-features; fi
         # moq-wasm's crate root is `#![cfg(target_arch = "wasm32")]`, so only a
         # wasm32 pass checks it. moq-mux, moq-ffi, and moq-clock ride along in that pass, and
         # nothing depends on moq-ffi, so each has to reach it on its own.
         if wants '(moq-wasm|moq-mux|moq-ffi|moq-clock)'; then just rs wasm; fi
         # Device code behind the off-by-default `capture` feature. check-test
         # lints it through the test build, as for the default features.
-        if wants '(moq-video|moq-audio)'; then
-            if [[ "$action" == check-test ]]; then CARGO_BUILD_WARNINGS=deny just rs capture-test; else just rs capture; fi
+        if [[ "$action" != lint ]] && wants '(moq-video|moq-audio)'; then
+            if [[ "$action" == check-test ]]; then just rs capture-test; else just rs capture; fi
         fi
         # moq-cli's media tasks are behind `play`; only check-test runs tests.
         if [[ "$action" == check-test ]] && wants moq-cli; then just rs play; fi
         # The relay's io_uring listener, off the default feature set.
         if wants moq-relay; then just rs uring-check; fi
-        # Each media feature shape compiles on its own, about two minutes.
-        if [[ -n "$media_script" ]] || wants '(moq-video|moq-audio|moq-transcode)'; then just rs media-features; fi
         ;;
     fix)
         just rs fix "${flags[@]}"
@@ -145,10 +150,21 @@ case "$action" in
         # A selection can hold nothing testable, and
         # nextest exits 4 on that; the whole workspace finding none really is wrong.
         [[ "$packages" == ALL ]] || flags+=(--no-tests=pass)
-        just rs test "${flags[@]}"
-        # Tests behind the off-by-default `capture` and `play` features.
-        if wants '(moq-video|moq-audio)'; then just rs capture-test; fi
-        if wants moq-cli; then just rs play; fi
+        # CI keeps Cargo's per-crate build timings, which check.yml uploads.
+        timings=()
+        [[ "${GITHUB_ACTIONS:-}" != true ]] || timings=(--timings)
+        # The tests behind the off-by-default device features join this build
+        # rather than compiling the workspace again per feature set. Those
+        # features only add code, so every test still runs. Cargo rejects a
+        # feature of a package outside the selection, hence the explicit picks.
+        features=()
+        if wants '(moq-video|moq-audio)'; then
+            [[ "$packages" == ALL ]] || flags+=(--package moq-video --package moq-audio)
+            features+=(moq-video/capture moq-audio/capture moq-audio/playback)
+        fi
+        if wants moq-cli; then features+=(moq-cli/play moq-cli/openh264); fi
+        if ((${#features[@]})); then flags+=(--features "${features[*]}"); fi
+        just rs test "${flags[@]}" ${timings[@]+"${timings[@]}"}
         ;;
     platform)
         # moq-gst links GStreamer via pkg-config, which the runners don't have.

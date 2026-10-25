@@ -1,14 +1,15 @@
 import { expect, test } from "bun:test";
 import { Unsupported } from "../auth.ts";
-import { SessionError } from "../error.ts";
+import { SessionCode, type SessionError, StreamCode, type StreamError } from "../error.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
-import { AuthError, AuthMessage, AuthOk, fromSetup, intoSetup } from "./auth.ts";
-import { SetupOption, SetupOptions } from "./parameters.ts";
+import { AuthError, AuthMessage, AuthOk } from "./auth.ts";
+import { fromSetup, intoSetup } from "./auth_setup.ts";
+import { SetupOption, SetupOptions } from "./setup_options.ts";
 import { Version } from "./version.ts";
 
-function patterns(...prefixes: string[]): Path.Patterns {
-	return new Path.Patterns(prefixes.map((prefix) => Path.Pattern.subtree(prefix)));
+function patterns(...texts: string[]): Path.Patterns {
+	return new Path.Patterns(texts.map((text) => Path.Pattern.parse(text)));
 }
 
 /** The bytes a write produces. */
@@ -65,50 +66,37 @@ test("AUTH round-trips its request id and token", async () => {
 	expect(new TextDecoder().decode(msg.token)).toBe("jwt");
 });
 
-test("AUTH_OK carries prefixes as namespace tuples", async () => {
-	const ok = new AuthOk(patterns("room/alice"), patterns(), undefined);
+test("AUTH_OK carries each pattern as its canonical text", async () => {
+	// The exact bytes `rs/moq-net/src/ietf/auth.rs` checks, so both encoders agree.
+	const ok = new AuthOk(patterns("room/*/cam", "ch1"), patterns(""), undefined);
 	const wire = await bytes((w) => ok.encode(w, Version.DRAFT_17));
-	// Type, 16-bit length, then: one prefix of two fields, no subscribe prefixes, never expires.
-	expect([...wire.slice(-15)]).toEqual([
-		0x01,
+	// Type, 16-bit length, then: two publish patterns in canonical order, the empty
+	// subscribe pattern, never expires.
+	expect([...wire.slice(-19)]).toEqual([
 		0x02,
-		0x04,
-		...new TextEncoder().encode("room"),
-		0x05,
-		...new TextEncoder().encode("alice"),
+		0x03,
+		...new TextEncoder().encode("ch1"),
+		0x0a,
+		...new TextEncoder().encode("room/*/cam"),
+		0x01,
 		0x00,
 		0x00,
 	]);
 
-	const r = await afterType((w) => new AuthOk(patterns(""), patterns("room"), 60_000).encode(w, Version.DRAFT_17));
+	// Literals and wildcards travel exactly, never widened to a prefix.
+	const grant = new AuthOk(patterns("**"), patterns("live/*", "lobby/cam-*.hang", "ch1"), 60_000);
+	const r = await afterType((w) => grant.encode(w, Version.DRAFT_17));
 	const got = await AuthOk.decode(r, Version.DRAFT_17);
-	// The empty prefix grants everything; the empty list grants nothing.
-	expect(got.publish.equals(new Path.Patterns([Path.Pattern.all()]))).toBe(true);
-	expect(got.subscribe.equals(patterns("room"))).toBe(true);
+	expect(got.publish.equals(grant.publish)).toBe(true);
+	expect(got.subscribe.equals(grant.subscribe)).toBe(true);
 	expect(got.expires).toBe(60_000);
 });
 
-test("a grant the prefix wire cannot express is refused before anything is written", async () => {
-	for (const union of [["room/alice"], ["room/*/cam"], ["room/**", "lobby"]]) {
-		const narrow = new AuthOk(new Path.Patterns(union.map((p) => Path.Pattern.parse(p))), patterns());
-		let written = 0;
-		const writer = new Writer(
-			new WritableStream({
-				write(chunk) {
-					written += chunk.byteLength;
-				},
-			}),
-			Version.DRAFT_17,
-		);
-		await expect(narrow.encode(writer, Version.DRAFT_17)).rejects.toBeInstanceOf(Unsupported);
-		writer.close();
-		await writer.closed;
-		expect(written).toBe(0);
-	}
-});
-
 test("a grant too large for one message is refused before anything is written", async () => {
-	const huge = new AuthOk(patterns(...Array.from({ length: 20 }, (_, i) => `${i}${"x".repeat(4000)}`)), patterns());
+	const huge = new AuthOk(
+		patterns(...Array.from({ length: 20 }, (_, i) => `${i}${"x".repeat(4000)}/**`)),
+		patterns(),
+	);
 	let written = 0;
 	const writer = new Writer(
 		new WritableStream({
@@ -124,10 +112,16 @@ test("a grant too large for one message is refused before anything is written", 
 	expect(written).toBe(0);
 });
 
-test("NOT_SUPPORTED is unsupported, every other code a refusal", async () => {
-	const r = await afterType((w) => new AuthError(0x3, "prefixes only").encode(w, Version.DRAFT_17));
+test("AUTH_ERROR preserves actionable refusal kinds", async () => {
+	const r = await afterType((w) => new AuthError(0x3, "too large").encode(w, Version.DRAFT_17));
 	expect((await AuthError.decode(r, Version.DRAFT_17)).toError()).toBeInstanceOf(Unsupported);
-	expect(new AuthError(0x1, "bad").toError()).toBeInstanceOf(SessionError);
+	const expired = new AuthError(0x5, "expired").toError() as SessionError;
+	expect(expired.code).toBe(SessionCode.Expired);
+	const unauthorized = new AuthError(0x1, "bad").toError() as SessionError;
+	expect(unauthorized.code).toBe(SessionCode.Unauthorized);
+	// Past the acceptor's GOAWAY: the request is refused, not the token.
+	const goingAway = new AuthError(0x6, "going away").toError() as StreamError;
+	expect(goingAway.code).toBe(StreamCode.GoingAway);
 });
 
 test("drafts before 17 carry no AUTH", async () => {

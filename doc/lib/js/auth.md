@@ -12,9 +12,12 @@ The TypeScript twin of [`moq-auth`](/lib/rs/moq-auth). `RequestSchema` and
 what an auth server answers, so a Worker or a Node server implements the
 contract with one import. It also generates keys, signs and verifies JWTs, and
 checks a connection path against a token's claims exactly as `moq auth serve`
-does. Tokens are interchangeable with the Rust side. Grants and claims are
+does. A grant can label its session's stats independently of its authorization
+root. Tokens are interchangeable with the Rust side. Grants and claims are
 [`Pattern`](https://www.npmjs.com/package/@moq/pattern) unions: `foo` is one
-broadcast, `foo/**` is a subtree, `**` is everything.
+broadcast, `foo/**` is a subtree, `**` is everything. Parsed claim and grant roles are
+pattern string arrays; `authorize` returns reduced `Patterns` for each role.
+Object roles, including bitrate caps, are refused during parsing.
 
 ```bash
 bun add @moq/auth

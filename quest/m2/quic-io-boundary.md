@@ -11,9 +11,10 @@ those buffers with the ring is
 ## Plan
 
 Decided in the 2026-09-30 plan: commit to the redesign, but start only after
-a noq or `moq-quic` profile shows where ingress and egress spend their time.
-No current profile is from noq, and every other copy is removed without an
-API change by [Remove moq-uring copies](/quest/m2/perf/uring-copies.md).
+a `moq-quic` profile shows where ingress and egress spend their time
+(`just bench-profile cpu` on `io-uring-workers`).
+No current profile is from `moq-quic`, and moq-uring already avoids every
+other copy the current API allows.
 
 Candidates, to be ranked by the profile:
 
@@ -24,6 +25,13 @@ Candidates, to be ranked by the profile:
   relying on `Vec` capacity.
 - One `handle` call takes a whole GRO batch.
 
+Received datagrams and leased stream bytes are copied out of their receive
+buffer, since a slice keeps the whole batch alive while the receive budgets
+charge only its bytes. A frame that references a ring slot must keep that
+bound. Per-packet ownership could let large frames skip the copy, which costs
+up to 70% of `wire_decode` (16 datagrams a packet) and 20% of `receive_lease`
+under the benches' plaintext crypto.
+
 Decided 2026-10-08: `SENDMSG_ZC`
 ([#3201](/quest/m3/3201-moq-uring-use-sendmsg-zc-for-large-udp-gso-trains.md))
 and registered TX buffers
@@ -33,12 +41,10 @@ settled once; registering buffers stays with #3204, which measures whether
 it pays. Report relay CPU per Gbps before and after on
 the same workloads.
 
+## Required
+
+- [Profile the io_uring workers](/quest/m2/perf/uring-profile.md) - the ring profile that ranks the candidates
+
 ## Related
 
 - [Relay egress profile](/quest/m2/quic-egress-profile.md) - its send-buffer pool lever touches the same `SendBuffer` seam
-
-## Required
-
-- [Hard fork](/quest/m1/quic/fork/README.md) - the redesign breaks `moq-quic`'s API
-- [Relay profiling recipe](/quest/m2/perf/lock-profile.md) - the captures that rank the candidates
-- [Remove moq-uring copies](/quest/m2/perf/uring-copies.md) - the cheap wins land first, so the profile shows what is left

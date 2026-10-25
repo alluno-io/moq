@@ -1,8 +1,8 @@
 //! The SETUP exchange, the extensions a side offers in it, and the credential a peer may
 //! present in it.
 //!
-//! Only [`Extensions`] and [`Token`] are public; the SETUP messages themselves are wire
-//! internals.
+//! Only [`Extensions`], [`Token`], and [`Role`] are public; the SETUP messages themselves
+//! are wire internals.
 
 use bytes::Bytes;
 
@@ -11,6 +11,9 @@ use crate::{
 	coding::{self, Decode, DecodeError, Decoder, Encode, EncodeError, Encoder},
 	ietf, lite,
 };
+
+/// The session direction a client advertises in its SETUP (moq-lite-05+).
+pub use crate::lite::Role;
 
 // SETUP only carries negotiation parameters. Bound it independently of control messages.
 pub(crate) const MAX_SETUP_SIZE: usize = u16::MAX as usize;
@@ -21,10 +24,57 @@ const SERVER_SETUP: u8 = 0x21;
 /// Draft-17 unified SETUP message type (varint 0x2F00)
 pub(crate) const SETUP_V17: u64 = 0x2F00;
 
-/// The moq-transport Setup Options this side offers, each on by default.
+/// Decode a SETUP Implementation value, refusing one that is not UTF-8.
+pub(crate) fn decode_implementation(bytes: Option<&[u8]>) -> Result<Option<String>, crate::DecodeError> {
+	bytes
+		.map(|bytes| {
+			std::str::from_utf8(bytes)
+				.map(str::to_owned)
+				.map_err(|_| crate::DecodeError::InvalidValue)
+		})
+		.transpose()
+}
+
+/// The implementation the peer advertised in SETUP, published once that SETUP is read.
+///
+/// `None` until then. The protocol holds a clone for the life of its driver, so a
+/// dropped driver closes the channel; `Session::peer_implementation` also watches the
+/// session's end, for a finished driver the caller keeps.
+#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+#[derive(Clone, Default)]
+pub(crate) struct PeerImplementation(kio::Producer<Option<Option<String>>>);
+
+#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+impl PeerImplementation {
+	/// A slot for a SETUP read before the session started, or a version that carries none.
+	pub fn known(value: Option<String>) -> Self {
+		Self(kio::Producer::new(Some(value)))
+	}
+
+	/// Record what the peer's SETUP advertised. The first SETUP wins.
+	pub fn set(&self, value: Option<String>) {
+		if let Ok(mut slot) = self.0.write()
+			&& slot.is_none()
+		{
+			*slot = Some(value);
+		}
+	}
+
+	pub(crate) fn consume(&self) -> kio::Consumer<Option<Option<String>>> {
+		self.0.consume()
+	}
+}
+
+#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+/// Our Implementation value to send, or `None` when the caller configured it empty.
+pub(crate) fn implementation(value: &str) -> Option<String> {
+	(!value.is_empty()).then(|| value.to_owned())
+}
+
+/// The SETUP extensions this side offers.
 ///
 /// Turning one off connects as a peer that does not speak that extension. moq-lite carries
-/// both in its core, so this only changes moq-transport sessions.
+/// auth, solicit, and epoch in its core, so those only change moq-transport sessions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -34,6 +84,12 @@ pub struct Extensions {
 	/// The MoQ Solicit extension: the peer answers our SUBSCRIBE_NAMESPACE rather than
 	/// announcing unasked.
 	pub solicit: bool,
+	/// The MoQ Epoch extension: announcements and requests carry the publisher's
+	/// [`Epoch`](crate::Epoch), as moq-lite 07 does (draft-17+).
+	pub epoch: bool,
+	/// The MoQ IETF extension, off by default: a moq-lite 07 hop between relays carries the
+	/// moq-transport object state a relay preserves, such as Object IDs and properties.
+	pub ietf: bool,
 }
 
 impl Default for Extensions {
@@ -41,6 +97,8 @@ impl Default for Extensions {
 		Self {
 			auth: true,
 			solicit: true,
+			epoch: true,
+			ietf: false,
 		}
 	}
 }
@@ -81,6 +139,7 @@ impl Setup {
 
 impl Encode<Version> for Setup {
 	fn encode(&self, w: &mut Encoder<'_>, v: Version) -> Result<(), EncodeError> {
+		w.control = Some(crate::stats::Control::Session);
 		Self::check_version(v);
 		w.varint(SETUP_V17)?;
 		let prefix = w.prefix_u16();
@@ -91,6 +150,7 @@ impl Encode<Version> for Setup {
 
 impl Decode<Version> for Setup {
 	fn decode(r: &mut Decoder<'_>, v: Version) -> Result<Self, DecodeError> {
+		r.control = Some(crate::stats::Control::Session);
 		Self::check_version(v);
 		let kind = r.varint()?;
 		if kind != SETUP_V17 {
@@ -156,6 +216,7 @@ impl Client {
 impl Decode<Version> for Client {
 	/// Decode a client setup message (draft-14 through draft-16 only).
 	fn decode(r: &mut Decoder<'_>, v: Version) -> Result<Self, DecodeError> {
+		r.control = Some(crate::stats::Control::Session);
 		let kind = r.u8()?;
 		if kind != CLIENT_SETUP {
 			return Err(DecodeError::InvalidValue);
@@ -184,6 +245,7 @@ impl Decode<Version> for Client {
 impl Encode<Version> for Client {
 	/// Encode a client setup message (draft-14 through draft-16 only).
 	fn encode(&self, w: &mut Encoder<'_>, v: Version) -> Result<(), EncodeError> {
+		w.control = Some(crate::stats::Control::Session);
 		w.u8(CLIENT_SETUP);
 		let prefix = prefix_body(w, v)?;
 		self.encode_inner(w, v)?;
@@ -252,6 +314,7 @@ impl Server {
 impl Encode<Version> for Server {
 	/// Encode a server setup message (draft-14 through draft-16 only).
 	fn encode(&self, w: &mut Encoder<'_>, v: Version) -> Result<(), EncodeError> {
+		w.control = Some(crate::stats::Control::Session);
 		w.u8(SERVER_SETUP);
 		let prefix = prefix_body(w, v)?;
 		self.encode_inner(w, v)?;
@@ -262,6 +325,7 @@ impl Encode<Version> for Server {
 impl Decode<Version> for Server {
 	/// Decode a server setup message (draft-14 through draft-16 only).
 	fn decode(r: &mut Decoder<'_>, v: Version) -> Result<Self, DecodeError> {
+		r.control = Some(crate::stats::Control::Session);
 		let kind = r.u8()?;
 		if kind != SERVER_SETUP {
 			return Err(DecodeError::InvalidValue);

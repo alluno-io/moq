@@ -19,6 +19,7 @@ categories = ["multimedia", "network-programming", "web-programming"]
 bench = ["moq-net/fuzz"]
 
 [dependencies]
+moq-clock = { workspace = true }
 moq-json = { workspace = true }
 moq-net = { workspace = true }
 serde = { workspace = true }
@@ -45,3 +46,6 @@ harness = false
 name = "producer_tick"
 harness = false
 required-features = ["bench"]
+
+[lints]
+workspace = true

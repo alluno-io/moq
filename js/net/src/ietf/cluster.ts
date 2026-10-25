@@ -26,10 +26,10 @@
 
 import { ProtocolViolation, reason } from "../error.ts";
 import { type Hop, HopSchema, MAX_HOPS, UNKNOWN_HOP } from "../hop.ts";
-import type { Reader } from "../stream.ts";
 import * as Varint from "../varint.ts";
-import { Parameters, SetupOption, type SetupOptions } from "./parameters.ts";
-import { MalformedAuthToken } from "./token.ts";
+// Type-only: SETUP loads eagerly and must not pull in the message parameter codec.
+import type { Parameters } from "./parameters.ts";
+import { SetupOption, type SetupOptions } from "./setup_options.ts";
 import { type IetfVersion, Version } from "./version.ts";
 
 /**
@@ -162,31 +162,26 @@ export function loops(advert: Advert, self: Hop): boolean {
 }
 
 /**
- * Write an advertisement's parameters, ready to encode onto the wire.
+ * Write an advertisement's parameters into `params`, ready to encode onto the wire.
  *
  * @internal
  */
-export function intoParams(advert: Advert): Parameters {
-	const params = new Parameters();
+export function intoParams(advert: Advert, params: Parameters) {
 	params.hopPath = encodeHops(advert.hops);
 
 	// Absent means 0, so a free path sends nothing.
 	if (advert.cost !== 0n) params.routeCost = advert.cost;
-
-	return params;
 }
 
 /**
- * Write a REQUEST_UPDATE's parameters: only what changed, and a cost of 0 explicitly,
- * since an omitted parameter keeps its value.
+ * Write a REQUEST_UPDATE's parameters into `params`: only what changed, and a cost of 0
+ * explicitly, since an omitted parameter keeps its value.
  *
  * @internal
  */
-export function updateIntoParams(update: Update): Parameters {
-	const params = new Parameters();
+export function updateIntoParams(update: Update, params: Parameters) {
 	if (update.hops !== undefined) params.hopPath = encodeHops(update.hops);
 	if (update.cost !== undefined) params.routeCost = update.cost;
-	return params;
 }
 
 /** Write a HOP_PATH value: the entries fill it with no count of their own, framed by the
@@ -202,33 +197,6 @@ function encodeHops(hops: Hop[]): Uint8Array {
 		offset += hop.length;
 	}
 	return value;
-}
-
-/**
- * Read the parameters a negotiated session puts on every advertisement, checked against
- * the list of the message that carries them (PUBLISH_NAMESPACE also allows a token).
- *
- * The parameter block is mandatory there, so a message that ends before it (the base form)
- * or one whose block does not parse is the peer's violation, same as a block that parses but
- * carries no HOP_PATH.
- *
- * @internal
- */
-export async function decodeParams(
-	r: Reader,
-	version: IetfVersion,
-	message: "namespace" | "publish-namespace",
-): Promise<Advert> {
-	let params: Parameters;
-	try {
-		params = await Parameters.decode(r, version, message);
-	} catch (err) {
-		// Keep a violation's own code, such as a request token's, and a refusal of the request alone.
-		if (err instanceof ProtocolViolation || err instanceof MalformedAuthToken) throw err;
-		throw new ProtocolViolation(reason(err), { cause: err });
-	}
-
-	return fromParams(params);
 }
 
 /**

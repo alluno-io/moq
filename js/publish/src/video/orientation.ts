@@ -1,8 +1,9 @@
+import { Milli, Nano } from "@moq/clock";
 import type { Effect, Signal } from "@moq/signals";
 import type { StreamTrack } from "./types";
 
 const SIZE = 16;
-const PERIOD = 1000;
+const PERIOD = Nano.fromMilli(Milli(1000));
 const MARGIN = 0.5;
 const FLOOR = 4;
 const TURNS = [0, 90, 180, 270] as const;
@@ -17,7 +18,7 @@ export function reportsRotation(): boolean {
  * a camera's frames only when painting them and leaves `VideoFrame.rotation` out (WebKit). Compares a
  * frame taken off a `<video>` of the track with the same `<video>` painted, about once a second.
  */
-export function watchRotation(effect: Effect, track: StreamTrack, rotation: Signal<number>): void {
+export function watchRotation(effect: Effect, track: StreamTrack, rotation: Signal<number | undefined>): void {
 	if (typeof document === "undefined") return;
 
 	const canvas = document.createElement("canvas");

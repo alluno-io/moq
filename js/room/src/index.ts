@@ -11,12 +11,10 @@
  * @module
  */
 
-export * as Hang from "@moq/hang";
-export * as Net from "@moq/net";
-export * as Publish from "@moq/publish";
-export * as Signals from "@moq/signals";
-export * as Watch from "@moq/watch";
+/** Re-export of {@link https://jsr.io/@moq/clock | @moq/clock}, the time units this package's signatures take. */
+export * as Clock from "@moq/clock";
 
+/** Chat messages exchanged in the room. */
 export * as Chat from "./chat.ts";
 export { Local, type LocalProps } from "./local.ts";
 export {

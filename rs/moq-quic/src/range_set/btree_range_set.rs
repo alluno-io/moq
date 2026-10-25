@@ -100,8 +100,7 @@ impl RangeSet {
             .map(|(&x, &y)| (x, y))
     }
 
-    #[cfg(test)]
-    pub(super) fn remove(&mut self, x: Range<u64>) -> bool {
+    pub(crate) fn remove(&mut self, x: Range<u64>) -> bool {
         if x.is_empty() {
             return false;
         }
@@ -339,7 +338,10 @@ impl Drop for Replace<'_> {
 /// Tests which apply for all implementations can be found in the `tests.rs` module
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::single_range_in_vec_init)] // https://github.com/rust-lang/rust-clippy/issues/11086
+    #![expect(
+        clippy::single_range_in_vec_init,
+        reason = "a false positive on a list of one range: https://github.com/rust-lang/rust-clippy/issues/11086"
+    )]
     use super::*;
 
     #[test]

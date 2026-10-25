@@ -1,8 +1,9 @@
+import { Milli } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
-import * as Moq from "@moq/net";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
 
+/** What the viewer wants from the audio rendition. */
 export type Target = {
 	// Optional manual override for the selected rendition name.
 	name?: string;
@@ -15,6 +16,7 @@ export type Target = {
  */
 export type Supported = (config: Catalog.AudioConfig) => Promise<boolean>;
 
+/** Signals the source reads. */
 export type SourceInput = {
 	broadcast: Getter<Broadcast | undefined>;
 
@@ -33,7 +35,7 @@ type SourceOutput = {
 	config: Signal<Catalog.AudioConfig | undefined>;
 
 	// The jitter the selected rendition advertises (ms): a floor on the decoder's playout target.
-	jitter: Signal<Moq.Time.Milli | undefined>;
+	jitter: Signal<Milli | undefined>;
 };
 
 /**
@@ -41,6 +43,7 @@ type SourceOutput = {
  * for audio playback. The Decoder consumes whichever rendition it picks.
  */
 export class Source {
+	/** The wired inputs, read-only. */
 	readonly in: Readonlys<SourceInput>;
 
 	readonly #out: SourceOutput = {
@@ -48,9 +51,13 @@ export class Source {
 		available: new Signal<Record<string, Catalog.AudioConfig>>({}),
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.AudioConfig | undefined>(undefined),
-		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
+		jitter: new Signal<Milli | undefined>(undefined),
 	};
+	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
+	#pending = new Signal(false);
+	/** Whether rendition support is still being resolved. @internal */
+	readonly pending: Getter<boolean> = this.#pending;
 
 	#signals = new Effect();
 
@@ -81,25 +88,30 @@ export class Source {
 		const supported = effect.get(this.in.supported);
 		if (!supported) return;
 
+		effect.set(this.#pending, true, false);
 		effect.spawn(async () => {
-			const available: Record<string, Catalog.AudioConfig> = {};
+			try {
+				const available: Record<string, Catalog.AudioConfig> = {};
 
-			for (const [name, config] of Object.entries(renditions)) {
-				// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-				// waits for the tasks it spawned, so an unraced probe would hold the next run shut.
-				const isSupported = await effect.race(supported(config));
+				for (const [name, config] of Object.entries(renditions)) {
+					// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
+					// waits for the tasks it spawned, so an unraced probe would hold the next run shut.
+					const isSupported = await effect.race(supported(config));
 
-				// Torn down: stop probing and publish nothing, since the rerun redoes this.
-				if (effect.abort.aborted) return;
+					// Torn down: stop probing and publish nothing, since the rerun redoes this.
+					if (effect.abort.aborted) return;
 
-				if (isSupported) available[name] = config;
+					if (isSupported) available[name] = config;
+				}
+
+				if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
+					console.warn("no supported audio renditions found:", renditions);
+				}
+
+				this.#out.available.set(available);
+			} finally {
+				this.#pending.set(false);
 			}
-
-			if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
-				console.warn("no supported audio renditions found:", renditions);
-			}
-
-			this.#out.available.set(available);
 		});
 	}
 
@@ -127,7 +139,7 @@ export class Source {
 		effect.set(this.#out.config, selected.config);
 
 		const jitter = selected.config.jitter;
-		effect.set(this.#out.jitter, jitter !== undefined ? Moq.Time.Milli(jitter) : undefined);
+		effect.set(this.#out.jitter, jitter !== undefined ? Milli(jitter) : undefined);
 	}
 
 	/**
@@ -160,6 +172,7 @@ export class Source {
 		return undefined;
 	}
 
+	/** Stop and release everything this holds. */
 	close(): void {
 		this.#signals.close();
 	}

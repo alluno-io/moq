@@ -9,7 +9,7 @@
 
 use moq_pattern::{Pattern, Patterns};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_with::{TimestampSeconds, serde_as};
+use serde_with::serde_as;
 
 /// The wire form of [`Claims`](crate::Claims).
 #[serde_with::skip_serializing_none]
@@ -27,12 +27,12 @@ pub(crate) struct Claims {
 	publish: Option<Patterns>,
 	#[serde(deserialize_with = "present")]
 	subscribe: Option<Patterns>,
-	#[serde_as(as = "Option<TimestampSeconds<i64>>")]
-	exp: Option<std::time::SystemTime>,
-	#[serde_as(as = "Option<TimestampSeconds<i64>>")]
-	iat: Option<std::time::SystemTime>,
-	#[serde_as(as = "Option<TimestampSeconds<i64>>")]
-	nbf: Option<std::time::SystemTime>,
+	#[serde_as(as = "Option<moq_clock::serde::UnixSeconds>")]
+	exp: Option<moq_clock::Wall>,
+	#[serde_as(as = "Option<moq_clock::serde::UnixSeconds>")]
+	iat: Option<moq_clock::Wall>,
+	#[serde_as(as = "Option<moq_clock::serde::UnixSeconds>")]
+	nbf: Option<moq_clock::Wall>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	peer: bool,
 	// Registered claims that narrow nothing: an issuer's bookkeeping, read and dropped.

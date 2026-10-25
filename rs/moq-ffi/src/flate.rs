@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use moq_mux::binary::Config;
-use moq_mux::catalog::hang::Extra;
 
 use crate::error::MoqError;
 use crate::producer::{MoqBroadcastProducer, MoqTrackProducer};
@@ -39,7 +38,7 @@ impl From<MoqFlateConfig> for Config {
 /// Publishes opaque payloads that consumers see as a single latest value.
 #[derive(uniffi::Object)]
 pub struct MoqFlateSnapshotProducer {
-	inner: std::sync::Mutex<Option<moq_mux::binary::Snapshot<Extra>>>,
+	inner: std::sync::Mutex<Option<moq_mux::binary::Snapshot>>,
 }
 
 #[uniffi::export]
@@ -67,10 +66,15 @@ impl MoqFlateSnapshotProducer {
 	}
 
 	/// Publish a new payload, superseding the last.
-	pub fn update(&self, payload: Vec<u8>) -> Result<(), MoqError> {
+	/// `timestamp_us` is on the broadcast clock; null publishes untimed.
+	#[uniffi::method(default(timestamp_us = None))]
+	pub fn update(&self, payload: Vec<u8>, timestamp_us: Option<u64>) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		let mut guard = self.inner.lock().unwrap();
-		guard.as_mut().ok_or(MoqError::Closed)?.update(payload)?;
+		guard.as_mut().ok_or(MoqError::Closed)?.update(moq_net::Timed {
+			value: payload.into(),
+			at: timestamp_us.map(moq_net::Timestamp::from_micros).transpose()?,
+		})?;
 		Ok(())
 	}
 
@@ -86,7 +90,7 @@ impl MoqFlateSnapshotProducer {
 /// Publishes an ordered log of opaque payloads, one per append.
 #[derive(uniffi::Object)]
 pub struct MoqFlateStreamProducer {
-	inner: std::sync::Mutex<Option<moq_mux::binary::Stream<Extra>>>,
+	inner: std::sync::Mutex<Option<moq_mux::binary::Stream>>,
 }
 
 #[uniffi::export]
@@ -114,10 +118,15 @@ impl MoqFlateStreamProducer {
 	}
 
 	/// Append one payload to the log.
-	pub fn append(&self, payload: Vec<u8>) -> Result<(), MoqError> {
+	/// `timestamp_us` is on the broadcast clock; null publishes untimed.
+	#[uniffi::method(default(timestamp_us = None))]
+	pub fn append(&self, payload: Vec<u8>, timestamp_us: Option<u64>) -> Result<(), MoqError> {
 		let _guard = crate::ffi::enter();
 		let mut guard = self.inner.lock().unwrap();
-		guard.as_mut().ok_or(MoqError::Closed)?.append(payload)?;
+		guard.as_mut().ok_or(MoqError::Closed)?.append(moq_net::Timed {
+			value: payload.into(),
+			at: timestamp_us.map(moq_net::Timestamp::from_micros).transpose()?,
+		})?;
 		Ok(())
 	}
 

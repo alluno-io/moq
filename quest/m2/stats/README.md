@@ -11,8 +11,7 @@ its own connection. A dashboard reads both the same way a publisher does. One
 shared model turns either report into a health verdict, and a bounded
 preflight run reports which media layer of a broadcast is broken. Stats and
 feedback cost nothing on the network unless someone subscribes. Not here: the
-relay's `moq-stats` layout, which this line does not change (the
-[broadcast epoch](/quest/m0/broadcast-epoch/README.md) line reshapes it);
+relay's `moq-stats` layout, which this line does not change;
 clock synchronization; any
 requirement that a client report; and feedback as an input to billing,
 authorization, or route selection.
@@ -85,12 +84,13 @@ kind.
     browser has only PROBE rtt until
     [#2733](https://github.com/moq-dev/moq/issues/2733)-style counters land.
 - **Encoding**: cumulative counters about once a second through
-  `moq_json::snapshot`, with the `.z` merge-patch sibling, produced whenever
-  stats are enabled. An unsubscribed stats track never leaves the process.
+  `moq_json::snapshot` on one track with `compress: true`, produced whenever
+  stats are enabled. The [m1 compression migration](/quest/m1/compress/migrate.md)
+  removes `.z` siblings; follow the delta policy it retains on the single track. An unsubscribed stats track never leaves the process.
   Gauges are carried but never summed.
 - **On main.** Every change is additive: optional sections on
   `#[non_exhaustive]` catalog types, and new types. The line left the
-  [QoS](/quest/m1/qos/README.md) line, which keeps the relay's moq-stats
+  [QoS](/quest/m2/qos/README.md) line, which keeps the relay's moq-stats
   changes.
 - **No `@moq/stats` package.** Media types live in `@moq/hang`, and the
   demo dashboard's relay-stats reader stays where it is.
@@ -111,10 +111,8 @@ connection view and the dashboard flow.
 
 ## Required
 
-- [Schema](/quest/m2/stats/schema.md) - hang defines the `stats` and
-  `echo` catalog sections, their snapshot types, and the draft text
-- [Rust reporters](/quest/m2/stats/rust.md) - the CLI, players, encoders, and
-  moq-mux remuxes publish stats and feedback
+- [Rust reporters](/quest/m2/stats/rust.md) - the player, encoders, and
+  gateways publish stats and feedback, as the CLI remuxes do
 - [Browser reporters](/quest/m2/stats/js.md) - `<moq-publish>` publishes
   stats and `<moq-watch>` publishes feedback
 - [Client health](/quest/m2/stats/health.md) - two snapshots become a
@@ -124,7 +122,9 @@ connection view and the dashboard flow.
 
 ## Related
 
-- [QoS](/quest/m1/qos/README.md) - the relay's delivery counters; the
+- [QoS](/quest/m2/qos/README.md) - the relay's delivery counters; the
   combined per-broadcast verdict reading both lives downstream
 - [Encoder feedback](/quest/m3/stats-encoder-feedback.md) - a Rust encoder
   adapts its bitrate to what its viewers report
+- [Latency ledger](/quest/m2/latency-ledger.md) - adds the viewer's latency
+  stages to the same stats and feedback snapshots

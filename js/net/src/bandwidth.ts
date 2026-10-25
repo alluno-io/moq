@@ -8,6 +8,7 @@
  * @module
  */
 import { Effect, type Getter, Signal } from "@moq/signals";
+import { hooks } from "./internal.ts";
 import type { Demand } from "./track.ts";
 
 /**
@@ -93,7 +94,7 @@ function wantsOf(entries: readonly Entry[]): Want[] {
 	const wants: Want[] = [];
 	for (const entry of entries) {
 		if (entry.demand.closed.peek() !== undefined) continue;
-		if (!entry.demand.used.peek()) continue;
+		if (entry.demand.wanted.peek() === undefined) continue;
 		wants.push({ id: entry.id, priority: entry.priority, max: entry.max });
 	}
 	return wants;
@@ -164,7 +165,7 @@ export class Allocator implements Handle {
 			if (this.#estimate) effect.get(this.#estimate);
 			const entries = effect.get(this.#entries);
 			for (const entry of entries) {
-				effect.get(entry.demand.used);
+				effect.get(entry.demand.wanted);
 				effect.get(entry.demand.closed);
 			}
 			this.#claimed.set(entries.some((entry) => entry.demand.closed.peek() === undefined));
@@ -200,7 +201,7 @@ export class Allocator implements Handle {
 	 * reservation that had followed it down would have already handed that room
 	 * to somebody else.
 	 *
-	 * Priority comes from the track (higher served first). A tier is filled to
+	 * Priority comes from the track's `Info.priority` (higher served first). A tier is filled to
 	 * its reservations before the next one sees a bit; within a tier the split is
 	 * max-min fair.
 	 *
@@ -222,7 +223,7 @@ export class Allocator implements Handle {
 			entries.push({
 				id,
 				demand: track,
-				priority: track.priority,
+				priority: hooks.demandPriority(track),
 				max,
 				grant,
 			});

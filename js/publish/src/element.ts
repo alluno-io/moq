@@ -25,7 +25,17 @@ function parseUrl(value: string | null): URL | undefined {
 	}
 }
 
-const OBSERVED = ["url", "name", "muted", "invisible", "source", "preview", "backend", "announce"] as const;
+// Parse the `versions` attribute: a comma-separated list, or the defaults when absent or empty.
+// The connection checks the names and reports an unsupported one on `connection.error`.
+function parseVersions(value: string | null): string[] | undefined {
+	const versions = value
+		?.split(",")
+		.map((version) => version.trim())
+		.filter((version) => version !== "");
+	return versions?.length ? versions : undefined;
+}
+
+const OBSERVED = ["url", "versions", "name", "muted", "invisible", "source", "preview", "backend", "announce"] as const;
 type Observed = (typeof OBSERVED)[number];
 
 /** The built-in capture sources selectable via the `source` attribute. */
@@ -76,8 +86,9 @@ function parsePreview(value: string | null): Preview.Mode {
 }
 
 function parseBackend(value: string | null): Preview.Backend {
-	if (value === null) return "auto";
-	if (value === "auto" || value === "webgpu" || value === "2d") return value;
+	const trimmed = value?.trim();
+	if (!trimmed) return "auto";
+	if (trimmed === "auto" || trimmed === "webgpu" || trimmed === "2d") return trimmed;
 	console.warn(`moq-publish: invalid backend="${value}", expected "auto", "webgpu", or "2d"`);
 	return "auto";
 }
@@ -87,12 +98,15 @@ function parseBackend(value: string | null): Preview.Backend {
 // There's no destructor for web components so this is the best we can do.
 const cleanup = new FinalizationRegistry<Effect>((signals) => signals.close());
 
+/** The `<moq-publish>` element: captures a source and publishes it as a broadcast. */
 export default class MoqPublish extends HTMLElement {
 	static observedAttributes = OBSERVED;
 
-	// The mutable user controls. As the top of the tree, this element owns the writable Signals
-	// and wires read-only views into the pipeline. The UI and the attribute/property accessors
-	// read and write these directly (e.g. effect.get(el.controls.source)).
+	/**
+	 * The mutable user controls. As the top of the tree, this element owns the writable Signals
+	 * and wires read-only views into the pipeline. The UI and the attribute/property accessors
+	 * read and write these directly (e.g. effect.get(el.controls.source)).
+	 */
 	readonly controls = {
 		source: new Signal<SourceType | File | undefined>(undefined),
 		muted: new Signal(false),
@@ -112,12 +126,15 @@ export default class MoqPublish extends HTMLElement {
 	 */
 	connection: Moq.Connection;
 	#capture: Video.Capture;
+	/** The broadcast being published. */
 	broadcast: Broadcast;
 
-	// The single video and audio encoders. For multiple renditions (e.g. simulcast), drop the element
-	// and register your own encoders on a Broadcast via the JS API. Tune them via `video.config` and
-	// the `audio` encoder's knobs (`codec`, `volume`, ...).
+	/**
+	 * The single video encoder, tuned via `video.config`. For multiple renditions (e.g. simulcast), drop
+	 * the element and register your own encoders on a Broadcast via the JS API.
+	 */
 	video: Video.Encoder;
+	/** The single audio encoder, tuned via its knobs (`codec`, `volume`, ...). */
 	audio: Audio.Encoder;
 
 	// The selected input sources: the Camera/Screen, Microphone/Screen, and File holders driving capture.
@@ -127,6 +144,7 @@ export default class MoqPublish extends HTMLElement {
 		audio: new Signal<Source.Microphone | Source.Screen | undefined>(undefined),
 		file: new Signal<Source.File | undefined>(undefined),
 	};
+	/** The selected input sources driving capture, read-only. */
 	readonly sources = readonlys(this.#sources);
 
 	// The captured media tracks, written by #runSource. Fed to the video and audio captures, so
@@ -139,6 +157,8 @@ export default class MoqPublish extends HTMLElement {
 
 	// Whether to flip the video horizontally on playback. No attribute yet.
 	#flip = new Signal(false);
+	// The camera's screen orientation, which the capture turns into a rotation for landscape frames.
+	#orientation = new Signal(0);
 
 	// The preview element, either a <video> (raw source via srcObject) or a <canvas> (rendered frames).
 	#preview = new Signal<HTMLVideoElement | HTMLCanvasElement | undefined>(undefined);
@@ -186,7 +206,7 @@ export default class MoqPublish extends HTMLElement {
 			this.#eitherEnabled.set(!muted || !invisible);
 		});
 
-		this.#capture = new Video.Capture({ source: this.#videoSource });
+		this.#capture = new Video.Capture({ source: this.#videoSource, orientation: this.#orientation });
 		this.signals.cleanup(() => this.#capture.close());
 
 		// Reached as `audio.capture` rather than a field of its own, so audio and video read alike.
@@ -203,6 +223,7 @@ export default class MoqPublish extends HTMLElement {
 			name: this.#name,
 			display: this.#capture.out.display,
 			flip: this.#flip,
+			rotation: this.#capture.out.rotation,
 		});
 		this.signals.cleanup(() => this.broadcast.close());
 
@@ -249,6 +270,7 @@ export default class MoqPublish extends HTMLElement {
 					frames: this.#capture.out.frames,
 					display: this.#capture.out.display,
 					flip: this.#flip,
+					rotation: this.#capture.out.rotation,
 					encoder: this.video,
 					mode: this.controls.preview,
 					enabled: this.#videoEnabled,
@@ -259,7 +281,8 @@ export default class MoqPublish extends HTMLElement {
 				// A canvas that lost its GPU never hands out another context, so swap in a fresh copy.
 				// The observer above picks it up and this effect builds a renderer for it.
 				effect.run((inner) => {
-					if (inner.get(renderer.out.error) === "surface-lost") preview.replaceWith(preview.cloneNode());
+					if (inner.get(renderer.out.error)?.name === "InvalidStateError")
+						preview.replaceWith(preview.cloneNode());
 				});
 				return;
 			}
@@ -316,6 +339,8 @@ export default class MoqPublish extends HTMLElement {
 
 		if (name === "url") {
 			this.connection.url.set(parseUrl(newValue));
+		} else if (name === "versions") {
+			this.connection.versions.set(parseVersions(newValue));
 		} else if (name === "name") {
 			this.#name.set(Moq.Path.from(newValue ?? ""));
 		} else if (name === "source") {
@@ -346,6 +371,7 @@ export default class MoqPublish extends HTMLElement {
 			video: this.#videoSource,
 			audio: this.#audioSource,
 		});
+		effect.set(this.#orientation, 0, 0);
 
 		if (!source) return;
 
@@ -358,6 +384,7 @@ export default class MoqPublish extends HTMLElement {
 			effect.run((nested) => {
 				nested.set(this.#videoSource, nested.get(video.out.source)?.video);
 				nested.set(this.#audioSource, nested.get(audio.out.source)?.audio);
+				nested.set(this.#orientation, nested.get(video.out.orientation), 0);
 			});
 
 			effect.cleanup(() => {
@@ -421,6 +448,7 @@ export default class MoqPublish extends HTMLElement {
 		throw new Error(`Invalid source: ${exhaustive}`);
 	}
 
+	/** The relay URL, mirrored by the `url` attribute. */
 	get url(): URL | undefined {
 		return this.connection.url.peek();
 	}
@@ -429,6 +457,16 @@ export default class MoqPublish extends HTMLElement {
 		this.connection.url.set(value ? new URL(value) : undefined);
 	}
 
+	/** The protocol versions to offer, most preferred first; undefined offers the defaults. */
+	get versions(): readonly string[] | undefined {
+		return this.connection.versions.peek();
+	}
+
+	set versions(value: readonly string[] | undefined) {
+		this.connection.versions.set(value);
+	}
+
+	/** The broadcast name, mirrored by the `name` attribute. */
 	get name(): Moq.Path.Valid {
 		return this.#name.peek();
 	}
@@ -437,6 +475,7 @@ export default class MoqPublish extends HTMLElement {
 		this.#name.set(Moq.Path.from(value));
 	}
 
+	/** What to capture: a built-in source, a file, or nothing. Mirrored by the `source` attribute. */
 	get source(): SourceType | File | undefined {
 		return this.controls.source.peek();
 	}
@@ -445,6 +484,7 @@ export default class MoqPublish extends HTMLElement {
 		this.controls.source.set(value);
 	}
 
+	/** Whether audio is muted, mirrored by the `muted` attribute. */
 	get muted(): boolean {
 		return this.controls.muted.peek();
 	}
@@ -453,6 +493,7 @@ export default class MoqPublish extends HTMLElement {
 		this.controls.muted.set(value);
 	}
 
+	/** Whether video is disabled, mirrored by the `invisible` attribute. */
 	get invisible(): boolean {
 		return this.controls.invisible.peek();
 	}
@@ -461,6 +502,7 @@ export default class MoqPublish extends HTMLElement {
 		this.controls.invisible.set(value);
 	}
 
+	/** What a <canvas> preview renders, mirrored by the `preview` attribute. */
 	get preview(): Preview.Mode {
 		return this.controls.preview.peek();
 	}
@@ -478,6 +520,7 @@ export default class MoqPublish extends HTMLElement {
 		this.controls.backend.set(value);
 	}
 
+	/** When to announce the broadcast, mirrored by the `announce` attribute. */
 	get announce(): AnnounceMode {
 		return this.controls.announce.peek();
 	}

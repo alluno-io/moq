@@ -1,10 +1,17 @@
 import { ProtocolViolation } from "../error.ts";
 import type * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
-import * as Cluster from "./cluster.ts";
 import * as Message from "./message.ts";
 import * as Namespace from "./namespace.ts";
 import { Parameters } from "./parameters.ts";
+import {
+	type AdvertParams,
+	advertIntoParams,
+	decodeAdvert,
+	extended,
+	NEGOTIATED_NONE,
+	type Negotiated,
+} from "./publish_namespace.ts";
 import { type IetfVersion, Version } from "./version.ts";
 
 // True for the drafts that use the legacy 0x11 SUBSCRIBE_NAMESPACE message.
@@ -246,39 +253,52 @@ export class SubscribeNamespaceError {
 	}
 }
 
+/** UNSUBSCRIBE_NAMESPACE (0x14), drafts 14 and 15 only: draft 14 names the prefix, draft 15 the request. */
 export class UnsubscribeNamespace {
 	static id = 0x14;
 
+	/** Draft 14: the Track Namespace Prefix of the SUBSCRIBE_NAMESPACE it cancels. */
+	prefix: Path.Valid;
+	/** Draft 15: the Request ID of the SUBSCRIBE_NAMESPACE it cancels. */
 	requestId: bigint;
 
-	constructor({ requestId }: { requestId: bigint }) {
+	constructor({ prefix = "" as Path.Valid, requestId = 0n }: { prefix?: Path.Valid; requestId?: bigint }) {
+		this.prefix = prefix;
 		this.requestId = requestId;
 	}
 
-	async #encode(w: Writer): Promise<void> {
-		await w.u62(this.requestId);
+	async #encode(w: Writer, version: IetfVersion): Promise<void> {
+		if (version === Version.DRAFT_14) {
+			await Namespace.encode(w, this.prefix);
+		} else if (version === Version.DRAFT_15) {
+			await w.u62(this.requestId);
+		} else {
+			throw new Error(`UNSUBSCRIBE_NAMESPACE is draft-14/15 only, not ${version}`);
+		}
 	}
 
-	async encode(w: Writer, _version: IetfVersion): Promise<void> {
-		return Message.encode(w, this.#encode.bind(this));
+	async encode(w: Writer, version: IetfVersion): Promise<void> {
+		return Message.encode(w, (wr) => this.#encode(wr, version));
 	}
 
-	static async decode(r: Reader, _version: IetfVersion): Promise<UnsubscribeNamespace> {
-		return Message.decode(r, UnsubscribeNamespace.#decode);
+	static async decode(r: Reader, version: IetfVersion): Promise<UnsubscribeNamespace> {
+		return Message.decode(r, (rd) => UnsubscribeNamespace.#decode(rd, version));
 	}
 
-	static async #decode(r: Reader): Promise<UnsubscribeNamespace> {
-		const requestId = await r.u62();
-		return new UnsubscribeNamespace({ requestId });
+	static async #decode(r: Reader, version: IetfVersion): Promise<UnsubscribeNamespace> {
+		if (version === Version.DRAFT_14) return new UnsubscribeNamespace({ prefix: await Namespace.decode(r) });
+		if (version === Version.DRAFT_15) return new UnsubscribeNamespace({ requestId: await r.u62() });
+		throw new Error(`UNSUBSCRIBE_NAMESPACE is draft-14/15 only, not ${version}`);
 	}
 }
 
 /**
  * NAMESPACE message (0x08), v16+, sent on the SUBSCRIBE_NAMESPACE bidi stream.
  *
- * The base message carries only the suffix. A session that negotiated the MoQ Cluster
- * extension uses the extended form instead, which appends a Parameters field so the
- * advertisement can carry its HOP_PATH and ROUTE_COST (see `cluster.ts`).
+ * The base message carries only the suffix. A session that negotiated the MoQ Cluster or
+ * MoQ Epoch extension uses the extended form instead, which appends one Parameters field
+ * for both, so the advertisement can carry its HOP_PATH and ROUTE_COST (see `cluster.ts`)
+ * and its EPOCH (see `epoch.ts`).
  */
 export class SubscribeNamespaceEntry {
 	static id = 0x08;
@@ -286,20 +306,20 @@ export class SubscribeNamespaceEntry {
 	suffix: Path.Valid;
 
 	/**
-	 * The MoQ Cluster parameters. Set selects the extended form, `undefined` the base one.
-	 * An endpoint must not append them on a session that did not negotiate.
+	 * The extension parameters. Set selects the extended form, `undefined` the base one.
+	 * An endpoint must not append them on a session that negotiated neither extension.
 	 */
-	cluster?: Cluster.Advert;
+	params?: AdvertParams;
 
-	constructor({ suffix, cluster }: { suffix: Path.Valid; cluster?: Cluster.Advert }) {
+	constructor({ suffix, params }: { suffix: Path.Valid; params?: AdvertParams }) {
 		this.suffix = suffix;
-		this.cluster = cluster;
+		this.params = params;
 	}
 
 	async #encode(w: Writer, version: IetfVersion): Promise<void> {
 		await Namespace.encode(w, this.suffix);
 		// The base form has no Parameters field at all, so there is nothing to write.
-		if (this.cluster) await Cluster.intoParams(this.cluster).encode(w, version);
+		if (this.params) await advertIntoParams(this.params).encode(w, version);
 	}
 
 	async encode(w: Writer, version: IetfVersion): Promise<void> {
@@ -307,18 +327,23 @@ export class SubscribeNamespaceEntry {
 	}
 
 	/**
-	 * Decode the message, expecting the extended form when the session negotiated the MoQ
-	 * Cluster extension. See {@link PublishNamespace.decode}.
+	 * Decode the message, expecting the extended form when the session negotiated an
+	 * extension that defines it. See {@link PublishNamespace.decode}.
 	 */
-	static async decode(r: Reader, version: IetfVersion, negotiated = false): Promise<SubscribeNamespaceEntry> {
+	static async decode(
+		r: Reader,
+		version: IetfVersion,
+		negotiated: Negotiated = NEGOTIATED_NONE,
+	): Promise<SubscribeNamespaceEntry> {
 		return Message.decode(r, (rd) => SubscribeNamespaceEntry.#decode(rd, version, negotiated));
 	}
 
-	static async #decode(r: Reader, version: IetfVersion, negotiated: boolean): Promise<SubscribeNamespaceEntry> {
+	static async #decode(r: Reader, version: IetfVersion, negotiated: Negotiated): Promise<SubscribeNamespaceEntry> {
 		const suffix = await Namespace.decode(r);
-		if (!negotiated) return new SubscribeNamespaceEntry({ suffix });
+		// The base form has no Parameters field at all, so there is nothing to read.
+		if (!extended(negotiated)) return new SubscribeNamespaceEntry({ suffix });
 
-		return new SubscribeNamespaceEntry({ suffix, cluster: await Cluster.decodeParams(r, version, "namespace") });
+		return new SubscribeNamespaceEntry({ suffix, params: await decodeAdvert(r, version, "namespace", negotiated) });
 	}
 }
 

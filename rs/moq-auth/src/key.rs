@@ -7,7 +7,8 @@ use p256::elliptic_curve::SecretKey;
 use p256::elliptic_curve::pkcs8::EncodePrivateKey;
 use rsa::BigUint;
 use rsa::pkcs1::EncodeRsaPrivateKey;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::{collections::HashSet, fmt, path::Path as StdPath};
 
@@ -15,9 +16,13 @@ use std::{collections::HashSet, fmt, path::Path as StdPath};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum KeyOperation {
+	/// Compute a signature.
 	Sign,
+	/// Verify a signature.
 	Verify,
+	/// Decrypt content.
 	Decrypt,
+	/// Encrypt content.
 	Encrypt,
 }
 
@@ -27,6 +32,7 @@ pub enum KeyOperation {
 pub enum KeyMaterial {
 	/// <https://datatracker.ietf.org/doc/html/rfc7518#section-6.2>
 	EC {
+		/// The curve the point lies on.
 		#[serde(rename = "crv")]
 		curve: EllipticCurve,
 		/// The X-coordinate of an EC key
@@ -46,8 +52,10 @@ pub enum KeyMaterial {
 	},
 	/// <https://datatracker.ietf.org/doc/html/rfc7518#section-6.3>
 	RSA {
+		/// The public modulus and exponent.
 		#[serde(flatten)]
 		public: RsaPublicKey,
+		/// The private parameters, absent for a public key.
 		#[serde(flatten, skip_serializing_if = "Option::is_none")]
 		private: Option<RsaPrivateKey>,
 	},
@@ -64,10 +72,13 @@ pub enum KeyMaterial {
 	},
 	/// <https://datatracker.ietf.org/doc/html/rfc8037#section-2>
 	OKP {
+		/// The curve the key belongs to.
 		#[serde(rename = "crv")]
 		curve: EllipticCurve,
+		/// The public key bytes, base64url encoded in the JWK.
 		#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 		x: Vec<u8>,
+		/// The private key bytes, base64url encoded in the JWK, absent for a public key.
 		#[serde(
 			rename = "d",
 			default,
@@ -84,13 +95,16 @@ pub enum KeyMaterial {
 /// See <https://datatracker.ietf.org/doc/html/rfc7518#section-6.2.1.1>
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum EllipticCurve {
+	/// NIST P-256.
 	#[serde(rename = "P-256")]
 	P256,
+	/// NIST P-384.
 	#[serde(rename = "P-384")]
 	P384,
 	// jsonwebtoken doesn't support the ES512 algorithm, so we can't implement this
 	// #[serde(rename = "P-521")]
 	// P521,
+	/// Ed25519, for OKP keys.
 	#[serde(rename = "Ed25519")]
 	Ed25519,
 }
@@ -100,8 +114,10 @@ pub enum EllipticCurve {
 /// See <https://datatracker.ietf.org/doc/html/rfc7518#section-6.3.1>
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RsaPublicKey {
+	/// The modulus.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub n: Vec<u8>,
+	/// The public exponent.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub e: Vec<u8>,
 }
@@ -111,18 +127,25 @@ pub struct RsaPublicKey {
 /// See <https://datatracker.ietf.org/doc/html/rfc7518#section-6.3.2>
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RsaPrivateKey {
+	/// The private exponent.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub d: Vec<u8>,
+	/// The first prime factor.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub p: Vec<u8>,
+	/// The second prime factor.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub q: Vec<u8>,
+	/// The first factor's CRT exponent.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub dp: Vec<u8>,
+	/// The second factor's CRT exponent.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub dq: Vec<u8>,
+	/// The first CRT coefficient.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub qi: Vec<u8>,
+	/// Other prime information, for keys with more than two primes.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub oth: Option<Vec<RsaAdditionalPrime>>,
 }
@@ -130,10 +153,13 @@ pub struct RsaPrivateKey {
 /// Additional prime information for multi-prime RSA keys.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RsaAdditionalPrime {
+	/// The prime factor.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub r: Vec<u8>,
+	/// The factor's CRT exponent.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub d: Vec<u8>,
+	/// The factor's CRT coefficient.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub t: Vec<u8>,
 }
@@ -221,7 +247,7 @@ impl Jwk {
 ///
 /// The fields are fixed at construction: derived crypto material is cached on first use, so a key
 /// that could be mutated would sign with stale material. Build one from a [`Jwk`], from
-/// [`Key::generate`], or by parsing with [`Key::from_str`], then use the builders to derive a new
+/// [`Key::generate`], or by parsing a string with [`str::parse`], then use the builders to derive a new
 /// key rather than editing an existing one.
 #[derive(Clone)]
 pub struct Key {
@@ -288,18 +314,11 @@ impl fmt::Debug for Key {
 	}
 }
 
-impl Key {
-	/// The serializable [`Jwk`] behind this key, cloned so editing it can't reach the original.
-	///
-	/// The inverse of [`Jwk::import`]. Use it to derive a variant: export, edit, import again.
-	/// Reading a single field needs no clone, since a [`Key`] derefs to its [`Jwk`].
-	pub fn export(&self) -> Jwk {
-		self.jwk.clone()
-	}
+impl FromStr for Key {
+	type Err = crate::Error;
 
 	/// Parse a key from a string, auto-detecting JSON or base64url encoding.
-	#[allow(clippy::should_implement_trait)]
-	pub fn from_str(s: &str) -> crate::Result<Self> {
+	fn from_str(s: &str) -> crate::Result<Self> {
 		let s = s.trim();
 		if s.starts_with('{') {
 			Ok(serde_json::from_str(s)?)
@@ -308,6 +327,16 @@ impl Key {
 			let json = String::from_utf8(decoded)?;
 			Ok(serde_json::from_str(&json)?)
 		}
+	}
+}
+
+impl Key {
+	/// The serializable [`Jwk`] behind this key, cloned so editing it can't reach the original.
+	///
+	/// The inverse of [`Jwk::import`]. Use it to derive a variant: export, edit, import again.
+	/// Reading a single field needs no clone, since a [`Key`] derefs to its [`Jwk`].
+	pub fn export(&self) -> Jwk {
+		self.jwk.clone()
 	}
 
 	/// Build an HS256 key from a raw shared secret; the bytes are used directly as
@@ -328,15 +357,13 @@ impl Key {
 
 	/// Load a key from a file, auto-detecting JSON or base64url encoding.
 	pub fn from_file<P: AsRef<StdPath>>(path: P) -> crate::Result<Self> {
-		let contents = std::fs::read_to_string(&path)?;
-		Self::from_str(&contents)
+		std::fs::read_to_string(&path)?.parse()
 	}
 
 	/// Async version of [`from_file`](Self::from_file), using `tokio::fs`.
-	#[cfg(feature = "tokio")]
+	#[cfg(any(feature = "client", feature = "serve"))]
 	pub async fn from_file_async<P: AsRef<StdPath>>(path: P) -> crate::Result<Self> {
-		let contents = tokio::fs::read_to_string(path).await?;
-		Self::from_str(&contents)
+		tokio::fs::read_to_string(path).await?.parse()
 	}
 
 	/// Encode the key as base64url-encoded JSON.
@@ -541,11 +568,19 @@ impl Key {
 		Ok(self.encode.get_or_init(|| encoding_key))
 	}
 
-	/// Decode a signed token into any payload, checking only signature, algorithm, and key ID.
+	/// Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope.
 	///
-	/// The caller validates payload fields and expiry. Use [`verify`](Self::verify) for
-	/// this crate's strict [`Claims`] contract.
-	pub fn decode<C: DeserializeOwned>(&self, token: &str) -> crate::Result<C> {
+	/// Scoping the claims to a connection path is a separate step; see
+	/// [`Claims::authorize`].
+	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
+		let claims = self.verify_claims(token)?;
+		validate_times(&claims, moq_clock::wall())?;
+		Ok(claims)
+	}
+
+	/// Verify the signature, claims, and key scope but not the times, so an expired
+	/// token's root is still known to be genuine.
+	pub(crate) fn verify_claims(&self, token: &str) -> crate::Result<Claims> {
 		if !self.operations.contains(&KeyOperation::Verify) {
 			return Err(KeyError::VerifyUnsupported.into());
 		}
@@ -562,16 +597,7 @@ impl Key {
 		validation.validate_exp = false;
 		validation.validate_nbf = false;
 		validation.validate_aud = false;
-		Ok(jsonwebtoken::decode::<C>(token, self.to_decoding_key()?, &validation)?.claims)
-	}
-
-	/// Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope.
-	///
-	/// Scoping the claims to a connection path is a separate step; see
-	/// [`Claims::authorize`].
-	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
-		let claims: Claims = self.decode(token)?;
-		validate_times(&claims, std::time::SystemTime::now())?;
+		let claims: Claims = jsonwebtoken::decode(token, self.to_decoding_key()?, &validation)?.claims;
 		claims.validate()?;
 		self.validate_scope(&claims)?;
 		Ok(claims)
@@ -627,7 +653,7 @@ impl Key {
 }
 
 /// Refuse claims expired at `now` (`exp <= now`) or not yet valid (`nbf > now`), as `jose` does.
-fn validate_times(claims: &Claims, now: std::time::SystemTime) -> crate::Result<()> {
+pub(crate) fn validate_times(claims: &Claims, now: moq_clock::Wall) -> crate::Result<()> {
 	if claims.expires.is_some_and(|exp| exp <= now) {
 		return Err(crate::Error::TokenExpired);
 	}
@@ -697,7 +723,8 @@ mod tests {
 	fn patterns(texts: &[&str]) -> crate::Patterns {
 		texts.iter().map(|text| text.parse().unwrap()).collect()
 	}
-	use std::time::{Duration, SystemTime};
+	use moq_clock::Wall;
+	use std::time::Duration;
 
 	fn create_test_key() -> Key {
 		let mut jwk = Jwk::new(
@@ -715,35 +742,33 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: patterns(&["test-pub/**"]),
 			subscribe: patterns(&["test-sub/**"]),
-			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
-			issued: Some(SystemTime::now()),
+			expires: Some(moq_clock::wall() + Duration::from_secs(3600)),
+			issued: Some(moq_clock::wall()),
 			not_before: None,
 			peer: false,
 		}
 	}
 
 	#[test]
-	fn decode_accepts_other_payloads_but_checks_kid_and_algorithm() {
+	fn verify_refuses_custom_payloads_and_checks_kid_and_algorithm() {
 		let key = create_test_key();
 		let mut header = Header::new(Algorithm::HS256.into());
 		header.kid = key.kid.as_ref().map(ToString::to_string);
 		let payload = serde_json::json!({"custom": "accepted", "exp": 1, "aud": "other-service"});
 		let token = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
-		let decoded: serde_json::Value = key.decode(&token).unwrap();
-		assert_eq!(decoded, payload);
 		assert!(key.verify(&token).is_err(), "strict claims reject the custom payload");
 
 		header.kid = Some("someone-else".into());
 		let wrong_kid = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
 		assert!(matches!(
-			key.decode::<serde_json::Value>(&wrong_kid),
+			key.verify(&wrong_kid),
 			Err(crate::Error::Key(KeyError::KeyNotFound(_)))
 		));
 
 		header.kid = key.kid.as_ref().map(ToString::to_string);
 		header.alg = jsonwebtoken::Algorithm::HS384;
 		let wrong_algorithm = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
-		assert!(key.decode::<serde_json::Value>(&wrong_algorithm).is_err());
+		assert!(key.verify(&wrong_algorithm).is_err());
 	}
 
 	#[test]
@@ -1036,8 +1061,8 @@ mod tests {
 	#[test]
 	fn test_key_verify_only_registered_claims() {
 		let key = create_test_key();
-		let now = SystemTime::now()
-			.duration_since(SystemTime::UNIX_EPOCH)
+		let now = moq_clock::wall()
+			.checked_duration_since(Wall::UNIX_EPOCH)
 			.unwrap()
 			.as_secs();
 
@@ -1074,8 +1099,8 @@ mod tests {
 	fn test_key_verify_enforces_not_before() {
 		let key = create_test_key();
 		let at = |offset: i64| {
-			let now = SystemTime::now()
-				.duration_since(SystemTime::UNIX_EPOCH)
+			let now = moq_clock::wall()
+				.checked_duration_since(Wall::UNIX_EPOCH)
 				.unwrap()
 				.as_secs() as i64;
 			sign_raw(
@@ -1090,10 +1115,10 @@ mod tests {
 	/// `exp` is refused at the instant itself and `nbf` accepted at it, matching `jose`.
 	#[test]
 	fn validate_times_at_the_boundary() {
-		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+		let now = Wall::UNIX_EPOCH + Duration::from_secs(1_000);
 		let second = Duration::from_secs(1);
 
-		let at = |expires: Option<SystemTime>, not_before: Option<SystemTime>| {
+		let at = |expires: Option<Wall>, not_before: Option<Wall>| {
 			let mut claims = create_test_claims();
 			claims.expires = expires;
 			claims.not_before = not_before;
@@ -1116,11 +1141,23 @@ mod tests {
 	fn test_key_verify_expired_token() {
 		let key = create_test_key();
 		let mut claims = create_test_claims();
-		claims.expires = Some(SystemTime::now() - Duration::from_secs(3600)); // 1 hour ago
+		claims.expires = Some(moq_clock::wall() - Duration::from_secs(3600)); // 1 hour ago
 		let token = key.sign(&claims).unwrap();
 
 		let result = key.verify(&token);
 		assert!(result.is_err());
+	}
+
+	#[moq_clock::test]
+	async fn token_validity_uses_the_ambient_wall() {
+		let key = create_test_key();
+		let mut claims = create_test_claims();
+		claims.issued = Some(moq_clock::wall());
+		claims.expires = Some(moq_clock::wall() + Duration::from_secs(10));
+		let token = key.sign(&claims).unwrap();
+		key.verify(&token).unwrap();
+		moq_clock::sleep(Duration::from_secs(10)).await;
+		assert!(matches!(key.verify(&token), Err(crate::Error::TokenExpired)));
 	}
 
 	#[test]
@@ -1151,8 +1188,8 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: patterns(&["test-pub/**"]),
 			subscribe: patterns(&["test-sub/**"]),
-			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
-			issued: Some(SystemTime::now()),
+			expires: Some(moq_clock::wall() + Duration::from_secs(3600)),
+			issued: Some(moq_clock::wall()),
 			not_before: None,
 			peer: false,
 		};
@@ -1225,36 +1262,6 @@ mod tests {
 			}
 			_ => panic!("Expected RSA key"),
 		}
-	}
-
-	#[test]
-	fn test_key_generate_es256() {
-		let key = Key::generate(Algorithm::ES256, Some(crate::KeyId::decode("test-id").unwrap()));
-		assert!(key.is_ok());
-		let key = key.unwrap();
-
-		assert_eq!(key.algorithm, Algorithm::ES256);
-		assert!(matches!(key.material, KeyMaterial::EC { .. }))
-	}
-
-	#[test]
-	fn test_key_generate_ps512() {
-		let key = Key::generate(Algorithm::PS512, Some(crate::KeyId::decode("test-id").unwrap()));
-		assert!(key.is_ok());
-		let key = key.unwrap();
-
-		assert_eq!(key.algorithm, Algorithm::PS512);
-		assert!(matches!(key.material, KeyMaterial::RSA { .. }));
-	}
-
-	#[test]
-	fn test_key_generate_eddsa() {
-		let key = Key::generate(Algorithm::EdDSA, Some(crate::KeyId::decode("test-id").unwrap()));
-		assert!(key.is_ok());
-		let key = key.unwrap();
-
-		assert_eq!(key.algorithm, Algorithm::EdDSA);
-		assert!(matches!(key.material, KeyMaterial::OKP { .. }));
 	}
 
 	#[test]
@@ -1370,22 +1377,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_key_generate_sign_verify_cycle() {
-		let key = Key::generate(Algorithm::HS256, Some(crate::KeyId::decode("test-id").unwrap()));
-		assert!(key.is_ok());
-		let key = key.unwrap();
-
-		let claims = create_test_claims();
-
-		let token = key.sign(&claims).unwrap();
-		let verified_claims = key.verify(&token).unwrap();
-
-		assert_eq!(verified_claims.root, claims.root);
-		assert_eq!(verified_claims.publish, claims.publish);
-		assert_eq!(verified_claims.subscribe, claims.subscribe);
-	}
-
-	#[test]
 	fn test_key_debug_no_secret() {
 		let key = create_test_key();
 		let debug_str = format!("{key:?}");
@@ -1394,22 +1385,6 @@ mod tests {
 		assert!(debug_str.contains("operations"));
 		assert!(debug_str.contains("kid: Some(KeyId(\"test-key-1\"))"));
 		assert!(!debug_str.contains("secret")); // Should not contain secret
-	}
-
-	#[test]
-	fn test_key_operations_enum() {
-		let sign_op = KeyOperation::Sign;
-		let verify_op = KeyOperation::Verify;
-		let decrypt_op = KeyOperation::Decrypt;
-		let encrypt_op = KeyOperation::Encrypt;
-
-		assert_eq!(sign_op, KeyOperation::Sign);
-		assert_eq!(verify_op, KeyOperation::Verify);
-		assert_eq!(decrypt_op, KeyOperation::Decrypt);
-		assert_eq!(encrypt_op, KeyOperation::Encrypt);
-
-		assert_ne!(sign_op, verify_op);
-		assert_ne!(decrypt_op, encrypt_op);
 	}
 
 	#[test]
@@ -1443,28 +1418,6 @@ mod tests {
 		) = (&key.material, &deserialized.material)
 		{
 			assert_eq!(deserialized_secret, original_secret);
-		} else {
-			panic!("Expected both keys to be OCT variant");
-		}
-	}
-
-	#[test]
-	fn test_key_clone() {
-		let key = create_test_key();
-		let cloned = key.clone();
-
-		assert_eq!(cloned.algorithm, key.algorithm);
-		assert_eq!(cloned.operations, key.operations);
-		assert_eq!(cloned.kid, key.kid);
-
-		if let (
-			KeyMaterial::OCT {
-				secret: original_secret,
-			},
-			KeyMaterial::OCT { secret: cloned_secret },
-		) = (&key.material, &cloned.material)
-		{
-			assert_eq!(cloned_secret, original_secret);
 		} else {
 			panic!("Expected both keys to be OCT variant");
 		}
@@ -1937,8 +1890,8 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 
 		fn temp_path(name: &str) -> std::path::PathBuf {
-			let unique = SystemTime::now()
-				.duration_since(SystemTime::UNIX_EPOCH)
+			let unique = moq_clock::wall()
+				.checked_duration_since(Wall::UNIX_EPOCH)
 				.unwrap()
 				.as_nanos();
 			std::env::temp_dir().join(format!("test_perms_{name}_{unique}.jwk"))

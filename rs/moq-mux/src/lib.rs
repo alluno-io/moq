@@ -1,3 +1,9 @@
+#![warn(missing_docs)]
+#![cfg_attr(
+	test,
+	expect(clippy::disallowed_methods, reason = "tests read the host clock directly")
+)]
+
 //! Media muxers and demuxers for MoQ.
 //!
 //! Sits between [`moq_net`] (pub/sub transport) and [`hang`] (media
@@ -25,6 +31,10 @@
 //!   record per aligned segment, mapping a span of content time to the group
 //!   ranges that carry it on each track, so consumers can seek or build
 //!   HLS/DASH playlists without downloading media.
+//! - [`follow`] follows a broadcast across the publisher instances that
+//!   serve it, for a reader that restarts on each one.
+//! - [`Linger`] keeps a cleanly ended broadcast up for a fixed time, so a
+//!   subscriber that arrives after the end still gets its tail.
 
 pub mod binary;
 pub mod catalog;
@@ -32,17 +42,21 @@ mod clock;
 pub mod codec;
 pub mod container;
 mod error;
+pub mod follow;
 pub mod import;
 mod jitter;
 pub mod json;
+mod linger;
 mod pace;
 pub mod rate;
 pub mod select;
 mod source;
+mod stats;
 pub mod timeline;
 
 pub use clock::Clock;
 pub use error::*;
+pub use linger::Linger;
 pub use pace::Pacer;
 pub use source::{Binding, Source};
 

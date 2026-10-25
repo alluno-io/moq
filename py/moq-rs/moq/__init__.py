@@ -5,9 +5,13 @@ Real-time pub/sub with built-in caching, fan-out, and prioritization.
 
 from moq_ffi import MoqError as Error
 
-# A submodule, not in __all__: a star import would shadow the stdlib `json`.
+from . import audio as audio
+
+# Layer namespaces stay out of __all__; json would shadow the stdlib module.
+from . import flate as flate
 from . import json as json
-from .client import Client, connect
+from . import video as video
+from .client import Client, CongestionControl, connect, qlog_supported, versions
 from .epoch import epoch_time, mint_epoch
 from .errors import is_auth, is_shutdown, protocol_error
 from .log import log_level
@@ -20,63 +24,65 @@ from .origin import (
     AnnounceEventRestart,
     AnnounceEventStart,
     AnnounceEventUpdate,
+    BroadcastPrepared,
     BroadcastRequest,
     OriginConsumer,
     OriginDynamic,
     OriginProducer,
 )
 from .publish import (
-    AudioProducer,
     BroadcastDynamic,
+    BroadcastFinish,
     BroadcastProducer,
-    GroupDemand,
+    Fill,
     GroupProducer,
-    GroupRequest,
     TrackDemand,
     TrackDynamic,
     TrackProducer,
     TrackRequest,
-    VideoProducer,
 )
 from .server import Request, Server, Transport
-from .session import Bandwidth, Reservation, Session
+from .session import Auth, AuthToken, Bandwidth, Reservation, Session
 from .subscribe import (
-    AudioConsumer,
     BroadcastConsumer,
     GroupConsumer,
     TrackConsumer,
-    VideoConsumer,
 )
 from .types import (
+    Anchor,
+    AnnounceRoute,
     AudioCodec,
-    AudioDecoderOutput,
     AudioEncoderInput,
-    AudioEncoderOutput,
-    AudioFrame,
     AudioSampleFormat,
     Backoff,
+    ClientTls,
+    ConnectionPhase,
+    ConnectionState,
     ConnectionStats,
-    ConnectionStatus,
     Datagram,
     ErrorScope,
     FetchGroupOptions,
     Frame,
+    Grant,
+    Order,
     ProtocolError,
     ProtocolKind,
+    QuicConfig,
+    Range,
     Route,
     Subscription,
     TrackInfo,
     VideoCodec,
     VideoDecodedFrame,
-    VideoDecoderOutput,
     VideoEncoderInput,
     VideoEncoderKind,
     VideoEncoderOutput,
-    VideoFrame,
     VideoPixelFormat,
+    WebSocketConfig,
 )
 
 __all__ = [
+    "Anchor",
     "Announce",
     "AnnounceConsumer",
     "AnnouncedBroadcast",
@@ -85,37 +91,43 @@ __all__ = [
     "AnnounceEventRestart",
     "AnnounceEventStart",
     "AnnounceEventUpdate",
+    "AnnounceRoute",
     "AudioCodec",
-    "AudioConsumer",
-    "AudioDecoderOutput",
     "AudioEncoderInput",
-    "AudioEncoderOutput",
     "AudioSampleFormat",
-    "AudioFrame",
-    "AudioProducer",
+    "Auth",
+    "AuthToken",
     "Backoff",
     "Bandwidth",
     "BroadcastConsumer",
     "BroadcastDynamic",
+    "BroadcastFinish",
+    "BroadcastPrepared",
     "BroadcastProducer",
     "BroadcastRequest",
     "Client",
+    "ClientTls",
+    "CongestionControl",
     "ConnectionStats",
-    "ConnectionStatus",
+    "ConnectionPhase",
+    "ConnectionState",
     "Datagram",
     "Error",
     "ErrorScope",
     "Frame",
     "ProtocolError",
     "ProtocolKind",
+    "QuicConfig",
     "FetchGroupOptions",
+    "Fill",
+    "Grant",
     "GroupConsumer",
-    "GroupDemand",
-    "GroupRequest",
     "GroupProducer",
     "OriginConsumer",
     "OriginDynamic",
     "OriginProducer",
+    "Order",
+    "Range",
     "Request",
     "Reservation",
     "Route",
@@ -133,12 +145,9 @@ __all__ = [
     "VideoEncoderInput",
     "VideoEncoderKind",
     "VideoEncoderOutput",
-    "VideoFrame",
-    "VideoConsumer",
     "VideoDecodedFrame",
-    "VideoDecoderOutput",
     "VideoPixelFormat",
-    "VideoProducer",
+    "WebSocketConfig",
     "connect",
     "epoch_time",
     "is_auth",
@@ -146,6 +155,8 @@ __all__ = [
     "log_level",
     "mint_epoch",
     "protocol_error",
+    "qlog_supported",
+    "versions",
 ]
 
 from . import media as media

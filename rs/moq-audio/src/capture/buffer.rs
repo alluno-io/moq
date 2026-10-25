@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use moq_net::time::Instant;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{CachingCons, CachingProd, HeapCons, HeapProd, HeapRb};
 use tokio::sync::mpsc;
@@ -88,6 +89,10 @@ fn relay(mut pending: HeapCons<Filled>, tx: mpsc::Sender<Filled>) {
 		if !pending.write_is_held() {
 			return;
 		}
+		#[expect(
+			clippy::disallowed_methods,
+			reason = "the device thread runs outside any runtime, so it blocks on the host clock"
+		)]
 		std::thread::sleep(RELAY_POLL_INTERVAL);
 	}
 }

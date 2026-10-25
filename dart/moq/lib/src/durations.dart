@@ -11,6 +11,13 @@ extension ConnectionStatsDuration on MoqConnectionStats {
   Duration? get rtt => rttUs == null ? null : Duration(microseconds: rttUs!);
 }
 
+/// Duration views over an authorization grant.
+extension GrantDuration on MoqGrant {
+  /// How long until the grant lapses, measured when it was read, or null for never.
+  Duration? get expires =>
+      expiresUs == null ? null : Duration(microseconds: expiresUs!);
+}
+
 /// Duration views over the reconnect pacing.
 extension BackoffDuration on MoqBackoff {
   /// Delay before the first reconnect attempt, or null for the default.
@@ -28,15 +35,36 @@ extension BackoffDuration on MoqBackoff {
 
 /// Duration views over the subscription knobs.
 extension SubscriptionDuration on MoqSubscription {
-  /// Upper bound on buffering before a stalled group is skipped.
-  Duration get maxDelay => Duration(microseconds: maxDelayUs);
+  /// Upper bound on buffering before a stalled group is skipped, or null for the
+  /// publisher's max age alone.
+  Duration? get maxDelay =>
+      maxDelayUs == null ? null : _saturatingMicros(maxDelayUs!);
 }
+
+/// Duration views over a fill.
+extension FillDuration on MoqFill {
+  /// The most tolerant age budget among its readers, or null for the publisher's max age alone.
+  Duration? get maxDelay {
+    final us = maxDelayUs();
+    return us == null ? null : _saturatingMicros(us);
+  }
+}
+
+/// A u64 past 2^63 - 1 microseconds, such as a peer's delay, reads back negative.
+Duration _saturatingMicros(int us) =>
+    Duration(microseconds: us < 0 ? 0x7FFFFFFFFFFFFFFF : us);
 
 /// Duration views over the publisher-side track settings.
 extension TrackInfoDuration on MoqTrackInfo {
   /// Maximum age of a non-latest group before the publisher evicts it, or null for the default.
   Duration? get maxAge =>
       maxAgeUs == null ? null : Duration(microseconds: maxAgeUs!);
+}
+
+/// Duration view over how long a finished broadcast stays up.
+extension BroadcastFinishDuration on MoqBroadcastFinish {
+  /// The longest max age of the finished tracks the broadcast holds.
+  Duration get linger => Duration(microseconds: lingerUs());
 }
 
 /// Duration view over a raw frame's presentation time.

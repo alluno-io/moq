@@ -6,35 +6,63 @@ import { Stream } from "../stream.ts";
 import { ControlStreamAdapter } from "./adapter.ts";
 import { toRequestCode } from "./error.ts";
 import { GoAway } from "./goaway.ts";
-import { PublishNamespace, PublishNamespaceCancel, PublishNamespaceDone } from "./publish_namespace.ts";
-import { initialMaxRequestId, MaxRequestId, RequestError } from "./request.ts";
-import { Subscribe, SubscribeUpdate } from "./subscribe.ts";
+import {
+	PublishNamespace,
+	PublishNamespaceCancel,
+	PublishNamespaceDone,
+	PublishNamespaceUpdate,
+} from "./publish_namespace.ts";
+import { MaxRequestId, RequestError, RequestOk } from "./request.ts";
+import { initialMaxRequestId, REQUEST_WINDOW } from "./setup_options.ts";
+import { Subscribe, SubscribeError, SubscribeUpdate } from "./subscribe.ts";
 import { SubscribeNamespaceLegacy } from "./subscribe_namespace.ts";
-import { TrackStatusRequest } from "./track.ts";
+import { TrackStatusOk, TrackStatusRequest } from "./track.ts";
 import { ALPN, type IetfVersion, Version } from "./version.ts";
 
-test("draft-14 TRACK_STATUS_OK cannot be routed as NAMESPACE_DONE", async () => {
+test("draft-14 status answers route by request ID and a refusal leaves the session usable", async () => {
+	const version = Version.DRAFT_14;
 	const pair = createMockTransportPair(ALPN.DRAFT_14);
-	const control = await Stream.open(pair.server, { version: Version.DRAFT_14 });
-	const adapter = new ControlStreamAdapter(pair.server, control, Version.DRAFT_14, 100n, true);
-	const running = adapter.run();
-	// A writer may yield a task before the rejection assertion below.
-	void running.catch(() => {});
-	const peer = await Stream.accept(pair.client, Version.DRAFT_14);
+	const control = await Stream.open(pair.server, { version });
+	const adapter = new ControlStreamAdapter(pair.server, control, version, 100n, true);
+	void adapter.run().catch(() => {});
+	const peer = await Stream.accept(pair.client, version);
 	if (!peer) throw new Error("no control stream");
-	await peer.writer.u53(0x0e);
-	await peer.writer.u16(0);
-	// The adapter may reject while the writer yields a browser task.
-	await new Promise<void>((resolve) => {
-		const channel = new MessageChannel();
-		channel.port1.onmessage = () => {
-			channel.port1.close();
-			channel.port2.close();
-			resolve();
-		};
-		channel.port2.postMessage(null);
-	});
-	await expect(running).rejects.toThrow("unexpected message 0x0e");
+	try {
+		for (const refused of [false, true, false]) {
+			const requestId = await adapter.nextRequestId();
+			if (requestId === undefined) throw new Error("no request ID");
+			const stream = await adapter.openBi();
+			await stream.writer.u53(TrackStatusRequest.id);
+			await new TrackStatusRequest({ requestId, trackNamespace: Path.from("room"), trackName: "video" }).encode(
+				stream.writer,
+				version,
+			);
+			expect(await peer.reader.u53()).toBe(TrackStatusRequest.id);
+			expect((await TrackStatusRequest.decode(peer.reader, version)).requestId).toBe(requestId);
+			if (refused) {
+				await peer.writer.u53(0x0f);
+				await new SubscribeError({ requestId, errorCode: 4, reasonPhrase: "missing" }).encode(
+					peer.writer,
+					version,
+				);
+				expect(await stream.reader.u53()).toBe(0x0f);
+				expect((await SubscribeError.decode(stream.reader, version)).requestId).toBe(requestId);
+			} else {
+				await peer.writer.u53(TrackStatusOk.id(version));
+				await new TrackStatusOk({ requestId, largest: { groupId: 4n, objectId: 1n } }).encode(
+					peer.writer,
+					version,
+				);
+				expect(await stream.reader.u53()).toBe(TrackStatusOk.id(version));
+				const status = await TrackStatusOk.decode(stream.reader, version);
+				expect(status.requestId).toBe(requestId);
+				expect(status.largest).toEqual({ groupId: 4n, objectId: 1n });
+			}
+			stream.close();
+		}
+	} finally {
+		adapter.close();
+	}
 });
 
 // Draft-15 is the interesting one: it names its namespace withdrawals instead of
@@ -616,7 +644,7 @@ test("draft 16 accepts reordered native and control IDs but never reuses them", 
 
 // Draft 16 remembers a skipped stretch as one run, so a jump costs nothing per skipped ID.
 test("draft 16 tracks a jump across a production window as one run", async () => {
-	const window = 220_000n;
+	const window = REQUEST_WINDOW;
 	const { adapter, peer } = await windowed(Version.DRAFT_16, ALPN.DRAFT_16, window, false);
 	const top = 2n * (window - 1n);
 	try {
@@ -706,6 +734,76 @@ test("a canceled request ID wait never spends a later grant", async () => {
 			expect(await adapter.nextRequestId()).toBe(0n);
 			await expect(adapter.nextRequestId(signal.signal)).rejects.toThrow("retired");
 			expect(await adapter.nextRequestId()).toBe(2n);
+		} finally {
+			peer.close();
+			adapter.close();
+			void running;
+		}
+	}
+});
+
+// Draft 16 answers our REQUEST_UPDATE by the update's own request ID. The answer reaches the
+// request it updated, and a refusal leaves that request open. Draft 15's reaches nothing.
+test("an answer to our update reaches the request it updated on draft 16 only", async () => {
+	for (const [version, alpn] of [
+		[Version.DRAFT_15, ALPN.DRAFT_15],
+		[Version.DRAFT_16, ALPN.DRAFT_16],
+	] as const) {
+		const { adapter, peer, running } = await windowed(version, alpn, 8n, true);
+		try {
+			const stream = adapter.openBi();
+			await stream.writer.u53(PublishNamespace.id);
+			await new PublishNamespace({ requestId: 0n, trackNamespace: Path.from("ns") }).encode(
+				stream.writer,
+				version,
+			);
+			// The mock transport schedules nothing on timers, so settled promise chains are final.
+			const next = async () => {
+				let id: number | undefined;
+				const read = stream.reader.u53().then((value) => {
+					id = value;
+				});
+				for (let i = 0; i < 20 && id === undefined; i++) await new Promise((resolve) => setImmediate(resolve));
+				void read.catch(() => undefined);
+				return id;
+			};
+			const renew = async (own: bigint) => {
+				await stream.writer.u53(SubscribeUpdate.id);
+				const update =
+					version === Version.DRAFT_16
+						? new PublishNamespaceUpdate({ requestId: own, namespaceRequestId: 0n, update: {} })
+						: new SubscribeUpdate({ requestId: 0n, ownRequestId: own });
+				await update.encode(stream.writer, version);
+			};
+			const ok = async (requestId: bigint) => {
+				await peer.writer.u53(RequestOk.id);
+				await new RequestOk({ requestId }).encode(peer.writer, version);
+			};
+
+			await ok(0n);
+			expect(await next()).toBe(RequestOk.id);
+			await RequestOk.decode(stream.reader, version);
+
+			await renew(2n);
+			await ok(2n);
+			await renew(4n);
+			await peer.writer.u53(RequestError.id);
+			await new RequestError({ requestId: 4n, errorCode: 0, reasonPhrase: "refused" }).encode(
+				peer.writer,
+				version,
+			);
+			if (version === Version.DRAFT_15) {
+				expect(await next()).toBeUndefined();
+				continue;
+			}
+			expect(await next()).toBe(RequestOk.id);
+			await RequestOk.decode(stream.reader, version);
+			expect(await next()).toBe(RequestError.id);
+			await RequestError.decode(stream.reader, version);
+
+			// Still open: a later message for the request reaches it after the refusal.
+			await ok(0n);
+			expect(await next()).toBe(RequestOk.id);
 		} finally {
 			peer.close();
 			adapter.close();

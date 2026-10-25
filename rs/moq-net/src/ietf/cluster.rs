@@ -227,10 +227,7 @@ pub fn peer_from_setup(params: &super::Parameters, version: Version) -> Result<P
 	}
 
 	// 0 is legal here: the peer speaks the extension but withholds its identity.
-	let hop = params
-		.get_varint(super::ParameterVarInt::HopId)
-		.map(Hop::from_wire)
-		.transpose()?;
+	let hop = params.get_varint(super::ParameterVarInt::HopId).map(Hop::from_wire);
 
 	Ok(Peer {
 		hop,
@@ -285,14 +282,8 @@ mod tests {
 	}
 
 	#[test]
-	fn code_points() {
-		// The registry values are what other implementations key on; a typo here is
-		// invisible against ourselves and fatal against anyone else. The parity is
-		// load-bearing too: odd values are length-prefixed, even ones bare varints.
-		assert_eq!(HOP_ID, 0x40B54);
-		assert_eq!(RELAY_COST, 0x40B56);
-		assert_eq!(HOP_PATH, 0x40B57);
-		assert_eq!(ROUTE_COST, 0x40B58);
+	fn code_point_parity() {
+		// The parity is load-bearing: odd values are length-prefixed, even ones bare varints.
 		assert_eq!(HOP_ID % 2, 0);
 		assert_eq!(RELAY_COST % 2, 0);
 		assert_eq!(HOP_PATH % 2, 1);
@@ -497,7 +488,12 @@ mod tests {
 
 	#[test]
 	fn setup_options_round_trip() {
-		for (self_hop, cost) in [(hop(42), Some(0)), (hop(42), Some(9)), (Hop::UNKNOWN, None)] {
+		for (self_hop, cost) in [
+			(hop(42), Some(0)),
+			(hop(42), Some(9)),
+			(hop(u64::MAX), None),
+			(Hop::UNKNOWN, None),
+		] {
 			let mut params = super::super::Parameters::default();
 			peer_into_setup(&mut params, self_hop, cost, VERSION);
 

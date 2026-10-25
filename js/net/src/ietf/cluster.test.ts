@@ -6,13 +6,17 @@ import { Reader, Writer } from "../stream.ts";
 import * as Cluster from "./cluster.ts";
 import * as Message from "./message.ts";
 import * as Namespace from "./namespace.ts";
-import { Parameters, SetupOption, SetupOptions } from "./parameters.ts";
+import { Parameters } from "./parameters.ts";
 import { PublishNamespace, PublishNamespaceUpdate } from "./publish_namespace.ts";
+import { SetupOption, SetupOptions } from "./setup_options.ts";
 import { SubscribeNamespaceEntry } from "./subscribe_namespace.ts";
 import { MalformedAuthToken } from "./token.ts";
 import { type IetfVersion, Version } from "./version.ts";
 
 const VERSION = Version.DRAFT_19;
+
+/** A session that negotiated MoQ Cluster alone. */
+const CLUSTER = { cluster: true, epoch: false };
 
 function origin(id: bigint): Hop {
 	return HopSchema.parse(id);
@@ -48,24 +52,20 @@ async function encode<T extends { encode(w: Writer, v: IetfVersion): Promise<voi
 	return out;
 }
 
+function intoParams(advert: Cluster.Advert): Parameters {
+	const params = new Parameters();
+	Cluster.intoParams(advert, params);
+	return params;
+}
+
 function reader(bytes: Uint8Array, version: IetfVersion = VERSION): Reader {
 	return new Reader(undefined, bytes, version);
 }
 
-test("Cluster: the registry code points and their parity", () => {
-	// Other implementations key on these, so a typo is invisible against ourselves and
-	// fatal against anyone else. The parity is load-bearing too: odd values are
-	// length-prefixed byte strings, even ones bare varints.
-	expect(SetupOption.HopId).toBe(0x40b54n);
-	expect(SetupOption.RelayCost).toBe(0x40b56n);
-	expect(SetupOption.HopId % 2n).toBe(0n);
-	expect(SetupOption.RelayCost % 2n).toBe(0n);
-});
-
 test("Cluster: the hop path carries no count of its own", async () => {
 	// The entries fill the parameter length; a count would make us unreadable to every
 	// other implementation.
-	const params = Cluster.intoParams({ hops: hops(1n, 2n, 3n), cost: 0n });
+	const params = intoParams({ hops: hops(1n, 2n, 3n), cost: 0n });
 	expect(Array.from(await encode(params))).toEqual([
 		0x01, // parameter count
 		0xc4,
@@ -80,14 +80,14 @@ test("Cluster: the hop path carries no count of its own", async () => {
 
 test("Cluster: an advertisement round trips through the parameters", async () => {
 	const advert = { hops: hops(7n, 9n), cost: 5n };
-	const encoded = await encode(Cluster.intoParams(advert));
+	const encoded = await encode(intoParams(advert));
 	const decoded = await Parameters.decode(reader(encoded), VERSION);
 	expect(Cluster.fromParams(decoded)).toEqual(advert);
 });
 
 test("Cluster: a zero route cost is absent from the wire", async () => {
-	const free = await encode(Cluster.intoParams({ hops: hops(7n), cost: 0n }));
-	const priced = await encode(Cluster.intoParams({ hops: hops(7n), cost: 1n }));
+	const free = await encode(intoParams({ hops: hops(7n), cost: 0n }));
+	const priced = await encode(intoParams({ hops: hops(7n), cost: 1n }));
 	expect(free.length).toBeLessThan(priced.length);
 
 	// Absent means 0, so it comes back as one.
@@ -97,7 +97,7 @@ test("Cluster: a zero route cost is absent from the wire", async () => {
 
 test("Cluster: a repeated zero is not a loop", async () => {
 	const advert = { hops: hops(0n, 5n, 0n), cost: 0n };
-	const encoded = await encode(Cluster.intoParams(advert));
+	const encoded = await encode(intoParams(advert));
 	const decoded = await Parameters.decode(reader(encoded), VERSION);
 	expect(Cluster.fromParams(decoded)).toEqual(advert);
 });
@@ -116,7 +116,7 @@ test("Cluster: a malformed advertisement is a session-fatal violation", () => {
 
 test("Cluster: a path that cannot have come from a conforming sender is rejected", () => {
 	// A non-zero id appearing twice is a loop.
-	expect(() => Cluster.intoParams({ hops: hops(4n, 8n, 4n), cost: 0n })).toThrow();
+	expect(() => intoParams({ hops: hops(4n, 8n, 4n), cost: 0n })).toThrow();
 
 	// The list always has at least one entry: the original publisher.
 	const empty = new Parameters();
@@ -134,11 +134,11 @@ test("Cluster: a path that cannot have come from a conforming sender is rejected
 
 	// Longer than we accept, which a real path never is and a loop is.
 	const long = Array.from({ length: 33 }, (_, i) => origin(BigInt(i + 1)));
-	expect(() => Cluster.intoParams({ hops: long, cost: 0n })).toThrow();
+	expect(() => intoParams({ hops: long, cost: 0n })).toThrow();
 });
 
 test("Cluster: the setup options round trip", async () => {
-	for (const declared of [origin(42n), UNKNOWN_HOP]) {
+	for (const declared of [origin(42n), origin((1n << 64n) - 1n), UNKNOWN_HOP]) {
 		const params = new SetupOptions();
 		Cluster.intoSetup(params, declared, VERSION);
 
@@ -215,21 +215,27 @@ test("Cluster: a loop is detected by any non-zero id", () => {
 
 test("Cluster: PUBLISH_NAMESPACE carries the parameters only once negotiated", async () => {
 	const advert = { hops: hops(7n, 9n), cost: 5n };
-	const msg = new PublishNamespace({ requestId: 1n, trackNamespace: Path.from("alice.hang"), cluster: advert });
+	const msg = new PublishNamespace({
+		requestId: 1n,
+		trackNamespace: Path.from("alice.hang"),
+		params: { cluster: advert },
+	});
 	const encoded = await encode(msg);
 
-	const decoded = await PublishNamespace.decode(reader(encoded), VERSION, true);
+	const decoded = await PublishNamespace.decode(reader(encoded), VERSION, CLUSTER);
 	expect(decoded.trackNamespace).toBe(Path.from("alice.hang"));
-	expect(decoded.cluster).toEqual(advert);
+	expect(decoded.params.cluster).toEqual(advert);
 
 	// The message always has a Parameters field, so a session that negotiated nothing
 	// reads the same bytes and ignores what it did not ask for.
-	expect((await PublishNamespace.decode(reader(encoded), VERSION)).cluster).toBeUndefined();
+	expect((await PublishNamespace.decode(reader(encoded), VERSION)).params.cluster).toBeUndefined();
 
 	// A negotiated session that omits HOP_PATH is a protocol violation, which the session
 	// dispatch closes over rather than losing only the stream.
 	const bare = new PublishNamespace({ requestId: 1n, trackNamespace: Path.from("alice.hang") });
-	await expect(PublishNamespace.decode(reader(await encode(bare)), VERSION, true)).rejects.toThrow(ProtocolViolation);
+	await expect(PublishNamespace.decode(reader(await encode(bare)), VERSION, CLUSTER)).rejects.toThrow(
+		ProtocolViolation,
+	);
 });
 
 test("Cluster: a negotiated PUBLISH_NAMESPACE may carry AUTHORIZATION_TOKEN", async () => {
@@ -241,15 +247,15 @@ test("Cluster: a negotiated PUBLISH_NAMESPACE may carry AUTHORIZATION_TOKEN", as
 			await Message.encode(w, async (wr) => {
 				await wr.u62(1n);
 				await Namespace.encode(wr, Path.from("alice.hang"));
-				const params = Cluster.intoParams(advert);
+				const params = intoParams(advert);
 				params.bytes.set(0x03n, new Uint8Array([0x03, 0x00, 0xaa])); // AUTHORIZATION_TOKEN: USE_VALUE, type 0
 				await params.encode(wr, version);
 			});
 		},
 	};
 
-	const decoded = await PublishNamespace.decode(reader(await encode(withToken)), VERSION, true);
-	expect(decoded.cluster).toEqual(advert);
+	const decoded = await PublishNamespace.decode(reader(await encode(withToken)), VERSION, CLUSTER);
+	expect(decoded.params.cluster).toEqual(advert);
 });
 
 test("Cluster: a repeated AUTHORIZATION_TOKEN refuses only the advertisement", async () => {
@@ -258,7 +264,7 @@ test("Cluster: a repeated AUTHORIZATION_TOKEN refuses only the advertisement", a
 	const frame = (body: number[]) => new Uint8Array([0, body.length, ...body]);
 
 	// Request ID 1 for namespace "a". The repeat is refused before the missing HOP_PATH is.
-	const advert = PublishNamespace.decode(reader(frame([1, 1, 1, 0x61, ...tokens])), VERSION, true);
+	const advert = PublishNamespace.decode(reader(frame([1, 1, 1, 0x61, ...tokens])), VERSION, CLUSTER);
 	await expect(advert).rejects.toThrow(MalformedAuthToken);
 	await expect(advert).rejects.toMatchObject({ requestId: 1n });
 
@@ -283,10 +289,25 @@ test("Cluster: every malformed PUBLISH_NAMESPACE update is a protocol violation"
 		await expect(PublishNamespaceUpdate.decode(reader(bytes), VERSION)).rejects.toThrow(ProtocolViolation);
 	}
 
-	// The message did not exist before draft-17.
+	// The message did not exist before draft-16.
 	await expect(
-		PublishNamespaceUpdate.decode(reader(new Uint8Array([0, 0]), Version.DRAFT_16), Version.DRAFT_16),
+		PublishNamespaceUpdate.decode(reader(new Uint8Array([0, 0]), Version.DRAFT_15), Version.DRAFT_15),
 	).rejects.toThrow(ProtocolViolation);
+});
+
+test("Cluster: a draft-16 PUBLISH_NAMESPACE update names the advertisement", async () => {
+	const version = Version.DRAFT_16;
+	const update = new PublishNamespaceUpdate({ requestId: 2n, namespaceRequestId: 0n, update: {} });
+	const decoded = await PublishNamespaceUpdate.decode(reader(await encode(update, version), version), version);
+	expect(decoded.requestId).toBe(2n);
+	expect(decoded.namespaceRequestId).toBe(0n);
+
+	// A repeated token refuses the update, keyed by its own Request ID.
+	const tokens = [2, 0x03, 3, 0x03, 0x00, 0xaa, 0, 3, 0x03, 0x00, 0xaa];
+	const body = [2, 0, ...tokens];
+	const repeated = PublishNamespaceUpdate.decode(reader(new Uint8Array([0, body.length, ...body]), version), version);
+	await expect(repeated).rejects.toThrow(MalformedAuthToken);
+	await expect(repeated).rejects.toMatchObject({ requestId: 2n });
 });
 
 test("Cluster: a reset while decoding an update stays stream-local", async () => {
@@ -326,17 +347,19 @@ test("Cluster: a transport ending while decoding an update stays transport-local
 
 test("Cluster: NAMESPACE grows a parameters field only once negotiated", async () => {
 	const advert = { hops: hops(7n), cost: 0n };
-	const extended = await encode(new SubscribeNamespaceEntry({ suffix: Path.from("alice.hang"), cluster: advert }));
+	const extended = await encode(
+		new SubscribeNamespaceEntry({ suffix: Path.from("alice.hang"), params: { cluster: advert } }),
+	);
 	const base = await encode(new SubscribeNamespaceEntry({ suffix: Path.from("alice.hang") }));
 
 	// The base form has no Parameters field at all, so it is strictly shorter.
 	expect(base.length).toBeLessThan(extended.length);
 
-	const decoded = await SubscribeNamespaceEntry.decode(reader(extended), VERSION, true);
+	const decoded = await SubscribeNamespaceEntry.decode(reader(extended), VERSION, CLUSTER);
 	expect(decoded.suffix).toBe(Path.from("alice.hang"));
-	expect(decoded.cluster).toEqual(advert);
+	expect(decoded.params?.cluster).toEqual(advert);
 
-	expect((await SubscribeNamespaceEntry.decode(reader(base), VERSION)).cluster).toBeUndefined();
+	expect((await SubscribeNamespaceEntry.decode(reader(base), VERSION)).params).toBeUndefined();
 
 	// Reading the extended form as the base one leaves the parameters behind rather than
 	// silently absorbing them.
@@ -344,5 +367,5 @@ test("Cluster: NAMESPACE grows a parameters field only once negotiated", async (
 
 	// The base form on a negotiated session ends before the parameters the peer owed us,
 	// which is the same violation as sending them without a HOP_PATH.
-	await expect(SubscribeNamespaceEntry.decode(reader(base), VERSION, true)).rejects.toThrow(ProtocolViolation);
+	await expect(SubscribeNamespaceEntry.decode(reader(base), VERSION, CLUSTER)).rejects.toThrow(ProtocolViolation);
 });

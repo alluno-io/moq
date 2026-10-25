@@ -17,6 +17,8 @@
 //! - <https://www.ietf.org/archive/id/draft-ietf-moq-msf-01.txt>
 //! - <https://www.ietf.org/archive/id/draft-ietf-moq-cmsf-00.txt>
 
+#![warn(missing_docs)]
+
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -108,6 +110,9 @@ impl<T: Serialize + serde::de::DeserializeOwned + Default + Clone + Send + Unpin
 pub struct Track {
 	/// Unique track name (case-sensitive).
 	pub name: String,
+
+	/// The track's absolute namespace; absent inherits the catalog's namespace.
+	pub namespace: Option<String>,
 
 	/// Packaging mode.
 	pub packaging: Packaging,
@@ -220,10 +225,13 @@ impl<E: CatalogExt> Catalog<E> {
 	pub fn to_json(&self) -> Result<String, serde_json::Error> {
 		serde_json::to_string(self)
 	}
+}
+
+impl<E: CatalogExt> FromStr for Catalog<E> {
+	type Err = serde_json::Error;
 
 	/// Deserialize an MSF catalog from a JSON string.
-	#[allow(clippy::should_implement_trait)]
-	pub fn from_str(s: &str) -> Result<Self, serde_json::Error> {
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		serde_json::from_str(s)
 	}
 }
@@ -472,6 +480,7 @@ impl Track {
 	pub fn new(name: impl Into<String>, packaging: Packaging) -> Self {
 		Self {
 			name: name.into(),
+			namespace: None,
 			packaging,
 			is_live: false,
 			role: None,
@@ -620,11 +629,24 @@ impl<'de> Deserialize<'de> for Role {
 
 #[cfg(test)]
 mod test {
+	#[test]
+	fn track_namespace_round_trips() {
+		for version in ["1", "\"draft-01\""] {
+			let wire = format!(
+				r#"{{"version": {version}, "tracks": [{{"name": "video", "namespace": "room/left", "packaging": "loc"}}]}}"#
+			);
+			let catalog = Catalog::<()>::from_str(&wire).unwrap();
+			let encoded: serde_json::Value = serde_json::from_str(&catalog.to_json().unwrap()).unwrap();
+			assert_eq!(encoded["tracks"][0]["namespace"], "room/left");
+		}
+	}
+
 	use super::*;
 
 	fn video_track() -> Track {
 		Track {
 			name: "video0".to_string(),
+			namespace: None,
 			packaging: Packaging::Legacy,
 			is_live: true,
 			role: Some(Role::Video),
@@ -651,6 +673,7 @@ mod test {
 	fn audio_track() -> Track {
 		Track {
 			name: "audio0".to_string(),
+			namespace: None,
 			packaging: Packaging::Legacy,
 			is_live: true,
 			role: Some(Role::Audio),
@@ -677,6 +700,7 @@ mod test {
 	fn track_with_sap_and_jitter() -> Track {
 		Track {
 			name: "video0".to_string(),
+			namespace: None,
 			packaging: Packaging::Cmaf,
 			is_live: true,
 			role: Some(Role::Video),
@@ -911,12 +935,6 @@ mod test {
 	}
 
 	#[test]
-	fn draft01_string_version_decodes() {
-		let catalog = Catalog::<()>::from_str(r#"{"version":"draft-01","tracks":[]}"#).unwrap();
-		assert!(catalog.tracks.is_empty());
-	}
-
-	#[test]
 	fn unknown_version_string_is_accepted() {
 		// A future draft we don't specifically recognize still decodes; we don't
 		// expose the version, so callers are unaffected.
@@ -1064,7 +1082,7 @@ mod test {
 	fn draft00_example_av_decodes() {
 		// Example 1 from draft-ietf-moq-msf-00: time-aligned audio/video. Exercises the
 		// numeric version, integer framerate into an f64 field, preserved generatedAt,
-		// and unmodeled fields (namespace, targetLatency) which must be ignored.
+		// and unmodeled fields (targetLatency) which must be ignored.
 		let json = r#"{
 			"version": 1,
 			"generatedAt": 1746104606044,

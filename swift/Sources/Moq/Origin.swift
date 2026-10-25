@@ -26,8 +26,8 @@ public final class OriginProducer: Sendable {
     /// A service that only serves some of them rejects the rest as they are
     /// requested. Create, `dynamic` if tracks are served on demand, populate,
     /// then `BroadcastProducer.announce`.
-    public func dynamic(prefix: String, route: Route = Route()) throws -> OriginDynamic {
-        OriginDynamic(try ffi.dynamic(prefix: prefix, route: route))
+    public func dynamic(prefix: String) throws -> OriginDynamic {
+        OriginDynamic(try ffi.dynamic(prefix: prefix))
     }
 
     /// Create a broadcast at `path`, returning the producer that feeds it.
@@ -54,14 +54,33 @@ public final class BroadcastRequest: Sendable {
         get throws { try ffi.path() }
     }
 
-    /// Serve the request with an unannounced broadcast.
-    public func accept(broadcast: BroadcastProducer) throws {
-        try ffi.accept(broadcast: broadcast.ffi)
+    /// Start an answer under a new epoch, hidden until published.
+    public func prepare(epoch: String) throws -> BroadcastPrepared {
+        BroadcastPrepared(try ffi.prepare(epoch: epoch))
     }
 
     /// Reject the request with an application error code.
     public func reject(errorCode: UInt16) throws {
         try ffi.reject(errorCode: errorCode)
+    }
+}
+
+/// A claim answer being filled before its exact route is announced.
+public final class BroadcastPrepared: Sendable {
+    let ffi: MoqBroadcastPrepared
+
+    init(_ ffi: MoqBroadcastPrepared) {
+        self.ffi = ffi
+    }
+
+    /// The unannounced broadcast to fill before publishing; only `publish` announces it.
+    public var broadcast: BroadcastProducer {
+        BroadcastProducer(ffi.broadcast())
+    }
+
+    /// Announce the filled broadcast and resolve every waiting requester.
+    public func publish() throws -> BroadcastProducer {
+        BroadcastProducer(try ffi.publish())
     }
 }
 
@@ -81,11 +100,6 @@ public final class OriginDynamic: AsyncSequence, Sendable {
     /// The next requested broadcast. Throws `Closed` once the origin closes.
     public func requestedBroadcast() async throws -> BroadcastRequest {
         BroadcastRequest(try await ffi.requestedBroadcast())
-    }
-
-    /// Re-price the route in place: replace its hops and costs.
-    public func update(route: Route) throws {
-        try ffi.update(route: route)
     }
 
     /// Cancel all current and future `requestedBroadcast()` calls and retract
@@ -116,7 +130,7 @@ public final class OriginConsumer: Sendable {
         AnnounceConsumer(try ffi.announced(config: MoqAnnounceConfig(prefix: prefix, filter: filter, hidden: hidden)))
     }
 
-    /// Wait for a route covering an exact path, then resolve the broadcast there.
+    /// Follow an exact path, resolving each publisher instance that serves it.
     public func announcedBroadcast(path: String) throws -> AnnouncedBroadcast {
         AnnouncedBroadcast(try ffi.announcedBroadcast(path: path))
     }
@@ -171,8 +185,12 @@ public final class AnnouncedBroadcast: Sendable {
         self.ffi = ffi
     }
 
-    /// Suspend until a route covers the path, then resolve the broadcast there.
-    /// Throws `Closed` if cancelled or the origin closes first.
+    /// Suspend until the next publisher instance serves the path, then resolve it.
+    /// The first call resolves the instance serving the path once one is announced.
+    /// Each later call waits for another to take over (a restarted publisher, or a
+    /// replacement session) or for the broadcast to return after it went offline.
+    /// Drop what was read from the previous instance then: its tracks end when its
+    /// session does. Throws `Closed` if cancelled or the origin closes first.
     public func available() async throws -> BroadcastConsumer {
         BroadcastConsumer(try await ffi.available())
     }

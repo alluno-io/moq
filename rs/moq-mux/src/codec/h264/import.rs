@@ -13,7 +13,7 @@
 
 use bytes::Bytes;
 
-use super::{Error, NAL_TYPE_SPS, Sps};
+use super::{Error, NAL_TYPE_SEI, NAL_TYPE_SPS, Sps};
 use crate::Result;
 use crate::catalog::hang::CatalogExt;
 use crate::codec::annexb::NalIterator;
@@ -27,9 +27,9 @@ use crate::container::Frame;
 /// The catalog rendition fills in lazily once the codec config is known (avcC via
 /// [`initialize`](Self::initialize) for avc1, the first SPS for avc3).
 pub struct Import {
-	/// True for the avc1 shape: the codec config is out-of-band (avcC), so
-	/// keyframes are not scanned for an inline SPS.
-	avc1: bool,
+	/// The NALU length size for the avc1 shape, whose codec config is out-of-band (avcC), so
+	/// keyframes are not scanned for an inline SPS. `None` for Annex-B.
+	length_size: Option<usize>,
 	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::VideoConfig>,
 	catalog: crate::codec::video::Catalog,
 	last_sps: Option<Bytes>,
@@ -52,7 +52,7 @@ impl Import {
 		let catalog = crate::codec::video::Catalog::new(hint);
 		let track = reserved.video(track, wire, None)?;
 		let mut import = Self {
-			avc1: false,
+			length_size: None,
 			track,
 			catalog,
 			last_sps: None,
@@ -86,7 +86,9 @@ impl Import {
 		// Only switch to avc1 mode once the avcC actually parses, so a parse failure leaves the
 		// importer in avc3 mode where inline-SPS keyframes still self-initialize.
 		let config = config_from_avcc(avcc_bytes)?;
-		self.avc1 = true;
+		// A new record starts a new coded sequence, whose HDR metadata the samples will carry.
+		self.catalog.hdr(&mut self.track, Default::default(), true)?;
+		self.length_size = Some(super::Avcc::parse(avcc_bytes)?.length_size);
 		self.apply_config(config)?;
 		Ok(())
 	}
@@ -98,14 +100,25 @@ impl Import {
 		let mut nals = NalIterator::new(&mut scan);
 		while let Some(nal) = nals.next().transpose()? {
 			if is_sps(&nal) {
-				self.configure_from_sps(&nal)?;
+				self.seed_sps(&nal)?;
 			}
 		}
 		if let Some(nal) = nals.flush()?
 			&& is_sps(&nal)
 		{
-			self.configure_from_sps(&nal)?;
+			self.seed_sps(&nal)?;
 		}
+		Ok(())
+	}
+
+	/// Configure from an SPS in a seed buffer. A new one starts a coded sequence, so the last one's
+	/// HDR metadata is dropped before the config publishes; the seed's own SEI arrives with its
+	/// keyframe through the splitter.
+	fn seed_sps(&mut self, sps: &Bytes) -> Result<()> {
+		if self.last_sps.as_ref() != Some(sps) {
+			self.catalog.hdr(&mut self.track, Default::default(), true)?;
+		}
+		self.configure_from_sps(sps)?;
 		Ok(())
 	}
 
@@ -151,11 +164,6 @@ impl Import {
 		Ok(())
 	}
 
-	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: std::time::Instant) -> crate::Result<()> {
-		self.track.flush(timestamp, now)
-	}
-
 	/// Record a frame's reorder delay (`PTS - DTS`) so the catalog `jitter` reflects the
 	/// B-frame reorder depth (the decode buffer a transmuxer/player must hold). The
 	/// container supplies this since the elementary stream alone carries no decode time.
@@ -173,7 +181,8 @@ impl Import {
 			return Ok(());
 		}
 		let config = config_from_sps(sps_nal)?;
-		self.last_sps = Some(sps_nal.clone());
+		// Own just the parameter set: the access unit it was found in is far larger.
+		self.last_sps = Some(Bytes::copy_from_slice(sps_nal));
 		self.apply_config(config)?;
 		Ok(())
 	}
@@ -190,13 +199,18 @@ impl Import {
 	/// keyframe's inline SPS and refining the catalog jitter as it goes.
 	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		for frame in frames {
-			// avc1 config arrives out-of-band via initialize(); avc3 carries SPS
-			// inline on keyframes.
-			if !self.avc1
-				&& frame.keyframe
-				&& let Some(sps) = find_sps(&frame.payload)
-			{
-				self.configure_from_sps(&sps)?;
+			if frame.keyframe {
+				let hdr =
+					crate::codec::color::access_unit(&frame.payload, self.length_size, 1, |h| h & 0x1f == NAL_TYPE_SEI);
+				// avc1 config arrives out-of-band via initialize(); avc3 carries the SPS inline.
+				let sps = self.length_size.is_none().then(|| find_sps(&frame.payload)).flatten();
+				// A new SPS starts a coded sequence whose HDR metadata replaces the last one's. It goes
+				// first, so a keyframe that also configures publishes once.
+				let sequence = sps.as_ref().is_some_and(|sps| self.last_sps.as_ref() != Some(sps));
+				self.catalog.hdr(&mut self.track, hdr, sequence)?;
+				if let Some(sps) = sps {
+					self.configure_from_sps(&sps)?;
+				}
 			}
 
 			if !self.catalog.configured() {
@@ -237,7 +251,7 @@ pub fn config(buf: &[u8]) -> Result<hang::catalog::VideoConfig> {
 
 /// The config an `AVCDecoderConfigurationRecord` describes, stored verbatim as the `description`
 /// (`inline: false`, the avc1 shape).
-fn config_from_avcc(avcc_bytes: &[u8]) -> Result<hang::catalog::VideoConfig> {
+pub(crate) fn config_from_avcc(avcc_bytes: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	let avcc = super::Avcc::parse(avcc_bytes)?;
 
 	let mut config = hang::catalog::VideoConfig::new(hang::catalog::H264 {
@@ -248,7 +262,10 @@ fn config_from_avcc(avcc_bytes: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	});
 	config.coded_width = avcc.coded_width;
 	config.coded_height = avcc.coded_height;
-	config.framerate = avcc.sps.first().and_then(|sps| super::sps_framerate(sps));
+	config.interlaced = avcc.sps.first().and_then(|sps| super::sps_interlaced(sps)) == Some(true);
+	if let Some(vui) = avcc.sps.first().and_then(|sps| super::sps_vui(sps)) {
+		vui.apply(&mut config);
+	}
 	config.description = Some(Bytes::copy_from_slice(avcc_bytes));
 	Ok(config)
 }
@@ -266,7 +283,10 @@ fn config_from_sps(sps_nal: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	});
 	config.coded_width = Some(sps.coded_width);
 	config.coded_height = Some(sps.coded_height);
-	config.framerate = super::sps_framerate(sps_nal);
+	config.interlaced = super::sps_interlaced(sps_nal) == Some(true);
+	if let Some(vui) = super::sps_vui(sps_nal) {
+		vui.apply(&mut config);
+	}
 	Ok(config)
 }
 
@@ -302,6 +322,231 @@ mod tests {
 		(track, catalog)
 	}
 
+	/// An HDR10 keyframe publishes its VUI colour and the static HDR metadata its SEI carries.
+	#[tokio::test(start_paused = true)]
+	async fn avc3_keyframe_publishes_hdr10_color() {
+		use crate::codec::h264::fixtures::{PPS, SEI_CONTENT_LIGHT, SEI_MASTERING, SPS_HDR10};
+
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let mut annexb = BytesMut::new();
+		for nal in [SPS_HDR10, PPS, SEI_MASTERING, SEI_CONTENT_LIGHT, idr] {
+			annexb.extend_from_slice(&[0, 0, 0, 1]);
+			annexb.extend_from_slice(nal);
+		}
+
+		let mut split = Split::new();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+		frames.extend(split.flush(pts).expect("flush keyframe"));
+		import.decode(frames).expect("decode keyframe");
+
+		let color = catalog.snapshot().video.renditions["video"]
+			.color
+			.clone()
+			.expect("colour");
+		assert_eq!(
+			(color.primaries, color.transfer, color.matrix, color.range),
+			(Some(9), Some(16), Some(9), Some(hang::catalog::Range::Limited))
+		);
+		let hdr = crate::codec::color::test::hdr10();
+		assert_eq!(
+			(color.mastering, color.content_light),
+			(hdr.mastering, hdr.content_light)
+		);
+	}
+
+	/// HDR metadata merges across keyframes of one coded sequence, and a new SPS drops it, so an
+	/// HDR-to-SDR switch never keeps stale HDR10 values.
+	#[tokio::test(start_paused = true)]
+	async fn a_new_sps_drops_stale_hdr_metadata() {
+		use crate::codec::h264::fixtures::{PPS, SEI_CONTENT_LIGHT, SEI_MASTERING, SPS_BT709, SPS_HDR10};
+
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let mut split = Split::new();
+		let mut keyframe = |ms: u64, nals: &[&[u8]]| {
+			let mut annexb = BytesMut::new();
+			for nal in nals {
+				annexb.extend_from_slice(&[0, 0, 0, 1]);
+				annexb.extend_from_slice(nal);
+			}
+			let pts = moq_net::Timestamp::from_millis(ms).unwrap();
+			let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+			frames.extend(split.flush(pts).expect("flush keyframe"));
+			import.decode(frames).expect("decode keyframe");
+			catalog.snapshot().video.renditions["video"]
+				.color
+				.clone()
+				.expect("colour")
+		};
+
+		let color = keyframe(0, &[SPS_HDR10, PPS, SEI_MASTERING, SEI_CONTENT_LIGHT, idr]);
+		assert!(color.mastering.is_some());
+		let color = keyframe(40, &[SPS_HDR10, PPS, idr]);
+		assert!(color.mastering.is_some(), "the same sequence keeps its metadata");
+		let color = keyframe(80, &[SPS_BT709, PPS, idr]);
+		assert_eq!(color.primaries, Some(1));
+		assert_eq!((color.mastering, color.content_light), (None, None));
+	}
+
+	/// A frame-only SPS declares its reorder depth, which holds for the track's life: a later SPS
+	/// declaring less or none keeps it, and one declaring more is refused.
+	#[tokio::test(start_paused = true)]
+	async fn a_declared_reorder_depth_holds_for_the_track() {
+		use crate::codec::h264::fixtures::{PPS, SPS_FIELD, SPS_IPB, SPS_PYRAMID};
+
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let (deep, catalog) = setup("deep");
+		let (shallow, _) = setup("shallow");
+		let mut deep = Import::new(deep, catalog.reserve(), Default::default()).unwrap();
+		let mut shallow = Import::new(shallow, catalog.reserve(), Default::default()).unwrap();
+		let mut split = Split::new();
+		let mut keyframe = |import: &mut Import, name: &str, ms: u64, sps: &[u8]| {
+			let mut annexb = BytesMut::new();
+			for nal in [sps, PPS, idr] {
+				annexb.extend_from_slice(&[0, 0, 0, 1]);
+				annexb.extend_from_slice(nal);
+			}
+			let pts = moq_net::Timestamp::from_millis(ms).unwrap();
+			let mut frames = split.decode(&annexb, pts).expect("split keyframe");
+			frames.extend(split.flush(pts).expect("flush keyframe"));
+			import
+				.decode(frames)
+				.map(|()| catalog.snapshot().video.renditions[name].reorder)
+		};
+
+		assert_eq!(keyframe(&mut deep, "deep", 0, SPS_PYRAMID).unwrap(), Some(2));
+		assert_eq!(keyframe(&mut deep, "deep", 40, SPS_IPB).unwrap(), Some(2));
+		assert_eq!(
+			keyframe(&mut deep, "deep", 80, SPS_FIELD).unwrap(),
+			Some(2),
+			"fields declare none"
+		);
+		assert_eq!(keyframe(&mut shallow, "shallow", 0, SPS_IPB).unwrap(), Some(1));
+		assert!(keyframe(&mut shallow, "shallow", 40, SPS_PYRAMID).is_err());
+	}
+
+	/// A new out-of-band avcC starts a new coded sequence, so in-band HDR metadata from the last one
+	/// is dropped.
+	#[tokio::test(start_paused = true)]
+	async fn a_new_avcc_drops_stale_hdr_metadata() {
+		use crate::codec::h264::fixtures::{PPS, SEI_CONTENT_LIGHT, SEI_MASTERING, SPS_BT709, SPS_HDR10};
+
+		let avcc = |sps: &'static [u8]| {
+			crate::codec::h264::build_avcc(&[Bytes::from_static(sps)], &[Bytes::from_static(PPS)]).unwrap()
+		};
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		import.initialize(&avcc(SPS_HDR10)).unwrap();
+
+		let mut au = Vec::new();
+		for nal in [SEI_MASTERING, SEI_CONTENT_LIGHT, &[0x65, 0x88, 0x84, 0x21][..]] {
+			au.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+			au.extend_from_slice(nal);
+		}
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		import
+			.decode([crate::codec::h264::avc1_frame(au, 4, pts).unwrap()])
+			.unwrap();
+		let color = || catalog.snapshot().video.renditions["video"].color.clone().unwrap();
+		assert!(color().mastering.is_some());
+
+		import.initialize(&avcc(SPS_BT709)).unwrap();
+		assert_eq!(color().primaries, Some(1));
+		assert_eq!((color().mastering, color().content_light), (None, None));
+	}
+
+	/// Seeding an Annex-B importer with a new SPS starts a new coded sequence, dropping the last
+	/// one's HDR metadata before the new config publishes.
+	#[tokio::test(start_paused = true)]
+	async fn a_new_seed_sps_drops_stale_hdr_metadata() {
+		use crate::codec::h264::fixtures::{PPS, SEI_CONTENT_LIGHT, SEI_MASTERING, SPS_BT709, SPS_HDR10};
+
+		let annexb = |nals: &[&[u8]]| {
+			let mut buf = BytesMut::new();
+			for nal in nals {
+				buf.extend_from_slice(&[0, 0, 0, 1]);
+				buf.extend_from_slice(nal);
+			}
+			buf
+		};
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let mut split = Split::new();
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let idr: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+		let au = annexb(&[SPS_HDR10, PPS, SEI_MASTERING, SEI_CONTENT_LIGHT, idr]);
+		let mut frames = split.decode(&au, pts).unwrap();
+		frames.extend(split.flush(pts).unwrap());
+		import.decode(frames).unwrap();
+		let color = || catalog.snapshot().video.renditions["video"].color.clone().unwrap();
+		assert!(color().mastering.is_some());
+
+		import.initialize(&annexb(&[SPS_BT709, PPS])).unwrap();
+		assert_eq!(color().primaries, Some(1));
+		assert_eq!((color().mastering, color().content_light), (None, None));
+	}
+
+	/// The stream outranks the caller's hint, which only fills what the stream leaves unsaid.
+	#[tokio::test(start_paused = true)]
+	async fn stream_color_outranks_the_hint() {
+		use crate::codec::h264::fixtures::{PPS, SPS_BT709};
+
+		let mut hinted = hang::catalog::Color::default();
+		hinted.primaries = Some(9);
+		hinted.content_light = crate::codec::color::test::hdr10().content_light;
+		let hint = crate::catalog::VideoHint {
+			color: Some(hinted),
+			..Default::default()
+		};
+
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), hint).unwrap();
+		let avcc =
+			crate::codec::h264::build_avcc(&[Bytes::from_static(SPS_BT709)], &[Bytes::from_static(PPS)]).unwrap();
+		import.initialize(&avcc).unwrap();
+
+		let color = catalog.snapshot().video.renditions["video"]
+			.color
+			.clone()
+			.expect("colour");
+		assert_eq!(color.primaries, Some(1), "the SPS outranks the hint");
+		assert_eq!(color.content_light, crate::codec::color::test::hdr10().content_light);
+	}
+
+	#[test]
+	fn annexb_resolves_display_aspect() {
+		use crate::codec::h264::fixtures;
+		for (sps, expected) in [
+			(fixtures::SPS_IPB, (None, None)),
+			(fixtures::SPS_ANAMORPHIC, (Some(16), Some(9))),
+			(fixtures::SPS_EXTENDED_SAR, (Some(28), Some(15))),
+		] {
+			let mut inline = vec![0, 0, 0, 1];
+			inline.extend_from_slice(sps);
+			let config = config(&inline).unwrap();
+			assert_eq!((config.display_aspect_width, config.display_aspect_height), expected);
+		}
+	}
+
+	#[test]
+	fn avcc_resolves_display_aspect() {
+		use crate::codec::h264::fixtures;
+		for (sps, expected) in [
+			(fixtures::SPS_IPB, (None, None)),
+			(fixtures::SPS_ANAMORPHIC, (Some(16), Some(9))),
+			(fixtures::SPS_EXTENDED_SAR, (Some(28), Some(15))),
+		] {
+			let avcc =
+				super::super::build_avcc(&[Bytes::from_static(sps)], &[Bytes::from_static(fixtures::PPS)]).unwrap();
+			let config = config(&avcc).unwrap();
+			assert_eq!((config.display_aspect_width, config.display_aspect_height), expected);
+		}
+	}
+
 	/// Only a fixed-rate SPS states the frame rate; without `fixed_frame_rate_flag` its tick is a
 	/// ceiling, left for the catalog estimator to measure.
 	#[test]
@@ -318,6 +563,22 @@ mod tests {
 		let mut inline = vec![0, 0, 0, 1];
 		inline.extend_from_slice(fixtures::SPS_IPB_VARIABLE);
 		assert_eq!(config(&inline).unwrap().framerate, None);
+	}
+
+	/// `frame_mbs_only_flag` 0 marks the rendition interlaced, in both the avc1 and avc3 shapes.
+	#[test]
+	fn config_marks_field_coding_interlaced() {
+		use crate::codec::h264::fixtures;
+
+		for (sps, interlaced) in [(fixtures::SPS_IPB, false), (fixtures::SPS_FIELD, true)] {
+			let avcc =
+				super::super::build_avcc(&[Bytes::from_static(sps)], &[Bytes::from_static(fixtures::PPS)]).unwrap();
+			assert_eq!(config(&avcc).unwrap().interlaced, interlaced);
+
+			let mut inline = vec![0, 0, 0, 1];
+			inline.extend_from_slice(sps);
+			assert_eq!(config(&inline).unwrap().interlaced, interlaced);
+		}
 	}
 
 	/// An avcC initializer resolves a config with the avcC stored as `description`.

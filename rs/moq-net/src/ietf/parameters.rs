@@ -17,6 +17,8 @@ pub enum ParameterVarInt {
 	/// Removed in draft-17; only used in draft-14/15/16.
 	MaxRequestId = 2,
 	MaxAuthTokenCacheSize = 4,
+	/// MAX_REQUEST_UPDATES, added in draft-19.
+	MaxRequestUpdates = super::request_update::OPTION,
 	/// HOP_ID, from the MoQ Cluster extension.
 	HopId = super::cluster::HOP_ID,
 	/// RELAY_COST, from the MoQ Cluster extension.
@@ -29,6 +31,12 @@ pub enum ParameterVarInt {
 	Auth = super::auth::AUTH,
 	/// ACTIVE_COUNT, from the MoQ Active Count extension.
 	ActiveCount = super::active_count::ACTIVE_COUNT,
+	/// Subscriber max age, from the MoQ Timestamp extension.
+	MaxAge = super::max_age::OPTION,
+	/// EPOCH, from the MoQ Epoch extension.
+	Epoch = super::epoch::EPOCH,
+	/// DEFLATE-compressed tracks, from the MoQ Flate extension.
+	Flate = super::flate::OPTION,
 	#[num_enum(catch_all)]
 	Unknown(u64),
 }
@@ -87,7 +95,14 @@ impl Decode<Version> for Parameters {
 			// Unknown SETUP options may repeat, including GREASE; their values still
 			// have to be well-formed Key-Value-Pairs (draft-21 section 9.1).
 			if kind % 2 == 0 {
-				let kind = ParameterVarInt::from(kind);
+				let kind = match ParameterVarInt::from(kind) {
+					// Undefined before draft 19, so there an unknown option that may repeat.
+					ParameterVarInt::MaxRequestUpdates if !super::request_update::supported(version) => {
+						ParameterVarInt::Unknown(kind)
+					}
+					ParameterVarInt::Flate if !super::flate::supported(version) => ParameterVarInt::Unknown(kind),
+					kind => kind,
+				};
 				if !matches!(kind, ParameterVarInt::Unknown(_)) && params.get_varint(kind).is_some() {
 					return Err(DecodeError::Duplicate);
 				}
@@ -488,7 +503,7 @@ pub(crate) fn skip_unlisted(r: &mut Decoder<'_>, version: Version, key: u64) -> 
 /// ```
 macro_rules! encode_params {
 	($w:expr, $version:expr, $($key:expr => $val:expr),* $(,)?) => {{
-		#[allow(unused)]
+		#[allow(unused, reason = "a compile-time key order check")]
 		const _: () = {
 			let _keys: &[u64] = &[$($key),*];
 			let mut _i = 1;
@@ -500,14 +515,14 @@ macro_rules! encode_params {
 
 		let _version: $crate::ietf::Version = $version;
 
-		#[allow(unused_mut)]
+		#[allow(unused_mut, reason = "a call with no parameters never counts one")]
 		let mut _count: usize = 0;
 		$(_count += if $crate::ietf::Param::param_present(&$val) { 1 } else { 0 };)*
 		$w.varint(_count as u64)?;
 
-		#[allow(unused_mut, unused_assignments)]
+		#[allow(unused_mut, unused_assignments, reason = "a call with no parameters never tracks a key")]
 		let mut _prev_key: u64 = 0;
-		#[allow(unused_mut, unused_assignments)]
+		#[allow(unused_mut, unused_assignments, reason = "a call with no parameters never tracks a key")]
 		let mut _first: bool = true;
 		$(
 			if $crate::ietf::Param::param_present(&$val) {
@@ -545,11 +560,11 @@ macro_rules! encode_params {
 ///     0x20 => subscriber_priority: Option<u8>,
 /// );
 /// // forward: Option<bool> and subscriber_priority: Option<u8> are now in scope
-/// let subscriber_priority = subscriber_priority.unwrap_or(128);
+/// let subscriber_priority = subscriber_priority.unwrap_or(super::priority::DEFAULT_WIRE);
 /// ```
 macro_rules! decode_params {
 	($r:expr, $version:expr, $($key:expr => $name:ident: $ty:ty $(where $gate:expr)?),* $(,)?) => {
-		#[allow(unused)]
+		#[allow(unused, reason = "a compile-time key order check")]
 		const _: () = {
 			let _keys: &[u64] = &[$($key),*];
 			let mut _i = 1;
@@ -560,7 +575,7 @@ macro_rules! decode_params {
 		};
 
 		// Use internal Option wrapper for duplicate detection, then shadow with Default.
-		$(#[allow(unused_mut, non_snake_case)] let mut $name: Option<$ty> = None;)*
+		$(#[allow(unused_mut, non_snake_case, reason = "names come from the call site, and an absent parameter is never assigned")] let mut $name: Option<$ty> = None;)*
 
 		{
 			let _version: $crate::ietf::Version = $version;
@@ -569,7 +584,7 @@ macro_rules! decode_params {
 				return Err($crate::coding::DecodeError::TooMany);
 			}
 
-			#[allow(unused_mut, unused_assignments)]
+			#[allow(unused_mut, unused_assignments, reason = "a call with no parameters never tracks a key")]
 			let mut _prev_key: u64 = 0;
 			for _i in 0.._count {
 				let _wire = $r.varint()?;
@@ -602,7 +617,7 @@ macro_rules! decode_params {
 		}
 
 		// Shadow with unwrap_or_default: Option<T> defaults to None, T defaults to T::default()
-		$(#[allow(unused_variables)] let $name: $ty = $name.unwrap_or_default();)*
+		$(#[allow(unused_variables, reason = "a caller may decode a parameter it never reads")] let $name: $ty = $name.unwrap_or_default();)*
 	};
 }
 
@@ -610,6 +625,22 @@ macro_rules! decode_params {
 mod tests {
 	use super::super::Filter;
 	use super::*;
+
+	/// Before draft 19, 0x08 is an unknown SETUP option, so a peer may repeat it.
+	#[test]
+	fn max_request_updates_is_unknown_before_draft_19() {
+		// Draft 18: no count prefix, delta-encoded types, so the repeat is a delta of 0.
+		let block = [0x08, 0x01, 0x00, 0x02];
+		let mut r = Decoder::new(&block, Version::Draft18.into());
+		let params = Parameters::decode(&mut r, Version::Draft18).expect("a repeated unknown option is legal");
+		assert_eq!(params.get_varint(ParameterVarInt::MaxRequestUpdates), None);
+
+		let mut r = Decoder::new(&block, Version::Draft19.into());
+		assert!(matches!(
+			Parameters::decode(&mut r, Version::Draft19),
+			Err(DecodeError::Duplicate)
+		));
+	}
 
 	#[test]
 	fn setup_allows_repeated_unknown_options() {
@@ -1276,7 +1307,9 @@ mod tests {
 			0x3E, 0x06, // and again
 		];
 		let mut r = Decoder::new(&block, Version::Draft14.into());
-		Parameters::skip_request(&mut r).unwrap();
+		let tokens = Parameters::skip_request(&mut r).unwrap();
+		assert_eq!(tokens.len(), 2);
+		assert_eq!(tokens[1].0.kind, 1);
 		assert!(r.is_empty());
 	}
 

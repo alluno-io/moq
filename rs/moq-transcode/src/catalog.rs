@@ -288,7 +288,7 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 
 	let mut resolved: Vec<Resolved> = Vec::new();
 	for rung in ladder.rungs() {
-		let side = u64::from(rung.size);
+		let side = u64::from(rung.short_side);
 		let source_side = source_width.min(source_height);
 		if side > source_side {
 			continue;
@@ -307,8 +307,8 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 			continue;
 		}
 		resolved.push(Resolved {
-			name: format!("video/{}p", rung.size),
-			short_side: rung.size,
+			name: format!("video/{}p", rung.short_side),
+			short_side: rung.short_side,
 			size: moq_video::Size::new(width as u32, height as u32),
 			bitrate: rung.bitrate,
 			framerate,
@@ -341,10 +341,12 @@ pub(crate) async fn rung_entry(
 }
 
 /// Rungs are enabled exactly when the rendition the pipeline decodes is: a disabled source sends
-/// no frames, so neither can its rungs.
-pub(crate) fn inherit_enabled(rungs: &mut [Published], source: &VideoConfig) {
+/// no frames, so neither can its rungs. They share its preference too, so a viewer that prefers
+/// the source can still step down the ladder within the same tier.
+pub(crate) fn inherit(rungs: &mut [Published], source: &VideoConfig) {
 	for published in rungs {
 		published.entry.enabled = source.enabled;
+		published.entry.preference = source.preference;
 	}
 }
 
@@ -446,7 +448,7 @@ mod tests {
 			entry: source(640, 360, Some(600_000)),
 		}];
 
-		inherit_enabled(&mut published, &source_catalog.video.renditions["video"]);
+		inherit(&mut published, &source_catalog.video.renditions["video"]);
 		let mut out = moq_mux::catalog::hang::Catalog::default();
 		populate(&mut out, &source_catalog, &published, None).unwrap();
 		assert!(!out.video.renditions["video/360p"].enabled);
@@ -454,9 +456,39 @@ mod tests {
 		// Following an enabled input re-enables the rungs.
 		let healthy = source(1920, 1080, Some(5_000_000));
 		source_catalog.video.insert("healthy", healthy.clone()).unwrap();
-		inherit_enabled(&mut published, &healthy);
+		inherit(&mut published, &healthy);
 		populate(&mut out, &source_catalog, &published, None).unwrap();
 		assert!(out.video.renditions["video/360p"].enabled);
+	}
+
+	#[test]
+	fn rungs_inherit_the_source_preference() {
+		let mut source_catalog = moq_mux::catalog::hang::Catalog::default();
+		let mut src = source(1280, 720, Some(2_500_000));
+		src.preference = 1;
+		source_catalog.video.insert("video", src).unwrap();
+
+		let mut published = [Published {
+			rung: Resolved {
+				name: "video/360p".into(),
+				short_side: 360,
+				size: moq_video::Size::new(640, 360),
+				bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
+				framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+			},
+			entry: source(640, 360, Some(600_000)),
+		}];
+
+		inherit(&mut published, &source_catalog.video.renditions["video"]);
+		let mut out = moq_mux::catalog::hang::Catalog::default();
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(out.video.renditions["video/360p"].preference, 1);
+
+		// A source catalog edit that only re-ranks the source carries over to the rungs.
+		source_catalog.video.renditions.get_mut("video").unwrap().preference = -1;
+		inherit(&mut published, &source_catalog.video.renditions["video"]);
+		populate(&mut out, &source_catalog, &published, None).unwrap();
+		assert_eq!(out.video.renditions["video/360p"].preference, -1);
 	}
 
 	#[test]
@@ -933,6 +965,33 @@ mod tests {
 		assert_eq!(decoders.probed, [(Codec::H265, false)]);
 	}
 
+	/// The ladder transcodes video alone: audio is referenced in the source, with every field kept,
+	/// so a player decodes exactly what the source published.
+	#[test]
+	fn populate_passes_audio_through_untouched() {
+		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
+		let mut audio = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2);
+		audio.description = Some(
+			moq_mux::codec::opus::Config::new(48_000, 2)
+				.with_pre_skip(312)
+				.encode()
+				.unwrap(),
+		);
+		audio.bitrate = Some(128_000);
+		audio.track = Some("1.m4s".to_string());
+		audio.jitter = Some(std::time::Duration::from_millis(20));
+		child.audio.insert("audio", audio.clone()).unwrap();
+
+		let rel = RelativeOwned::from(".".to_string());
+		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
+		populate(&mut out, &child, &[], Some(&rel)).unwrap();
+
+		let mut expected = audio;
+		expected.broadcast = Some(rel);
+		assert_eq!(out.audio.renditions.get("audio"), Some(&expected));
+		assert_eq!(out.audio.renditions.len(), 1);
+	}
+
 	#[test]
 	fn populate_preserves_the_child_archive() {
 		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
@@ -941,9 +1000,10 @@ mod tests {
 			.insert("video", source(1920, 1080, Some(6_000_000)))
 			.unwrap();
 		let mut archive = hang::catalog::Archive::new();
-		archive
-			.timelines
-			.insert("video".to_string(), "video.timeline.z".to_string());
+		archive.timelines.insert(
+			"video".to_string(),
+			hang::catalog::Timeline::new("video.timeline.z", 4_000),
+		);
 		archive.replay = Some(RelativeOwned::from("./recordings/clip".to_string()));
 		archive.version = Some(hang::catalog::Archive::VERSION);
 		child.archive = Some(archive.clone());
@@ -960,11 +1020,13 @@ mod tests {
 	/// `modify()`, so the derivative's clock carries that mapping and its data is stamped on it.
 	#[tokio::test(start_paused = true)]
 	async fn a_derivative_stamps_on_its_source_clock() {
-		use std::time::{Duration, Instant, SystemTime};
+		use std::time::Duration;
 
 		// A minute in, the source's mapping is far from the one a fresh clock would advertise.
 		let ago = Duration::from_secs(60);
-		let clock = moq_mux::Clock::at(Instant::now() - ago, SystemTime::now() - ago).unwrap();
+		let _ = moq_net::time::Instant::now();
+		tokio::time::advance(ago).await;
+		let clock = moq_mux::Clock::at(moq_net::time::Instant::now() - ago, moq_clock::wall() - ago).unwrap();
 		let mut input = moq_net::broadcast::Info::default().produce();
 		let source =
 			moq_mux::catalog::Producer::new(&mut input, moq_mux::catalog::Config::default().with_clock(clock)).unwrap();
@@ -986,7 +1048,7 @@ mod tests {
 			.unwrap();
 		let mut subscriber = status.consume();
 		tokio::time::advance(Duration::from_secs(3)).await;
-		status.update(&1).unwrap();
+		status.update(moq_net::Timed::from(&1).at(adopted.now())).unwrap();
 
 		let waiter = kio::Waiter::noop();
 		let std::task::Poll::Ready(Ok(Some(mut group))) = subscriber.poll_recv_group(&waiter) else {

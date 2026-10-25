@@ -1,4 +1,4 @@
-use moq_auth::serve::{Keys, Policy, Refusal};
+use moq_auth::serve::{Denial, Keys, Policy};
 use moq_auth::{Claims, Key, Patterns, Permissions, Request, Transport};
 
 fn patterns(texts: &[&str]) -> Patterns {
@@ -39,12 +39,12 @@ async fn a_token_signed_with_a_short_shared_secret_is_admitted() {
 
 #[tokio::test]
 async fn a_token_signed_with_another_secret_is_refused() {
-	let refusal = policy("db-password")
+	let denial = policy("db-password")
 		.decide(&request("/alluno", Some(&token("someone-else"))))
 		.await
 		.unwrap_err();
 
-	assert!(matches!(refusal, Refusal::InvalidToken(_)), "{refusal:?}");
+	assert!(matches!(denial, Denial::InvalidToken(_)), "{denial:?}");
 }
 
 #[tokio::test]

@@ -80,6 +80,9 @@ mod tests {
 	#[test]
 	fn draft21_matches_draft20_on_the_wire() {
 		let properties = Properties {
+			unknown: Default::default(),
+			dynamic_groups: false,
+			compress: false,
 			max_cache_duration: None,
 			timescale: Some(Timescale::new(90_000).unwrap()),
 			priority: Some(64),
@@ -87,6 +90,8 @@ mod tests {
 		};
 
 		let subscribe = Subscribe {
+			max_age: None,
+			new_group: None,
 			request_id: RequestId(1),
 			track_namespace: Path::new("broadcast"),
 			track_name: "video".into(),
@@ -99,7 +104,10 @@ mod tests {
 			}),
 			properties_wanted: false,
 			forward: true,
+			rendezvous: false,
 			range_filters: false,
+			authorization_token: None,
+			epoch: None,
 		};
 
 		let subscribe_ok = SubscribeOk {
@@ -107,7 +115,7 @@ mod tests {
 			request_id: None,
 			track_alias: 4,
 			largest: Some(Location { group: 5, object: 2 }),
-			properties,
+			properties: properties.clone(),
 		};
 
 		let publish = Publish {
@@ -118,6 +126,9 @@ mod tests {
 			largest_location: Some(Location { group: 9, object: 0 }),
 			forward: true,
 			properties,
+			subscriber_priority: None,
+			group_order: None,
+			filter: None,
 		};
 
 		let fetch = Fetch {
@@ -138,6 +149,7 @@ mod tests {
 			range_filters: false,
 			fill_timeout: false,
 			properties_wanted: false,
+			epoch: None,
 		};
 
 		let group = GroupHeader {
@@ -161,6 +173,8 @@ mod tests {
 	#[test]
 	fn draft22_changes_only_the_location_filter() {
 		let subscribe = Subscribe {
+			max_age: None,
+			new_group: None,
 			request_id: RequestId(1),
 			track_namespace: Path::new("broadcast"),
 			track_name: "video".into(),
@@ -170,7 +184,10 @@ mod tests {
 			fill: None,
 			properties_wanted: true,
 			forward: true,
+			rendezvous: false,
 			range_filters: false,
+			authorization_token: None,
+			epoch: None,
 		};
 
 		// Draft-20 spells Next Object as a Length of 2 and two zero fields; draft-22 as type 0x05.

@@ -1,6 +1,7 @@
 import 'package:moq_ffi/moq_ffi.dart';
 
 import 'aliases.dart';
+import 'stream.dart';
 
 /// Everything [Server.listen] can be told.
 ///
@@ -26,6 +27,10 @@ final class ListenOptions {
   /// Cap on the concurrent QUIC streams each peer may open toward this server.
   final int? maxStreams;
 
+  /// Danger: write TLS session secrets to the file `SSLKEYLOGFILE` names, for
+  /// decrypting a capture. Off by default; on without `SSLKEYLOGFILE` fails.
+  final bool keylog;
+
   /// Origin whose broadcasts are served to incoming sessions; auto-created when null.
   final OriginProducer? publish;
 
@@ -39,6 +44,7 @@ final class ListenOptions {
     this.tlsGenerate,
     this.versions,
     this.maxStreams,
+    this.keylog = false,
     this.publish,
     this.consume,
   });
@@ -85,7 +91,10 @@ final class Server {
           key: options.tlsKey ?? const [],
           generate: options.tlsGenerate ?? const [],
         ),
-        quic: MoqQuicConfig(maxStreams: options.maxStreams),
+        quic: MoqQuicConfig(
+          maxStreams: options.maxStreams,
+          keylog: options.keylog,
+        ),
         publish: publishOrigin,
         consume: options.consume ?? shared,
       ),
@@ -122,18 +131,34 @@ final class Server {
   /// Each [Request] must be answered with `accept()` to complete the handshake
   /// or `reject(code:)` to refuse it; the returned session must be held to keep
   /// the connection alive. The stream ends when the server stops accepting.
-  Stream<Request> requests() async* {
-    while (true) {
-      final request = await server.accept();
-      if (request == null) return;
-      yield request;
-    }
-  }
+  /// Cancelling releases only its pending accept; the server keeps listening.
+  Stream<Request> requests() => _Requests(server).cast<Request>();
 
   /// Stop accepting new sessions and release the native server handle, closing
   /// the listening socket before it returns so the address can be bound again
   /// immediately.
   void close() {
     server.cancel();
+  }
+}
+
+final class _Requests extends NativeStream<Request?> {
+  final MoqServer server;
+  _Requests(this.server);
+
+  @override
+  UniffiRustFuture<Request?> read() => server.accept();
+
+  @override
+  bool finished(Request? value) => value == null;
+
+  @override
+  void discard(Request? value) {
+    if (value == null) return;
+    try {
+      value.cancel();
+    } finally {
+      value.dispose();
+    }
   }
 }

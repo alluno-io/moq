@@ -6,7 +6,7 @@
 //! `moq <MoQ side> fetch <track>` to read one group.
 //!
 //! - The MoQ side (`--connect`, the `--listen*` transport binds, `--cluster-lan`,
-//!   and `--cluster-connect` / `--cluster-connect-api`; all optional, at least
+//!   and `--cluster-connect` / `--cluster-api-url`; all optional, at least
 //!   one) attaches the shared Origin to the MoQ network, and comes before the
 //!   first stage. They compose: dial a relay, accept incoming sessions, mesh
 //!   with the LAN, and join a cluster all at once.
@@ -40,7 +40,7 @@ use crate::subscribe::{CatalogFormatArg, SubscribeFormat};
 // the doc comment to one line: Usage renders the rest as `--help` body text, where
 // rustdoc links read as noise.
 /// moq-cli: a media router that wires endpoints onto a shared MoQ Origin.
-#[derive(usage::Cli, Clone)]
+#[derive(usage_rs::Cli, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[usage(name = "moq", version = env!("CARGO_PKG_VERSION"))]
 #[usage(completion, settings)]
@@ -66,7 +66,7 @@ pub struct Cli {
 // read like it scopes that stage, when there is only ever one connection. As with
 // [`Cli`], the doc comment stays one line because Usage shows it in `--help`.
 /// A stage after the first: the verb and endpoint, without the globals.
-#[derive(usage::Cli, Clone)]
+#[derive(usage_rs::Cli, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[usage(name = "moq")]
 #[usage(completion, settings)]
@@ -92,7 +92,7 @@ pub struct Invocation {
 	/// otherwise make `moq auth` and `moq completion` fail for everyone who has one.
 	/// Read from the parse itself rather than from the built fields, so a flag added
 	/// to any flattened config is refused without anyone listing it here.
-	given: Vec<&'static usage::Flag<'static>>,
+	given: Vec<&'static usage_rs::Flag<'static>>,
 
 	/// The stages, in the order given. Never empty.
 	pub stages: Vec<Command>,
@@ -124,7 +124,7 @@ pub struct ParseError {
 
 impl ParseError {
 	/// The broad failure category.
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg_attr(not(test), allow(dead_code, reason = "only tests use it"))]
 	pub fn kind(&self) -> ParseErrorKind {
 		self.kind
 	}
@@ -155,7 +155,7 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Whether `flag` is one of the flags `T` declares.
-fn owns<T: usage::spec::CommandArgs>(flag: &usage::Flag<'_>) -> bool {
+fn owns<T: usage_rs::spec::CommandArgs>(flag: &usage_rs::Flag<'_>) -> bool {
 	T::COMMAND.flags.iter().any(|own| own.key == flag.key)
 }
 
@@ -199,7 +199,7 @@ impl Invocation {
 	/// `--iroh-*` settings it dials with. Answered from the command line, like
 	/// [`Self::reject`].
 	pub fn dial_only(&self, command: &str, allow: &[&str]) -> anyhow::Result<()> {
-		let dials = |flag: &&&usage::Flag<'_>| {
+		let dials = |flag: &&&usage_rs::Flag<'_>| {
 			#[cfg(feature = "iroh")]
 			if owns::<moq_tokio::iroh::Config>(flag) {
 				return true;
@@ -217,15 +217,18 @@ impl Invocation {
 		Ok(())
 	}
 
-	/// Refuse the listener flags (`--listen-*`, `--auth-*`) when nothing listens,
-	/// rather than silently ignoring them. Answered from the command line, like
+	/// Refuse listener, auth, and drain settings when nothing listens, rather
+	/// than silently ignoring them. Answered from the command line, like
 	/// [`Self::reject`].
 	pub fn unserved(&self) -> anyhow::Result<()> {
 		if self.moq.serves() {
 			return Ok(());
 		}
-		let listens =
-			|flag: &&&usage::Flag<'_>| owns::<moq_tokio::listen::Config>(flag) || owns::<moq_relay::auth::Config>(flag);
+		let listens = |flag: &&&usage_rs::Flag<'_>| {
+			owns::<moq_tokio::listen::Config>(flag)
+				|| owns::<moq_relay::auth::Config>(flag)
+				|| flag.longs.contains(&"drain-timeout")
+		};
 		if let Some(flags) = Self::names(self.given.iter().filter(listens)) {
 			anyhow::bail!(
 				"{flags} configure a listener, but none is bound; add --listen, --listen-tcp-bind, --listen-unix-bind, or --cluster-lan"
@@ -235,7 +238,7 @@ impl Invocation {
 	}
 
 	/// `--a, --b` for the flags given, or `None` when there are none.
-	fn names<'a>(flags: impl Iterator<Item = &'a &'static usage::Flag<'static>>) -> Option<String> {
+	fn names<'a>(flags: impl Iterator<Item = &'a &'static usage_rs::Flag<'static>>) -> Option<String> {
 		let names: Vec<String> = flags.map(|flag| format!("--{}", flag.longs[0])).collect();
 		(!names.is_empty()).then(|| names.join(", "))
 	}
@@ -301,33 +304,65 @@ impl Invocation {
 	/// Called before anything binds a port or dials out, so a refused invocation has
 	/// no side effects to unwind.
 	pub fn validate(&self) -> anyhow::Result<()> {
-		if self.moq.epoch.is_some() {
-			let mut publishes = false;
-			for command in &self.stages {
-				match command {
-					Command::Import(import) => {
-						if let Some(reason) = import.source.epoch_refusal() {
-							anyhow::bail!("--epoch makes instances one publisher of identical tracks, but {reason}");
-						}
-						publishes = true;
-					}
-					#[cfg(feature = "transcode")]
-					Command::Transcode(_) => anyhow::bail!(
-						"--epoch makes instances one publisher of identical tracks, but two `transcode` encoders never produce the same bytes"
-					),
-					_ => {}
-				}
+		if !self.stages.iter().all(Command::is_stageable) {
+			let listener_settings = self.given.iter().filter(|flag| flag.longs.contains(&"drain-timeout"));
+			if let Some(flags) = Self::names(listener_settings) {
+				anyhow::bail!("{flags} configure listening import/export stages");
 			}
-			anyhow::ensure!(
-				publishes,
-				"--epoch names what this process publishes, but nothing here publishes"
-			);
 		}
 
 		for command in &self.stages {
+			if let Command::Import(import) = command
+				&& import.report
+				&& let Some(reason) = import.source.report_refusal()
+			{
+				anyhow::bail!("--report names a track in the catalog the import builds, but {reason}");
+			}
+			if let Command::Import(import) = command
+				&& import.linger.is_some()
+				&& let Some(reason) = import.source.linger_refusal()
+			{
+				anyhow::bail!("--linger keeps a cleanly ended broadcast up, but {reason}");
+			}
 			let Command::Export(export) = command else {
 				continue;
 			};
+			if let Some(sink) = export.sink.report() {
+				anyhow::ensure!(
+					export.catalog_format.is_none(),
+					"`export {sink}` reads no media, so it takes no --catalog-format"
+				);
+				anyhow::ensure!(
+					export.echo.is_none(),
+					"`export {sink}` reads no media to report on; remove --echo"
+				);
+			}
+			if matches!(export.sink, ExportSink::Archive(_)) {
+				anyhow::ensure!(
+					export.catalog_format.is_none(),
+					"`export archive` records every track without reading a catalog, so it takes no --catalog-format"
+				);
+			}
+			if export.echo.is_some() {
+				if export.sink.stdout().is_none()
+					&& let Some(sink) = export.sink.ignores_selection()
+				{
+					anyhow::bail!(
+						"--echo reports what a stdout container export reads, and `export {sink}` is not one"
+					);
+				}
+				let msf = match export.catalog_format {
+					Some(format) => matches!(format, CatalogFormatArg::Msf),
+					None => matches!(
+						moq_mux::catalog::CatalogFormat::detect(&command.broadcast(&self.moq)),
+						Some(moq_mux::catalog::CatalogFormat::Msf)
+					),
+				};
+				anyhow::ensure!(
+					!msf,
+					"--echo follows the hang catalog's `echo` section, which the MSF catalog does not carry"
+				);
+			}
 			if let Some(stdout) = export.sink.stdout() {
 				anyhow::ensure!(
 					stdout.linger.is_zero() || matches!(stdout.format, SubscribeFormat::Ts),
@@ -375,17 +410,19 @@ impl Invocation {
 /// moq-bench, which parse more than once for their own reasons. This adds the
 /// failure category, which only this crate's callers ask about.
 fn parse_error(
-	spec: &usage::argv::spec::Spec<'_>,
-	root: &usage::Command<'_>,
+	spec: &usage_rs::argv::spec::Spec<'_>,
+	root: &usage_rs::Command<'_>,
 	argv: &[&OsStr],
-	err: usage::Error<'_, '_>,
+	err: usage_rs::Error<'_, '_>,
 ) -> ParseError {
 	let kind = match &err {
-		usage::Error::Help { .. } | usage::Error::HelpAll { .. } => ParseErrorKind::DisplayHelp,
-		usage::Error::Version { .. } => ParseErrorKind::DisplayVersion,
-		usage::Error::UnknownFlag { .. } | usage::Error::UnexpectedArg { .. } => ParseErrorKind::UnknownArgument,
-		usage::Error::MissingSubcommand | usage::Error::MissingArgsHelp { .. } => ParseErrorKind::MissingSubcommand,
-		usage::Error::InvalidValue(_) | usage::Error::InvalidChoice { .. } => ParseErrorKind::ValueValidation,
+		usage_rs::Error::Help { .. } | usage_rs::Error::HelpAll { .. } => ParseErrorKind::DisplayHelp,
+		usage_rs::Error::Version { .. } => ParseErrorKind::DisplayVersion,
+		usage_rs::Error::UnknownFlag { .. } | usage_rs::Error::UnexpectedArg { .. } => ParseErrorKind::UnknownArgument,
+		usage_rs::Error::MissingSubcommand | usage_rs::Error::MissingArgsHelp { .. } => {
+			ParseErrorKind::MissingSubcommand
+		}
+		usage_rs::Error::InvalidValue(_) | usage_rs::Error::InvalidChoice { .. } => ParseErrorKind::ValueValidation,
 		_ => ParseErrorKind::Other,
 	};
 	ParseError::new(kind, moq_tokio::cli::answer(spec, root, argv, err).message())
@@ -401,7 +438,7 @@ fn parse_error(
 /// The three transport sections are read as plain fields. [`Invocation`] refuses a
 /// released spelling while parsing, so a field left unset here means the command
 /// line really did leave it unset.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct MoqSide {
 	/// The default broadcast name for every stage that doesn't name its own.
@@ -416,17 +453,6 @@ pub struct MoqSide {
 	/// The released spelling of [`Self::broadcast`].
 	#[usage(long = "name", hide = true)]
 	name: Option<String>,
-
-	/// Announce under this epoch (a UUIDv7) instead of minting a fresh one per run.
-	///
-	/// Relays resume a subscription only between routes with the same epoch, so
-	/// redundant publishers of one broadcast pass the same value and fail over
-	/// seamlessly. Leave it unset otherwise: a fresh epoch per run is what makes a
-	/// restarted publisher replace the old broadcast instead of resuming into it.
-	/// Only `import fmp4`, `flv`, `hls`, and `ts` (one program, or `--passthrough`)
-	/// accept it, since the other publishers' tracks differ between instances.
-	#[usage(long, env = "MOQ_EPOCH", help_heading = "MoQ")]
-	pub epoch: Option<hang::moq_net::Epoch>,
 
 	/// MoQ client config (`--connect`, `--connect-bind`, `--connect-tls-*`, ...).
 	#[usage(flatten)]
@@ -457,6 +483,10 @@ pub struct MoqSide {
 	/// `moq-relay`; a listener needs exactly one.
 	#[usage(flatten)]
 	pub auth: moq_relay::auth::Config,
+
+	/// Drain accepted sessions for up to this long after SIGINT or SIGTERM; defaults to 10s.
+	#[usage(long, env = "MOQ_DRAIN_TIMEOUT", help_heading = "MoQ")]
+	pub drain_timeout: Option<moq_tokio::cli::Duration>,
 }
 
 impl MoqSide {
@@ -513,9 +543,9 @@ impl MoqSide {
 	}
 
 	/// Whether a WAN cluster dial is configured (`--cluster-connect` or
-	/// `--cluster-connect-api`).
+	/// `--cluster-api-url`).
 	fn cluster_dials(&self) -> bool {
-		!self.cluster.connect.is_empty() || self.cluster.connect_api.is_some()
+		!self.cluster.connect.is_empty() || self.cluster.api.url.is_some()
 	}
 
 	/// Reject a verb that needs the MoQ network but was given no way to reach it.
@@ -525,6 +555,15 @@ impl MoqSide {
 		anyhow::ensure!(
 			self.client.url.is_some() || self.serves() || self.cluster_dials(),
 			"a MoQ side is required: pass --connect <url> to dial a relay, a --listen option to self-host, --cluster-lan to mesh over the LAN, or --cluster-connect to join a cluster"
+		);
+		// The `--connect` client and the cluster's WAN dials each bind
+		// `--connect-bind` for QUIC, so a fixed port would collide halfway through startup.
+		#[cfg(feature = "quic")]
+		anyhow::ensure!(
+			!(self.client.url.is_some()
+				&& self.cluster_dials()
+				&& self.client.bind.is_some_and(|bind| bind.port() != 0)),
+			"--connect-bind with a fixed port cannot serve both --connect and --cluster-connect / --cluster-api-url, which each bind it: use port 0, or drop --connect (unset MOQ_CONNECT if it supplies the URL)"
 		);
 		#[cfg(feature = "cluster-lan")]
 		{
@@ -555,13 +594,13 @@ impl MoqSide {
 	/// A flattened config's flags sit in this struct's table under the keys that
 	/// config minted, so the table is the complete list. The chunk already parsed,
 	/// so nothing stops the walk early.
-	fn given(argv: &[&OsStr]) -> Vec<&'static usage::Flag<'static>> {
-		use usage::spec::CommandArgs;
+	fn given(argv: &[&OsStr]) -> Vec<&'static usage_rs::Flag<'static>> {
+		use usage_rs::spec::CommandArgs;
 
-		let mut given: Vec<&'static usage::Flag<'static>> = Vec::new();
-		let mut parser = usage::Parser::new(Cli::command(), argv);
+		let mut given: Vec<&'static usage_rs::Flag<'static>> = Vec::new();
+		let mut parser = usage_rs::Parser::new(Cli::command(), argv);
 		while let Some(Ok(event)) = parser.next_event() {
-			if let usage::Event::Flag { flag, .. } = event
+			if let usage_rs::Event::Flag { flag, .. } = event
 				&& <Self as CommandArgs>::COMMAND
 					.flags
 					.iter()
@@ -577,7 +616,7 @@ impl MoqSide {
 
 /// The verb: for `import`/`export` it is also the data direction, the pivot
 /// between the MoQ side and the endpoint.
-#[derive(usage::Subcommands, Clone)]
+#[derive(usage_rs::Subcommands, Clone)]
 pub enum Command {
 	/// Route media INTO MoQ from one source.
 	Import(Import),
@@ -690,7 +729,7 @@ impl Command {
 // ------------------------------------------------------------------ import
 
 /// import = one source -> MoQ.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Import {
 	/// The broadcast this stage publishes, overriding the process-wide `--broadcast`.
@@ -712,14 +751,28 @@ pub struct Import {
 	/// wait for a late group). The default suits a segmented egress (HLS/DASH), which may only
 	/// advertise segments that are still fetchable; lower it when nothing reads history and the
 	/// memory matters. Media tracks only -- the catalog and timeline are read at the live edge,
-	/// which is retained unconditionally. A stdin import also stays up this long after EOF, so
-	/// a subscriber still catching up can drain the finished broadcast.
+	/// which is retained unconditionally.
 	#[usage(long)]
-	pub max_age: Option<crate::duration::Duration>,
+	pub max_age: Option<moq_tokio::cli::Duration>,
+
+	/// How long a cleanly ended broadcast stays up, counted from its end, e.g. "30s"; "0s"
+	/// closes it at once. Defaults to 30s.
+	///
+	/// Subscribers already reading get the tail either way; this serves one that arrives after
+	/// the end, such as a player that read the final catalog late. A clean end is stdin EOF, an
+	/// RTMP unpublish or completed play, the end of an SRT stream, a WHIP `DELETE`, or an HLS
+	/// playlist's `EXT-X-ENDLIST`. A failure, and Ctrl-C, close the broadcast at once.
+	#[usage(long)]
+	pub linger: Option<moq_tokio::cli::Duration>,
 
 	/// The released spelling of [`Self::max_age`].
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<crate::duration::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
+
+	/// Name a media report track in the catalog's `stats` section and fill it with what each
+	/// track has written, about once a second while subscribed. The stdin imports only.
+	#[usage(long)]
+	pub report: bool,
 
 	/// The single source feeding the Origin.
 	#[usage(subcommand)]
@@ -741,22 +794,24 @@ impl Import {
 
 /// The single source feeding the Origin on an import. The container formats read
 /// from stdin; the gateways bridge another protocol.
-#[derive(usage::Subcommands, Clone)]
+#[derive(usage_rs::Subcommands, Clone)]
 pub enum ImportSource {
 	/// Raw H.264 Annex-B from stdin.
 	Avc3,
 	/// Fragmented MP4 / CMAF from stdin.
-	Fmp4,
+	Fmp4(Fmp4Import),
 	/// MPEG-TS from stdin.
 	Ts(TsImport),
 	/// FLV / RTMP container from stdin.
 	Flv,
-	/// Pull a remote HLS / LL-HLS playlist (http/https URL or local file) into MoQ.
+	/// Follow a remote live HLS / LL-HLS playlist (http/https URL or local file) into MoQ.
 	Hls(crate::hls::ImportArgs),
 	/// RTMP: pull a remote play (`--connect`) or accept incoming publishes (`--listen`).
 	Rtmp(crate::rtmp::Args),
 	/// SRT: pull a remote stream (`--connect`) or accept incoming publishes (`--listen`).
 	Srt(crate::srt::ImportArgs),
+	/// RTSP: pull an IP camera's stream (`--connect`), reconnecting on failure.
+	Rtsp(crate::rtsp::ImportArgs),
 	/// WebRTC: WHEP client pulling a remote (`--connect`) or WHIP server accepting publishes (`--listen`).
 	Rtc(crate::rtc::Args),
 	/// Replay a recording from an object store, serving its groups on demand.
@@ -772,7 +827,9 @@ impl ImportSource {
 	pub fn stdin_format(&self) -> Option<PublishFormat> {
 		Some(match self {
 			Self::Avc3 => PublishFormat::Avc3,
-			Self::Fmp4 => PublishFormat::Fmp4,
+			Self::Fmp4(args) => PublishFormat::Fmp4 {
+				passthrough: args.passthrough,
+			},
 			Self::Ts(args) if args.passthrough => PublishFormat::TsPassthrough {
 				pcr_pid: args.pcr_pid.map(|pid| pid.0),
 			},
@@ -784,29 +841,57 @@ impl ImportSource {
 		})
 	}
 
-	/// Why `--epoch` can't name this source, or `None` when it can: the source must
-	/// announce once per run and derive its tracks from the input alone.
-	fn epoch_refusal(&self) -> Option<&'static str> {
+	/// Why `--report` can't report this source, or `None` when it can: the CLI builds the one
+	/// catalog of a stdin import, whose tracks `moq-mux` counts.
+	fn report_refusal(&self) -> Option<&'static str> {
 		match self {
 			Self::Ts(args) if args.program == Some(TsProgram::All) => {
-				Some("`import ts --program all` mints an epoch per program")
+				Some("`import ts --program all` builds a catalog per program")
 			}
-			Self::Rtmp(_) | Self::Srt(_) => Some("the RTMP and SRT imports mint an epoch per connection"),
-			Self::Rtc(rtc) if rtc.listen.is_some() => Some("the WHIP listener mints an epoch per connection"),
-			Self::Rtc(_) => Some("`import rtc --connect` timestamps frames from its own RTP session"),
-			Self::Avc3 => Some("`import avc3` timestamps frames from their arrival on stdin"),
-			Self::Archive(_) => {
-				Some("`import archive` rewrites the catalog and timeline groups it replays under the live names")
+			Self::Hls(_) | Self::Rtmp(_) | Self::Srt(_) | Self::Rtsp(_) | Self::Rtc(_) | Self::Archive(_) => {
+				Some("the gateway and archive imports build their own catalogs")
 			}
 			#[cfg(feature = "capture")]
-			Self::Capture(_) => Some("two `import capture` encoders never produce the same bytes"),
-			Self::Ts(_) | Self::Fmp4 | Self::Flv | Self::Hls(_) => None,
+			Self::Capture(_) => Some("`import capture` encodes, and its encoders do not count yet"),
+			Self::Avc3 | Self::Fmp4(_) | Self::Ts(_) | Self::Flv => None,
+		}
+	}
+
+	/// Why `--linger` can't apply to this source, or `None` when it can: only a source with a
+	/// clean end has a finished broadcast to keep up.
+	fn linger_refusal(&self) -> Option<&'static str> {
+		match self {
+			// Every run is followed by a redial publishing the next one, so a run's end is not
+			// the end of the content, and its finished catalog would tell readers to stop.
+			Self::Rtsp(_) => Some("`import rtsp` redials after every session, so a run's end is not the content's"),
+			Self::Rtc(rtc) if rtc.connect.is_some() => Some("a WHEP pull has no clean end"),
+			Self::Archive(_) => Some("`import archive` serves its recording until stopped"),
+			#[cfg(feature = "capture")]
+			Self::Capture(_) => Some("`import capture` has no clean end"),
+			Self::Avc3
+			| Self::Fmp4(_)
+			| Self::Ts(_)
+			| Self::Flv
+			| Self::Hls(_)
+			| Self::Rtmp(_)
+			| Self::Srt(_)
+			| Self::Rtc(_) => None,
 		}
 	}
 }
 
+/// The fMP4 stdin container: whether to unwrap its fragments.
+#[derive(usage_rs::Args, Clone)]
+#[usage(unknown_flags = "error", args_override_self = false)]
+pub struct Fmp4Import {
+	/// Publish each fragment whole as CMAF instead of splitting it into one frame per sample.
+	/// Keeps the source's exact sample timing, but every player has to parse ISO BMFF.
+	#[usage(long = "cmaf")]
+	pub passthrough: bool,
+}
+
 /// The MPEG-TS stdin container: which programs of a multiplex to publish.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct TsImport {
 	/// Import one program of a multi-program stream, by its PAT program number, or `all` to
@@ -884,7 +969,7 @@ impl std::str::FromStr for TsProgram {
 // ------------------------------------------------------------------ export
 
 /// export = MoQ -> one sink.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Export {
 	/// The broadcast this stage subscribes to, overriding the process-wide `--broadcast`.
@@ -906,6 +991,12 @@ pub struct Export {
 	#[usage(flatten)]
 	pub select: crate::subscribe::SelectArgs,
 
+	/// Publish feedback where the broadcast's catalog solicits it: a `<NAME>.echo` broadcast
+	/// under the catalog's `echo` path, reporting what each rendition this export reads has
+	/// received. One path segment, not starting with `.`. The stdout container exports only.
+	#[usage(long, value_name = "NAME")]
+	pub echo: Option<crate::report::EchoName>,
+
 	/// The single sink draining the Origin.
 	#[usage(subcommand)]
 	pub sink: ExportSink,
@@ -923,8 +1014,8 @@ impl Export {
 			ExportSink::Ts(args) => found.extend(args.deprecated()),
 			ExportSink::Flv(args) => found.extend(args.deprecated()),
 			ExportSink::H264(args) | ExportSink::H265(args) => found.extend(args.deprecated()),
-			ExportSink::Hls(hls) => found.extend(hls.tls.deprecated()),
 			ExportSink::Rtmp(rtmp) => found.extend(rtmp.deprecated()),
+			ExportSink::Hls(hls) => found.extend(hls.tls.deprecated()),
 			_ => {}
 		}
 		found
@@ -933,7 +1024,7 @@ impl Export {
 
 /// The single sink draining the Origin on an export. The container formats write
 /// to stdout; the gateways bridge another protocol.
-#[derive(usage::Subcommands, Clone)]
+#[derive(usage_rs::Subcommands, Clone)]
 pub enum ExportSink {
 	/// Fragmented MP4 / CMAF to stdout.
 	Fmp4(Fragmented),
@@ -955,8 +1046,12 @@ pub enum ExportSink {
 	Srt(crate::srt::ExportArgs),
 	/// WebRTC: WHIP client pushing to a remote (`--connect`) or WHEP server serving plays (`--listen`).
 	Rtc(crate::rtc::Args),
-	/// Record the broadcast into an object store until it ends.
+	/// Record every broadcast announced under `--broadcast` into an object store.
 	Archive(crate::archive::ExportArgs),
+	/// Write the broadcast's media reports (`import --report`) to stdout as JSON lines.
+	Report,
+	/// Write the feedback of every `.echo` broadcast under `--broadcast` to stdout as JSON lines.
+	Echo,
 }
 
 impl ExportSink {
@@ -970,12 +1065,23 @@ impl ExportSink {
 			Self::Srt(_) => "srt",
 			Self::Rtc(_) => "rtc",
 			Self::Archive(_) => "archive",
+			Self::Report => "report",
+			Self::Echo => "echo",
 		})
 	}
 
-	/// Whether this sink writes to stdout (the container formats).
+	/// The report sink's name: these read no media, so they skip catalog discovery.
+	fn report(&self) -> Option<&'static str> {
+		match self {
+			Self::Report => Some("report"),
+			Self::Echo => Some("echo"),
+			_ => None,
+		}
+	}
+
+	/// Whether this sink writes to stdout (the container formats and the report sinks).
 	pub fn is_stdout(&self) -> bool {
-		self.stdout().is_some()
+		self.stdout().is_some() || self.report().is_some()
 	}
 
 	/// The stdout container format and its options, when this sink writes to
@@ -983,8 +1089,8 @@ impl ExportSink {
 	pub fn stdout(&self) -> Option<Stdout> {
 		let container = |format, container: &Container| Stdout {
 			format,
-			max_delay: container.max_delay.into_std(),
-			linger: container.linger.into_std(),
+			max_delay: container.max_delay.into(),
+			linger: container.linger.into(),
 			stitch: false,
 			fragment_duration: None,
 			mux_rate: None,
@@ -992,8 +1098,8 @@ impl ExportSink {
 		};
 		let buffered = |format, args: &Buffered| Stdout {
 			format,
-			max_delay: args.delay.into_std(),
-			linger: args.linger.into_std(),
+			max_delay: args.delay.into(),
+			linger: args.linger.into(),
 			stitch: false,
 			fragment_duration: None,
 			mux_rate: None,
@@ -1001,17 +1107,17 @@ impl ExportSink {
 		};
 		Some(match self {
 			Self::Fmp4(args) => Stdout {
-				fragment_duration: args.fragment_duration.map(crate::duration::Duration::into_std),
+				fragment_duration: args.fragment_duration.map(Into::into),
 				..container(SubscribeFormat::Fmp4, &args.container)
 			},
 			Self::Mkv(args) => Stdout {
-				fragment_duration: args.fragment_duration.map(crate::duration::Duration::into_std),
+				fragment_duration: args.fragment_duration.map(Into::into),
 				..buffered(SubscribeFormat::Mkv, &args.container)
 			},
 			Self::Ts(args) => Stdout {
 				format: SubscribeFormat::Ts,
-				max_delay: args.delay.into_std(),
-				linger: args.linger.into_std(),
+				max_delay: args.delay.into(),
+				linger: args.linger.into(),
 				stitch: args.stitch,
 				fragment_duration: None,
 				mux_rate: args.mux_rate,
@@ -1028,7 +1134,8 @@ impl ExportSink {
 /// A stdout sink's format and the options that apply to it.
 pub struct Stdout {
 	pub format: SubscribeFormat,
-	/// The staleness budget, also used as the TS/FLV/MKV release delay.
+	/// The staleness budget, also the FLV/MKV release delay and how far behind the source `ts`
+	/// runs (`--delay`).
 	pub max_delay: Duration,
 	pub linger: Duration,
 	/// Follow a replacement as a program switch (`ts` only).
@@ -1040,25 +1147,25 @@ pub struct Stdout {
 }
 
 /// Staleness options for stdout sinks without a fixed release delay.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Container {
 	/// How far a group may fall behind the live edge before it is skipped (e.g. `500ms`, `1s`).
 	#[usage(long, default = "500ms")]
-	pub max_delay: crate::duration::Duration,
+	pub max_delay: moq_tokio::cli::Duration,
 
 	/// Accepted only to refuse a nonzero value with a pointer to `ts`, the one format
 	/// that can mark where a returned broadcast restarts.
 	#[usage(long, default = "0s", hide = true)]
-	pub linger: crate::duration::Duration,
+	pub linger: moq_tokio::cli::Duration,
 
 	/// The released spelling of [`Self::max_delay`].
 	#[usage(long = "max-age", hide = true)]
-	max_age: Option<crate::duration::Duration>,
+	max_age: Option<moq_tokio::cli::Duration>,
 
 	/// The released spelling of [`Self::max_delay`], before `--max-age`.
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<crate::duration::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 }
 
 impl Container {
@@ -1075,33 +1182,29 @@ impl Container {
 }
 
 /// A stdout container with a fixed release delay.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Buffered {
 	/// How long after its decode time each frame is written (e.g. `500ms`); late frames are dropped.
 	/// The same delay bounds source staleness. Zero writes each frame as soon as it is read and
 	/// drops none as late, but still skips a stalled group once a newer one is ready.
 	#[usage(long, default = "500ms")]
-	pub delay: crate::duration::Duration,
+	pub delay: moq_tokio::cli::Duration,
 	/// Accepted only to refuse a nonzero value: only TS can mark a broadcast restart.
 	#[usage(long, default = "0s", hide = true)]
-	pub linger: crate::duration::Duration,
-	/// The retired staleness-only setting.
-	#[usage(long, hide = true)]
-	max_delay: Option<crate::duration::Duration>,
+	pub linger: moq_tokio::cli::Duration,
 	/// An older spelling of the staleness setting.
 	#[usage(long = "max-age", hide = true)]
-	max_age: Option<crate::duration::Duration>,
+	max_age: Option<moq_tokio::cli::Duration>,
 	/// An older spelling of the staleness setting.
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<crate::duration::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 }
 
 impl Buffered {
 	fn deprecated(&self) -> moq_tokio::cli::Deprecated {
 		let mut found = moq_tokio::cli::Deprecated::default();
 		for (present, flag) in [
-			(self.max_delay.is_some(), "--max-delay"),
 			(self.max_age.is_some(), "--max-age"),
 			(self.latency_max.is_some(), "--latency-max"),
 		] {
@@ -1114,32 +1217,33 @@ impl Buffered {
 }
 
 /// A buffered Matroska output with an optional cluster cap.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct BufferedFragmented {
 	#[usage(flatten)]
 	pub container: Buffered,
 	/// Cap the output cluster duration (e.g. `2s`); defaults to video GOPs.
 	#[usage(long)]
-	pub fragment_duration: Option<crate::duration::Duration>,
+	pub fragment_duration: Option<moq_tokio::cli::Duration>,
 }
 
 /// The MPEG-TS stdout container.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Transport {
-	/// How long after its decode time each frame is written (e.g. `500ms`), like an SRT
-	/// receiver's latency. A frame that arrives later than this is dropped, and a stalled
-	/// group is skipped once it falls half this behind the newest content.
-	#[usage(long, default = "500ms")]
-	pub delay: crate::duration::Duration,
+	/// How far behind the source the output runs (e.g. `2s`), like an SRT receiver's latency,
+	/// including how far ahead of its decode time each frame is sent. A frame that arrives
+	/// later than this is dropped, and a stalled group is skipped once it falls half this
+	/// behind the newest content.
+	#[usage(long, default = "1s")]
+	pub delay: moq_tokio::cli::Duration,
 
 	/// How long to wait for the same publisher instance to come back once it ends (e.g. `10s`),
 	/// then carry on with the same stream. A replacement exits 1 unless `--stitch` is passed.
 	/// An export that fails while the broadcast is still up exits without waiting.
 	/// Also bounds a stitched replacement through its first catalog; zero requires it already available.
 	#[usage(long, default = "0s")]
-	pub linger: crate::duration::Duration,
+	pub linger: moq_tokio::cli::Duration,
 
 	/// Follow another publisher instance that replaces the broadcast, as a full program switch:
 	/// a new PMT from its catalog, flagged as a break on every PID.
@@ -1160,29 +1264,29 @@ pub struct Transport {
 
 	/// The released spelling of [`Self::delay`].
 	#[usage(long = "max-age", hide = true)]
-	max_age: Option<crate::duration::Duration>,
+	max_age: Option<moq_tokio::cli::Duration>,
 
 	/// The released spelling of [`Self::delay`], before `--max-age`.
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<crate::duration::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 }
 
 impl Transport {
 	fn deprecated(&self) -> moq_tokio::cli::Deprecated {
-		const HOLDS: &str = "it also holds every frame that long after its decode time";
+		const BEHIND: &str = "it also sets how far behind the source the output runs";
 		let mut found = moq_tokio::cli::Deprecated::default();
 		if self.max_age.is_some() {
-			found.changed("--max-age", None, "--delay", HOLDS);
+			found.changed("--max-age", None, "--delay", BEHIND);
 		}
 		if self.latency_max.is_some() {
-			found.changed("--latency-max", None, "--delay", HOLDS);
+			found.changed("--latency-max", None, "--delay", BEHIND);
 		}
 		found
 	}
 }
 
 /// The fMP4 stdout container with a fragment cap.
-#[derive(usage::Args, Clone)]
+#[derive(usage_rs::Args, Clone)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 pub struct Fragmented {
 	#[usage(flatten)]
@@ -1191,7 +1295,7 @@ pub struct Fragmented {
 	/// Cap the output fragment/cluster duration (e.g. `2s`).
 	/// Defaults to publisher groups.
 	#[usage(long)]
-	pub fragment_duration: Option<crate::duration::Duration>,
+	pub fragment_duration: Option<moq_tokio::cli::Duration>,
 }
 
 #[cfg(test)]
@@ -1212,14 +1316,6 @@ mod tests {
 	#[test]
 	fn valid_stage() {
 		let _ = Stage::to_kdl();
-	}
-
-	#[test]
-	fn single_stage() {
-		let cli = Invocation::try_parse_from(["moq", "--connect", "http://relay", "import", "ts"]).unwrap();
-		assert_eq!(cli.stages.len(), 1);
-		assert_eq!(cli.stages[0].name(), "import");
-		assert!(cli.validate().is_ok());
 	}
 
 	/// Only TS can mark where a returned broadcast restarts, so only `export ts` may linger.
@@ -1256,13 +1352,171 @@ mod tests {
 			};
 			export.sink.stdout().unwrap().max_delay
 		};
-		assert_eq!(stdout(&[]), Duration::from_millis(500));
+		assert_eq!(stdout(&[]), Duration::from_secs(1));
 		assert_eq!(stdout(&["--delay", "2s"]), Duration::from_secs(2));
 		for old in ["--max-age", "--latency-max"] {
 			let Err(err) = parse(&[old, "1s"]) else {
 				panic!("{old} must not start a run");
 			};
 			assert!(err.to_string().contains(&format!("{old} -> --delay")), "{err}");
+		}
+	}
+
+	#[test]
+	fn hls_tls_environment_is_independent_of_the_moq_listener() {
+		if !test_env::Env::default()
+			.set("MOQ_LISTEN_TLS_CERT", "moq.pem")
+			.set("MOQ_HLS_TLS_CERT", "hls.pem")
+			.set("MOQ_HLS_TLS_KEY", "hls.key")
+			.set("MOQ_HLS_TLS_ROOT", "root.pem")
+			.isolate()
+		{
+			return;
+		}
+		let cli = Invocation::try_parse_from(["moq", "export", "hls"]).unwrap();
+		assert_eq!(cli.moq.server.tls.cert, [std::path::PathBuf::from("moq.pem")]);
+		let Command::Export(export) = &cli.stages[0] else {
+			panic!("expected export")
+		};
+		let ExportSink::Hls(hls) = &export.sink else {
+			panic!("expected HLS")
+		};
+		assert_eq!(hls.tls.cert, [std::path::PathBuf::from("hls.pem")]);
+		assert_eq!(hls.tls.key, [std::path::PathBuf::from("hls.key")]);
+		assert_eq!(hls.tls.root, [std::path::PathBuf::from("root.pem")]);
+	}
+
+	macro_rules! released_environment {
+		($test:ident, $old:literal, $replacement:literal, $value:literal) => {
+			#[test]
+			fn $test() {
+				if !test_env::Env::default().set($old, $value).isolate() {
+					return;
+				}
+				let err = Invocation::try_parse_from(["moq", "import", "ts"])
+					.err()
+					.expect("released environment must not be ignored");
+				assert!(
+					err.to_string().contains($old) && err.to_string().contains($replacement),
+					"{err}"
+				);
+			}
+		};
+	}
+
+	released_environment!(
+		released_backoff_initial_env,
+		"MOQ_BACKOFF_INITIAL",
+		"MOQ_CONNECT_BACKOFF_INITIAL",
+		"2s"
+	);
+	released_environment!(
+		released_backoff_multiplier_env,
+		"MOQ_BACKOFF_MULTIPLIER",
+		"MOQ_CONNECT_BACKOFF_MULTIPLIER",
+		"3"
+	);
+	released_environment!(
+		released_backoff_max_env,
+		"MOQ_BACKOFF_MAX",
+		"MOQ_CONNECT_BACKOFF_MAX",
+		"2s"
+	);
+	released_environment!(
+		released_backoff_timeout_env,
+		"MOQ_BACKOFF_TIMEOUT",
+		"MOQ_CONNECT_BACKOFF_TIMEOUT",
+		"2s"
+	);
+	released_environment!(
+		released_goaway_redirect_env,
+		"MOQ_GOAWAY_REDIRECT",
+		"MOQ_CONNECT_GOAWAY_REDIRECT",
+		"ignore"
+	);
+	released_environment!(
+		released_goaway_handover_env,
+		"MOQ_GOAWAY_HANDOVER",
+		"MOQ_CONNECT_GOAWAY_HANDOVER",
+		"2s"
+	);
+
+	#[test]
+	fn connection_prefixes_refuse_released_spellings() {
+		for (family, names) in [
+			("backoff", &["initial", "multiplier", "max", "timeout"][..]),
+			("goaway", &["redirect", "handover"][..]),
+		] {
+			for name in names {
+				let value = match *name {
+					"multiplier" => "3",
+					"redirect" => "ignore",
+					_ => "2s",
+				};
+				let current = format!("--connect-{family}-{name}");
+				Invocation::try_parse_from(["moq", current.as_str(), value, "import", "ts"]).unwrap();
+				let old = format!("--{family}-{name}");
+				let err = Invocation::try_parse_from(["moq", old.as_str(), value, "import", "ts"])
+					.err()
+					.expect("released spelling refused");
+				assert!(
+					err.to_string().contains(&old) && err.to_string().contains(&current),
+					"{err}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn audited_flags_parse_the_consumer_policy() {
+		for format in ["fmp4", "hls"] {
+			let mut argv = vec!["moq", "import", format];
+			if format == "hls" {
+				argv.push("input.m3u8");
+			}
+			argv.push("--cmaf");
+			let cli = Invocation::try_parse_from(argv).expect("explicit CMAF publishing");
+			let Command::Import(import) = &cli.stages[0] else {
+				panic!("expected import")
+			};
+			match &import.source {
+				ImportSource::Fmp4(args) => assert!(args.passthrough),
+				ImportSource::Hls(args) => assert!(args.passthrough),
+				_ => panic!("expected fragment input"),
+			}
+		}
+		Invocation::try_parse_from([
+			"moq",
+			"export",
+			"rtmp",
+			"--connect",
+			"rtmp://localhost/live/key",
+			"--delay",
+			"2s",
+		])
+		.expect("RTMP paced release");
+	}
+
+	#[test]
+	fn unpublished_spellings_have_no_migration_shim() {
+		for format in ["fmp4", "hls"] {
+			let mut argv = vec!["moq", "import", format];
+			if format == "hls" {
+				argv.push("input.m3u8");
+			}
+			argv.push("--passthrough");
+			let err = Invocation::try_parse_from(argv).err().expect("CMAF is explicit");
+			assert_eq!(err.kind(), ParseErrorKind::UnknownArgument);
+		}
+		for format in ["flv", "mkv", "rtmp"] {
+			let mut argv = vec!["moq", "export", format, "--max-delay", "2s"];
+			if format == "rtmp" {
+				argv.extend(["--connect", "rtmp://localhost/live/key"]);
+			}
+			let err = Invocation::try_parse_from(argv)
+				.err()
+				.expect("unreleased spelling is unknown");
+			assert_eq!(err.kind(), ParseErrorKind::UnknownArgument);
 		}
 	}
 
@@ -1369,6 +1623,86 @@ mod tests {
 		}
 	}
 
+	/// `--report` goes where the CLI builds the one catalog it names a track in.
+	#[test]
+	fn report_needs_a_catalog_the_cli_builds() {
+		let import = |source: &[&str]| {
+			let argv = [
+				"moq",
+				"--connect",
+				"http://relay",
+				"--broadcast",
+				"room",
+				"import",
+				"--report",
+			];
+			Invocation::try_parse_from(argv.iter().chain(source).copied()).unwrap()
+		};
+		for source in [
+			["ts"].as_slice(),
+			&["fmp4"],
+			&["flv"],
+			&["avc3"],
+			&["ts", "--program", "1"],
+		] {
+			import(source).validate().unwrap();
+		}
+		for source in [
+			["ts", "--program", "all"].as_slice(),
+			&["hls", "http://origin/master.m3u8"],
+			&["rtmp", "--listen", "127.0.0.1:1935"],
+			&["rtsp", "--connect", "rtsp://camera/stream"],
+		] {
+			let err = import(source).validate().unwrap_err().to_string();
+			assert!(err.contains("--report"), "{source:?}: {err}");
+		}
+	}
+
+	/// `--echo` reports what a stdout container export reads from a hang catalog, under one
+	/// path segment, and the report sinks read no media to report on.
+	#[test]
+	fn echo_needs_a_container_export_and_a_hang_catalog() {
+		for sink in ["ts", "fmp4", "mkv", "flv", "h264", "h265"] {
+			export(&["--echo", "alice", sink]).unwrap().validate().unwrap();
+		}
+		for sink in [["hls", "--listen", "127.0.0.1:8080"].as_slice(), &["report"], &["echo"]] {
+			let err = export(&[["--echo", "alice"].as_slice(), sink].concat())
+				.unwrap()
+				.validate()
+				.unwrap_err();
+			assert!(err.to_string().contains("--echo"), "{sink:?}: {err}");
+		}
+		for flags in [
+			["--echo", "alice", "--catalog-format", "msf", "fmp4"].as_slice(),
+			&["--broadcast", "live.msf", "--echo", "alice", "fmp4"],
+		] {
+			let err = export(flags).unwrap().validate().unwrap_err();
+			assert!(err.to_string().contains("MSF"), "{flags:?}: {err}");
+		}
+		export(&[
+			"--broadcast",
+			"live.msf",
+			"--catalog-format",
+			"hang",
+			"--echo",
+			"alice",
+			"fmp4",
+		])
+		.unwrap()
+		.validate()
+		.unwrap();
+		for name in ["", "a/b", ".", "..", "*", ".alice"] {
+			assert!(export(&["--echo", name, "fmp4"]).is_err(), "`{name}` must be refused");
+		}
+		for sink in ["report", "echo"] {
+			let err = export(&["--catalog-format", "hang", sink])
+				.unwrap()
+				.validate()
+				.unwrap_err();
+			assert!(err.to_string().contains("--catalog-format"), "{sink}: {err}");
+		}
+	}
+
 	#[test]
 	fn import_ts_takes_a_program_number_or_all() {
 		// `None` when the command line is refused.
@@ -1463,7 +1797,7 @@ mod tests {
 		let ExportSink::Srt(args) = &export.sink else {
 			panic!("an export srt stage");
 		};
-		assert_eq!(args.linger.into_std(), Duration::from_secs(10));
+		assert_eq!(Duration::from(args.linger), Duration::from_secs(10));
 		assert!(args.stitch);
 		assert!(
 			Invocation::try_parse_from(["moq", "import", "srt", "--listen", "[::]:9000", "--stitch"]).is_err(),
@@ -1510,60 +1844,24 @@ mod tests {
 		}
 	}
 
-	/// `--epoch` reaches the importers that announce once per run and derive their tracks
-	/// from the input alone, and is refused everywhere else: an ingest that announces per
-	/// connection, a publisher whose timestamps or bytes come from the instance, or no
-	/// publisher at all.
 	#[test]
-	fn epoch_applies_only_to_a_once_per_run_publisher() {
-		let _env = crate::test_env::EnvGuard::clear(&["MOQ_EPOCH"]);
+	fn independent_importers_cannot_select_a_shared_epoch() {
 		let epoch = hang::moq_net::Epoch::mint().to_string();
-		let parse = |stage: &[&str]| {
-			let argv = ["moq", "--connect", "http://relay/anon", "--epoch", &epoch].into_iter();
-			Invocation::try_parse_from(argv.chain(stage.iter().copied())).expect("parse")
-		};
-
-		let cli = parse(&["import", "fmp4"]);
-		cli.validate().expect("a stdin import takes an epoch");
-		assert_eq!(cli.moq.epoch.map(|epoch| epoch.to_string()), Some(epoch.clone()));
-
-		for accepted in [
-			&["import", "ts"][..],
-			&["import", "ts", "--program", "1"],
-			&["import", "ts", "--passthrough"],
-			&["import", "flv"],
-			&["import", "hls", "https://example.com/live.m3u8"],
-		] {
-			parse(accepted)
-				.validate()
-				.unwrap_or_else(|err| panic!("{accepted:?} refused --epoch: {err:#}"));
-		}
-
-		for refused in [
-			&["import", "rtmp", "--listen", "[::]:1935"][..],
-			&["import", "rtmp", "--connect", "rtmp://example.com/live/key"],
-			&["import", "srt", "--connect", "srt://example.com:9000"],
-			&["import", "rtc", "--listen", "[::]:8080"],
-			&["import", "rtc", "--connect", "https://example.com/whep"],
-			&["import", "ts", "--program", "all"],
-			&["import", "avc3"],
-			&["import", "archive", "file:///tmp/recording"],
-			#[cfg(feature = "capture")]
-			&["import", "capture"],
-			#[cfg(feature = "transcode")]
-			&["transcode"],
-			&["export", "fmp4"],
-		] {
-			assert!(parse(refused).validate().is_err(), "{refused:?} accepted --epoch");
-		}
-
-		let malformed = Invocation::try_parse_from(["moq", "--epoch", "42", "import", "fmp4"]);
-		assert!(malformed.is_err(), "--epoch accepted a value that is not a UUIDv7");
+		let refused = Invocation::try_parse_from([
+			"moq",
+			"--connect",
+			"http://relay/anon",
+			"--epoch",
+			&epoch,
+			"import",
+			"ts",
+		]);
+		assert!(refused.is_err(), "independent importers cannot claim identical content");
 	}
 
 	/// A stage carries config of its own, and the check has to reach it.
 	///
-	/// `export hls` flattens `tls::Listen`. Its listener decides whether to serve
+	/// `export hls` adapts its TLS arguments. Its listener decides whether to serve
 	/// TLS at all from the canonical `cert`/`generate` fields, so a released
 	/// `--tls-cert` left it serving plaintext HTTP without ever reaching the builder
 	/// that refuses: the certificate and the mTLS roots both silently gone.
@@ -1660,6 +1958,56 @@ mod tests {
 		let err = parse(["--auth-public", "**"]).moq.validate().unwrap_err().to_string();
 		assert!(err.contains("--auth-public ignores"), "{err}");
 		assert!(parse(["--auth-url", "http://127.0.0.1:4440/"]).moq.validate().is_ok());
+	}
+
+	#[test]
+	fn listening_drain_settings_parse() {
+		let cli = Invocation::try_parse_from([
+			"moq",
+			"--listen-tcp-bind",
+			"127.0.0.1:0",
+			"--auth-public",
+			"**",
+			"--drain-timeout",
+			"500ms",
+			"import",
+			"ts",
+		])
+		.unwrap();
+		cli.validate().unwrap();
+		cli.unserved().unwrap();
+		assert_eq!(
+			Duration::from(cli.moq.drain_timeout.unwrap()),
+			Duration::from_millis(500)
+		);
+		let cli = Invocation::try_parse_from([
+			"moq",
+			"--connect",
+			"https://relay.example",
+			"--drain-timeout",
+			"500ms",
+			"import",
+			"ts",
+		])
+		.unwrap();
+		assert!(cli.unserved().unwrap_err().to_string().contains("--drain-timeout"));
+	}
+
+	#[cfg(feature = "play")]
+	#[test]
+	fn listening_lifecycle_settings_do_not_apply_to_playback() {
+		let cli = Invocation::try_parse_from([
+			"moq",
+			"--listen-tcp-bind",
+			"127.0.0.1:0",
+			"--auth-public",
+			"**",
+			"--drain-timeout",
+			"500ms",
+			"play",
+		])
+		.unwrap();
+		assert!(cli.validate().unwrap_err().to_string().contains("--drain-timeout"));
 	}
 
 	/// A listener for ordinary clients admits nobody without a decision, so it
@@ -2006,7 +2354,7 @@ mod tests {
 		for format in ["flv", "mkv"] {
 			assert_eq!(stdout(&[format]), Duration::from_millis(500));
 			assert_eq!(stdout(&[format, "--delay", "2s"]), Duration::from_secs(2));
-			for old in ["--max-delay", "--max-age", "--latency-max"] {
+			for old in ["--max-age", "--latency-max"] {
 				let Err(err) = export(&[format, old, "2s"]) else {
 					panic!("{old} must be refused")
 				};
@@ -2021,18 +2369,18 @@ mod tests {
 		assert!(export(&["ts", "--max-delay", "2s"]).is_err(), "ts spells it --delay");
 
 		let rtmp = |flag: &str| export(&["rtmp", "--connect", "rtmp://example.com/live/key", flag, "2s"]);
-		let cli = rtmp("--max-delay").unwrap();
+		let cli = rtmp("--delay").unwrap();
 		let Command::Export(export_rtmp) = &cli.stages[0] else {
 			panic!("expected export")
 		};
 		let ExportSink::Rtmp(args) = &export_rtmp.sink else {
 			panic!("expected rtmp")
 		};
-		assert_eq!(args.max_delay.into_std(), Duration::from_secs(2));
+		assert_eq!(Duration::from(args.delay), Duration::from_secs(2));
 		let Err(err) = rtmp("--max-age") else {
 			panic!("rtmp: --max-age must not start a run");
 		};
-		assert!(err.to_string().contains("--max-age -> --max-delay"), "rtmp: {err}");
+		assert!(err.to_string().contains("--max-age -> --delay"), "rtmp: {err}");
 
 		assert!(
 			Invocation::try_parse_from(["moq", "import", "--max-delay", "5s", "ts"]).is_err(),
@@ -2063,7 +2411,9 @@ mod tests {
 	#[test]
 	fn the_environment_cannot_ask_for_a_moq_side() {
 		let url = "https://relay.example.com";
-		let _env = crate::test_env::EnvGuard::set(&[("MOQ_CONNECT", url)]);
+		if !test_env::Env::default().set("MOQ_CONNECT", url).isolate() {
+			return;
+		}
 
 		let ambient = Invocation::try_parse_from(["moq", "auth", "generate"]).expect("parse");
 		assert!(
@@ -2093,11 +2443,7 @@ mod tests {
 			("--listen-tcp-bind", "127.0.0.1:0", "--listen-tcp-bind"),
 			("--broadcast", "room", "--broadcast"),
 			("--cluster-connect", "https://relay.example", "--cluster-connect"),
-			(
-				"--cluster-connect-api",
-				"https://api.example/peers",
-				"--cluster-connect-api",
-			),
+			("--cluster-api-url", "https://api.example/peers", "--cluster-api-url"),
 			("--cluster-node", "https://self.example", "--cluster-node"),
 			("--cluster-token", "cluster.jwt", "--cluster-token"),
 			("--cluster-id", "1", "--cluster-id"),
@@ -2170,12 +2516,12 @@ mod tests {
 			&["--listen-tcp-bind", "127.0.0.1:0"],
 			&["--cluster-node", "https://self.example"],
 			&["--auth-public", "**"],
-			&["--epoch", "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b"],
+			&["--drain-timeout", "500ms"],
 		];
 		let dial: &[&[&str]] = &[
 			&["--connect", "https://relay.example"],
 			&["--connect-tls-insecure"],
-			&["--backoff-initial", "2s"],
+			&["--connect-backoff-initial", "2s"],
 			&["--quic-idle-timeout", "10s"],
 			#[cfg(feature = "iroh")]
 			&["--iroh-enabled"],
@@ -2236,7 +2582,52 @@ mod tests {
 		parse(&[]).unserved().expect("nothing to refuse");
 	}
 
-	/// `--cluster-connect` / `--cluster-connect-api` attach the process as a
+	/// `--connect` and a WAN cluster peer each bind `--connect-bind` for QUIC, so a
+	/// fixed port is refused before anything binds; port 0 or either side alone is
+	/// fine, and a build without QUIC binds nothing to collide.
+	#[test]
+	fn a_fixed_connect_bind_serves_one_dialer() {
+		let parse = |flags: &[&str]| {
+			let args = ["moq"].iter().chain(flags).chain(&["import", "ts"]).copied();
+			Invocation::try_parse_from(args).expect("parse")
+		};
+		for peer in [
+			["--cluster-connect", "https://relay.example"],
+			["--cluster-api-url", "https://api.example/peers"],
+		] {
+			let both = [
+				&["--connect", "https://relay.example", "--connect-bind", "127.0.0.1:4443"][..],
+				&peer,
+			]
+			.concat();
+			let result = parse(&both).moq.validate();
+			if cfg!(feature = "quic") {
+				let err = result.unwrap_err().to_string();
+				assert!(err.contains("--connect-bind") && err.contains(peer[0]), "{err}");
+			} else {
+				result.expect("without QUIC nothing binds the fixed port");
+			}
+
+			let ephemeral = [
+				&["--connect", "https://relay.example", "--connect-bind", "127.0.0.1:0"][..],
+				&peer,
+			]
+			.concat();
+			parse(&ephemeral).moq.validate().expect("an ephemeral bind serves both");
+
+			let cluster_only = [&["--connect-bind", "127.0.0.1:4443"][..], &peer].concat();
+			parse(&cluster_only)
+				.moq
+				.validate()
+				.expect("the cluster alone owns a fixed bind");
+		}
+		parse(&["--connect", "https://relay.example", "--connect-bind", "127.0.0.1:4443"])
+			.moq
+			.validate()
+			.expect("--connect alone owns a fixed bind");
+	}
+
+	/// `--cluster-connect` / `--cluster-api-url` attach the process as a
 	/// cluster peer, so they are a MoQ side on their own. `--cluster-node` is
 	/// identity, not an attachment.
 	#[test]
@@ -2245,14 +2636,8 @@ mod tests {
 			.expect("parse");
 		assert!(cli.moq.validate().is_ok(), "a cluster dial is a MoQ side on its own");
 
-		let cli = Invocation::try_parse_from([
-			"moq",
-			"--cluster-connect-api",
-			"https://api.example/peers",
-			"import",
-			"ts",
-		])
-		.expect("parse");
+		let cli = Invocation::try_parse_from(["moq", "--cluster-api-url", "https://api.example/peers", "import", "ts"])
+			.expect("parse");
 		assert!(cli.moq.validate().is_ok(), "a cluster API is a MoQ side on its own");
 
 		let cli = Invocation::try_parse_from(["moq", "--cluster-node", "https://self.example", "import", "ts"])
@@ -2338,7 +2723,10 @@ mod tests {
 		])
 		.expect("parse");
 		assert!(cli.moq.validate().is_ok());
-		assert_eq!(cli.moq.cluster.lan.secret.as_deref(), Some("cluster.key"));
+		assert_eq!(
+			cli.moq.cluster.lan.secret.as_deref(),
+			Some(std::path::Path::new("cluster.key"))
+		);
 	}
 
 	/// The app is only read by the mesh, so configuring one without it is an
@@ -2479,6 +2867,27 @@ mod tests {
 		assert!(play.validate().is_ok());
 	}
 
+	#[test]
+	fn flag_help_uses_plain_names() {
+		for command in [
+			vec![],
+			vec!["import", "fmp4"],
+			vec!["import", "hls"],
+			vec!["export", "rtmp"],
+			vec!["export", "hls"],
+			vec!["auth", "serve"],
+		] {
+			let mut argv = vec!["moq"];
+			argv.extend(command);
+			argv.push("--help");
+			let help = Invocation::try_parse_from(argv)
+				.err()
+				.expect("help request")
+				.to_string();
+			assert!(!help.contains("[`"), "{help}");
+		}
+	}
+
 	/// Help and version are answered with their actual page, not an empty string.
 	///
 	/// Usage renders those variants as nothing through `render_failure`, because the
@@ -2553,7 +2962,7 @@ mod tests {
 	/// add the draft, and this fails until every list has it.
 	#[test]
 	fn version_choices_match_the_parser() {
-		fn walk<'a>(cmd: &'a usage::argv::spec::CommandMeta<'a>, found: &mut Vec<(&'a str, Vec<&'a str>)>) {
+		fn walk<'a>(cmd: &'a usage_rs::argv::spec::CommandMeta<'a>, found: &mut Vec<(&'a str, Vec<&'a str>)>) {
 			for flag in cmd.flags {
 				let Some(long) = flag.flag.longs.first() else {
 					continue;
