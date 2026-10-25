@@ -70,7 +70,7 @@ fn apply_transport(transport: &mut driver::TransportConfig, quic: &Resolved) {
 
 	apply_windows(transport, quic);
 
-	transport.congestion_controller_factory(congestion_factory(quic.congestion()));
+	transport.congestion_controller_factory(congestion_factory(quic.congestion(), quic.probe_rtt_cwnd_gain));
 }
 
 /// Apply the flow-control windows `Config::resolve` settled, replacing moq-quic's own.
@@ -83,11 +83,21 @@ fn apply_windows(transport: &mut driver::TransportConfig, quic: &Resolved) {
 	transport.send_window(quic.send_window);
 }
 
-/// The controller factory for a congestion control family. moq-quic's BBR is v3.
-fn congestion_factory(family: CongestionControl) -> Arc<dyn moq_congestion::ControllerFactory + Send + Sync> {
+/// The controller factory for a congestion control family. moq-quic's BBR is v3, and
+/// takes the ProbeRTT gain when one is set.
+fn congestion_factory(
+	family: CongestionControl,
+	probe_rtt_cwnd_gain: Option<f64>,
+) -> Arc<dyn moq_congestion::ControllerFactory + Send + Sync> {
 	match family {
 		CongestionControl::Loss => Arc::new(moq_congestion::CubicConfig::default()),
-		CongestionControl::Delay => Arc::new(moq_congestion::Bbr3Config::default()),
+		CongestionControl::Delay => {
+			let mut bbr = moq_congestion::Bbr3Config::default();
+			if let Some(gain) = probe_rtt_cwnd_gain {
+				bbr.probe_rtt_cwnd_gain(gain);
+			}
+			Arc::new(bbr)
+		}
 		CongestionControl::None => Arc::new(moq_congestion::Unlimited),
 	}
 }
@@ -1240,20 +1250,62 @@ mod tests {
 		let now = moq_clock::Instant::now();
 		let mtu = 1200;
 
-		let loss = congestion_factory(CongestionControl::Loss).build(now, mtu);
+		let loss = congestion_factory(CongestionControl::Loss, None).build(now, mtu);
 		assert!(loss.into_any().downcast::<moq_congestion::Cubic>().is_ok());
 
-		let delay = congestion_factory(CongestionControl::Delay).build(now, mtu);
+		let delay = congestion_factory(CongestionControl::Delay, None).build(now, mtu);
 		assert!(delay.into_any().downcast::<moq_congestion::Bbr3>().is_ok());
 
-		let none = congestion_factory(CongestionControl::None).build(now, mtu);
+		let none = congestion_factory(CongestionControl::None, None).build(now, mtu);
 		assert!(none.into_any().downcast::<moq_congestion::Unlimited>().is_ok());
+	}
+
+	/// The BBRv3 controller a factory builds holds the configured ProbeRTT gain, and
+	/// the draft's 0.5 when none is set.
+	#[test]
+	fn congestion_factory_applies_the_probe_rtt_gain() {
+		let now = moq_clock::Instant::now();
+		for (gain, expected) in [
+			(None, "probe_rtt_cwnd_gain: 0.5,"),
+			(Some(1.0), "probe_rtt_cwnd_gain: 1.0,"),
+		] {
+			let bbr = congestion_factory(CongestionControl::Delay, gain).build(now, 1200);
+			let bbr = bbr.into_any().downcast::<moq_congestion::Bbr3>().expect("BBRv3");
+			assert!(format!("{bbr:?}").contains(expected), "{gain:?}: {bbr:?}");
+		}
 	}
 
 	/// Loopback regression test: with the knob unset, live QUIC connections must run
 	/// BBRv3 on both ends.
 	#[tokio::test]
 	async fn default_reaches_the_live_connection() {
+		// The knob left unset, the way a binary that never mentions it runs.
+		let (client, server) = live_bbr3(crate::quic::Config::default()).await;
+		assert!(client.is_some(), "client connection is not running BBRv3");
+		assert!(server.is_some(), "server connection is not running BBRv3");
+	}
+
+	/// Loopback regression test: a configured ProbeRTT gain is the one live QUIC
+	/// connections run BBRv3 with, on both ends.
+	#[tokio::test]
+	async fn probe_rtt_gain_reaches_the_live_connection() {
+		let quic = crate::quic::Config {
+			probe_rtt_cwnd_gain: Some(1.0),
+			..Default::default()
+		};
+		let (client, server) = live_bbr3(quic).await;
+		for (end, bbr) in [("client", client), ("server", server)] {
+			let bbr = bbr.unwrap_or_else(|| panic!("{end} connection is not running BBRv3"));
+			let rendered = format!("{bbr:?}");
+			assert!(rendered.contains("probe_rtt_cwnd_gain: 1.0,"), "{end}: {rendered}");
+		}
+	}
+
+	/// Connect a client to a server over loopback with `quic` on both ends, and
+	/// return each end's controller when it is BBRv3.
+	async fn live_bbr3(
+		quic: crate::quic::Config,
+	) -> (Option<Box<moq_congestion::Bbr3>>, Option<Box<moq_congestion::Bbr3>>) {
 		let server_config = listen::Config {
 			bind: Some("127.0.0.1:0".parse().unwrap()),
 			tls: crate::tls::Listen {
@@ -1262,9 +1314,6 @@ mod tests {
 			},
 			..Default::default()
 		};
-
-		// The knob left unset, the way a binary that never mentions it runs.
-		let quic = crate::quic::Config::default();
 
 		let tls = server_config.tls.load().unwrap();
 		let server = Server::new(Options {
@@ -1279,7 +1328,7 @@ mod tests {
 		let accepted = tokio::spawn(async move {
 			let incoming = server.accept().await.expect("no incoming connection");
 			let conn = incoming.accept().expect("accept").await.expect("handshake");
-			is_bbr3(&conn)
+			bbr3(&conn)
 		});
 
 		// tls::Connect has a private field, so it can't be built with a struct literal.
@@ -1297,8 +1346,8 @@ mod tests {
 		// Dial the loopback IP directly so the system resolver is never involved.
 		let url: Url = format!("moqt://127.0.0.1:{}", addr.port()).parse().unwrap();
 
-		// Bound the whole connect + accept + assert flow so a handshake
-		// regression fails fast instead of stalling CI.
+		// Bound the whole connect + accept flow so a handshake regression fails
+		// fast instead of stalling CI.
 		tokio::time::timeout(Duration::from_secs(5), async move {
 			let session = client
 				.connect(&tls, url.into(), &moq_net::Versions::default())
@@ -1306,21 +1355,19 @@ mod tests {
 				.expect("connect failed");
 
 			// web::Session derefs to the driver connection.
-			assert!(is_bbr3(&session), "client connection is not running BBRv3");
-			assert!(
-				accepted.await.expect("server task panicked"),
-				"server connection is not running BBRv3"
-			);
+			let client = bbr3(&session);
+			let server = accepted.await.expect("server task panicked");
+			(client, server)
 		})
 		.await
-		.expect("test timed out");
+		.expect("test timed out")
 	}
 
-	/// Whether a live connection is running BBRv3.
-	fn is_bbr3(conn: &driver::Connection) -> bool {
+	/// A live connection's controller, when it is BBRv3.
+	fn bbr3(conn: &driver::Connection) -> Option<Box<moq_congestion::Bbr3>> {
 		conn.congestion_state()
 			.into_any()
 			.downcast::<moq_congestion::Bbr3>()
-			.is_ok()
+			.ok()
 	}
 }

@@ -282,14 +282,24 @@ fn transport_config(config: &Transport) -> Result<moq_quic::TransportConfig, Err
 	if !config.mtu_discovery {
 		transport.mtu_discovery_config(None);
 	}
-	transport.congestion_controller_factory(match config.congestion {
-		Congestion::Loss => {
-			Arc::new(moq_congestion::CubicConfig::default()) as Arc<dyn moq_congestion::ControllerFactory + Send + Sync>
-		}
-		Congestion::Delay => Arc::new(moq_congestion::Bbr3Config::default()),
-		Congestion::None => Arc::new(moq_congestion::Unlimited),
-	});
+	transport.congestion_controller_factory(congestion_factory(config));
 	Ok(transport)
+}
+
+/// The controller factory for `config`'s congestion family. BBRv3 takes the
+/// ProbeRTT gain when one is set.
+fn congestion_factory(config: &Transport) -> Arc<dyn moq_congestion::ControllerFactory + Send + Sync> {
+	match config.congestion {
+		Congestion::Loss => Arc::new(moq_congestion::CubicConfig::default()),
+		Congestion::Delay => {
+			let mut bbr = moq_congestion::Bbr3Config::default();
+			if let Some(gain) = config.probe_rtt_cwnd_gain {
+				bbr.probe_rtt_cwnd_gain(gain);
+			}
+			Arc::new(bbr)
+		}
+		Congestion::None => Arc::new(moq_congestion::Unlimited),
+	}
 }
 
 /// A receive window on the wire is a QUIC varint. One that does not fit cannot
@@ -387,7 +397,28 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 #[cfg(test)]
 mod tests {
-	use super::{CONNECTION_WINDOW, SEND_WINDOW, STREAM_WINDOW, Transport, transport_config};
+	use super::{
+		CONNECTION_WINDOW, Congestion, SEND_WINDOW, STREAM_WINDOW, Transport, congestion_factory, transport_config,
+	};
+
+	/// The delay family runs BBRv3 with the configured ProbeRTT gain, and the
+	/// draft's 0.5 when none is set.
+	#[test]
+	fn the_probe_rtt_gain_reaches_bbr() {
+		for (gain, expected) in [
+			(None, "probe_rtt_cwnd_gain: 0.5,"),
+			(Some(1.0), "probe_rtt_cwnd_gain: 1.0,"),
+		] {
+			let config = Transport {
+				congestion: Congestion::Delay,
+				probe_rtt_cwnd_gain: gain,
+				..Default::default()
+			};
+			let bbr = congestion_factory(&config).build(moq_clock::Instant::now(), 1200);
+			let bbr = bbr.into_any().downcast::<moq_congestion::Bbr3>().expect("BBRv3");
+			assert!(format!("{bbr:?}").contains(expected), "{gain:?}: {bbr:?}");
+		}
+	}
 
 	/// moq-quic keeps the windows private, but its `Debug` prints them. The leading
 	/// space keeps `receive_window` from matching `stream_receive_window`, and

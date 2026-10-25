@@ -231,6 +231,23 @@ pub struct Config {
 	)]
 	pub congestion_control: Option<CongestionControl>,
 
+	/// BBRv3's ProbeRTT window, as a multiple of the estimated bandwidth-delay
+	/// product. Defaults to 0.5, the BBR draft's `ProbeRTTCwndGain`.
+	///
+	/// Every 5s ProbeRTT caps inflight at this multiple to re-measure the minimum
+	/// RTT. A live stream holding more than that in flight, such as video filling
+	/// over half its uplink, stalls behind the cap until it lifts; 1.0 keeps it
+	/// sending through the probe. Only the `delay` family reads it, and iroh
+	/// cannot set it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[usage(
+		name = "quic-probe-rtt-cwnd-gain",
+		long = "quic-probe-rtt-cwnd-gain",
+		env = "MOQ_QUIC_PROBE_RTT_CWND_GAIN",
+		setting = "quic.probe_rtt_cwnd_gain"
+	)]
+	pub probe_rtt_cwnd_gain: Option<f64>,
+
 	/// Connection-wide receive window, in bytes: how much data the peer may have
 	/// in flight or in incomplete messages across every stream at once. Defaults to
 	/// 128 MiB, and must fit the largest message a session assembles, just over 64 MiB.
@@ -547,6 +564,7 @@ impl Config {
 			_ => Ok(()),
 		}?;
 		validate_idle_timeout(Some(self.resolve().idle_timeout))?;
+		validate_probe_rtt_cwnd_gain(self.probe_rtt_cwnd_gain)?;
 		validate_streams(self.max_streams)?;
 		validate_windows(self)
 	}
@@ -570,6 +588,7 @@ impl Config {
 			keep_alive,
 			mtu_discovery: self.mtu_discovery.unwrap_or(false),
 			congestion_control: self.congestion_control,
+			probe_rtt_cwnd_gain: self.probe_rtt_cwnd_gain,
 			receive_window: self.receive_window.unwrap_or(DEFAULT_RECEIVE_WINDOW),
 			stream_receive_window: self.stream_receive_window.unwrap_or(DEFAULT_STREAM_RECEIVE_WINDOW),
 			send_window: self.send_window.unwrap_or(DEFAULT_SEND_WINDOW),
@@ -592,6 +611,18 @@ const MAX_IDLE_TIMEOUT: Duration = Duration::from_millis((1 << 62) - 1);
 fn validate_idle_timeout(idle_timeout: Option<Duration>) -> crate::Result<()> {
 	match idle_timeout {
 		Some(timeout) if timeout > MAX_IDLE_TIMEOUT => Err(crate::Error::IdleTimeoutRange),
+		_ => Ok(()),
+	}
+}
+
+/// Reject a ProbeRTT gain no window can be sized from.
+///
+/// A negative or NaN gain would size the window at nothing and an infinite one
+/// would never cap it, so neither does what the operator wrote.
+#[cfg(feature = "_transport")]
+fn validate_probe_rtt_cwnd_gain(gain: Option<f64>) -> crate::Result<()> {
+	match gain {
+		Some(gain) if !gain.is_finite() || gain < 0.0 => Err(crate::Error::ProbeRttCwndGainRange),
 		_ => Ok(()),
 	}
 }
@@ -676,6 +707,8 @@ pub struct Resolved {
 	pub mtu_discovery: bool,
 	/// Congestion control override, or `None` for the default.
 	pub congestion_control: Option<CongestionControl>,
+	/// BBRv3's ProbeRTT window gain, or `None` for the controller's default (0.5).
+	pub probe_rtt_cwnd_gain: Option<f64>,
 	/// Connection-wide receive window in bytes, defaulting to [`DEFAULT_RECEIVE_WINDOW`].
 	///
 	/// The windows are resolved here rather than by each backend, whose own defaults
@@ -757,6 +790,7 @@ mod tests {
 		assert_eq!(quic.gso, None);
 		assert!(!quic.gso_disabled());
 		assert!(quic.keylog.is_none());
+		assert_eq!(quic.probe_rtt_cwnd_gain, None);
 	}
 
 	#[test]
@@ -796,6 +830,8 @@ mod tests {
 			"--quic-gso=false",
 			"--quic-congestion-control",
 			"delay",
+			"--quic-probe-rtt-cwnd-gain",
+			"1.0",
 			"--quic-qlog",
 			"/tmp/qlog",
 			"--quic-keylog",
@@ -804,6 +840,7 @@ mod tests {
 		assert_eq!(quic.max_streams, Some(5000));
 		assert_eq!(quic.gso, Some(false));
 		assert_eq!(quic.congestion_control, Some(CongestionControl::Delay));
+		assert_eq!(quic.probe_rtt_cwnd_gain, Some(1.0));
 		assert_eq!(quic.qlog.as_deref(), Some(std::path::Path::new("/tmp/qlog")));
 		assert_eq!(quic.keylog.as_deref(), Some(std::path::Path::new("/tmp/keys.log")));
 	}
@@ -816,6 +853,17 @@ mod tests {
 		let quic: Config = toml::from_str(r#"congestion_control = "none""#).expect("parse");
 		assert_eq!(quic.congestion_control, Some(CongestionControl::None));
 		assert_eq!("NONE".parse(), Ok(CongestionControl::None));
+	}
+
+	/// The ProbeRTT gain reads the same from TOML as from the flag, and a whole
+	/// number is a gain too.
+	#[test]
+	fn probe_rtt_cwnd_gain_parses_from_toml() {
+		let quic: Config = toml::from_str("probe_rtt_cwnd_gain = 1.0").expect("parse");
+		assert_eq!(quic.probe_rtt_cwnd_gain, Some(1.0));
+		let quic: Config = toml::from_str("probe_rtt_cwnd_gain = 1").expect("parse");
+		assert_eq!(quic.probe_rtt_cwnd_gain, Some(1.0));
+		assert_eq!(quic.resolve().probe_rtt_cwnd_gain, Some(1.0));
 	}
 
 	/// Every old role-prefixed spelling parses into a hidden field and is reported,
@@ -959,6 +1007,31 @@ mod tests {
 		assert_eq!(set.receive_window, 64 << 20);
 		assert_eq!(set.stream_receive_window, 8 << 20);
 		assert_eq!(set.send_window, 32 << 20);
+	}
+
+	/// A gain that sizes the ProbeRTT window at nothing, or never caps it, is not
+	/// what the operator wrote, so it fails instead of reaching the controller.
+	#[cfg(feature = "_transport")]
+	#[test]
+	fn probe_rtt_cwnd_gain_must_be_finite_and_not_negative() {
+		for gain in [-0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+			let quic = Config {
+				probe_rtt_cwnd_gain: Some(gain),
+				..Default::default()
+			};
+			assert!(
+				matches!(quic.validate(), Err(crate::Error::ProbeRttCwndGainRange)),
+				"{gain} was accepted"
+			);
+		}
+		for gain in [0.0, 0.5, 1.0, 2.0] {
+			let quic = Config {
+				probe_rtt_cwnd_gain: Some(gain),
+				..Default::default()
+			};
+			assert!(quic.validate().is_ok(), "{gain} was rejected");
+			assert_eq!(quic.resolve().probe_rtt_cwnd_gain, Some(gain));
+		}
 	}
 
 	/// A zero window credits nothing, so it would wedge the connection rather than

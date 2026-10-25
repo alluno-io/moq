@@ -127,6 +127,10 @@ pub enum Error {
 	#[error("quic max_streams must be between 1 and 2^60")]
 	StreamsRange,
 
+	/// The BBRv3 ProbeRTT gain is negative or not a finite number.
+	#[error("quic probe_rtt_cwnd_gain must be a finite number, zero or more")]
+	ProbeRttCwndGainRange,
+
 	/// The QUIC connection receive window can't fit the largest message a session
 	/// assembles. The payload is the minimum, in bytes.
 	#[error("quic receive_window must be at least {0} bytes to fit the largest message")]
@@ -287,6 +291,7 @@ impl Error {
 			| Self::WindowRange(_)
 			| Self::ReceiveWindowTooSmall(_)
 			| Self::StreamsRange
+			| Self::ProbeRttCwndGainRange
 			| Self::KeylogUnset
 			| Self::BackoffHealthy
 			| Self::QlogUnsupported

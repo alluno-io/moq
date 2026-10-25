@@ -2063,6 +2063,17 @@ impl Bbr3Config {
         self
     }
 
+    /// The multiple of the estimated BDP the congestion window is held at while probing the
+    /// minimum RTT (`BBRProbeRTTCwndGain`, 0.5 by default).
+    ///
+    /// A flow that keeps more than half a BDP in flight, such as real-time media on a link it
+    /// fills over half of, stalls behind a 0.5 cap for each `PROBE_RTT`; a higher gain keeps it
+    /// sending through the probe.
+    pub fn probe_rtt_cwnd_gain(&mut self, value: f64) -> &mut Self {
+        self.probe_rtt_cwnd_gain = Some(value);
+        self
+    }
+
     /// Seed the probe phases for deterministic transport tests.
     #[cfg(any(test, feature = "testing"))]
     pub fn probe_rng_seed(&mut self, seed: [u8; 16]) -> &mut Self {
@@ -3781,6 +3792,52 @@ mod test {
             bbr.pacing_gain, bbr.default_pacing_gain,
             "PROBE_REFILL pacing_gain should be DefaultPacingGain"
         );
+    }
+
+    /// `Bbr3Config::probe_rtt_cwnd_gain` replaces ProbeRTTCwndGain: the flow enters PROBE_RTT
+    /// with the configured gain and holds its window at that multiple of the estimated BDP,
+    /// where the draft's 0.5 holds it at half.
+    #[test]
+    fn probe_rtt_cwnd_gain_sets_the_probe_rtt_window() {
+        for (configured, expected) in [(None, PROBE_RTT_CWND_GAIN), (Some(1.0), 1.0)] {
+            let mut config = Bbr3Config::default();
+            if let Some(gain) = configured {
+                config.probe_rtt_cwnd_gain(gain);
+            }
+            let mut sim = Sim::new(config, 1200, 12_500_000.0, 100_000_000);
+            let mut reached_probe_bw = false;
+            let mut held: Option<(f64, u64, u64)> = None;
+            let done = Cell::new(false);
+            sim.run(
+                2_000_000,
+                |_bbr| match done.get() {
+                    true => ControlFlow::Break(()),
+                    false => ControlFlow::Continue(()),
+                },
+                |bbr, _now_ns, _inflight, _pn| {
+                    if bbr.full_bw_reached && matches!(bbr.state, BbrState::ProbeBw(_)) {
+                        reached_probe_bw = true;
+                    }
+                    if reached_probe_bw
+                        && held.is_none()
+                        && bbr.state == BbrState::ProbeRtt
+                        && bbr.probe_rtt_done_stamp.is_some()
+                    {
+                        let bdp = bbr.bdp_multiple(bbr.bw, 1.0);
+                        held = Some((bbr.cwnd_gain, bbr.window(), bdp));
+                        done.set(true);
+                    }
+                    ControlFlow::Continue(())
+                },
+            );
+            let (cwnd_gain, window, bdp) = held.expect("BBR never held its PROBE_RTT window");
+            assert_eq!(cwnd_gain, expected, "PROBE_RTT cwnd_gain");
+            let share = window as f64 / bdp as f64;
+            assert!(
+                (share - expected).abs() < 0.05,
+                "PROBE_RTT held the window at {share:.3} of the BDP with gain {expected}"
+            );
+        }
     }
 
     /// A.10: Entering and exiting PROBE_RTT.

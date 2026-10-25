@@ -494,6 +494,7 @@ fn transport(quic: &moq_tokio::quic::Resolved) -> anyhow::Result<moq_uring::quic
 		// substitution the operator would never learn about.
 		Some(other) => anyhow::bail!("io_uring workers cannot run the {other:?} congestion controller"),
 	};
+	transport.probe_rtt_cwnd_gain = quic.probe_rtt_cwnd_gain;
 	Ok(transport)
 }
 
@@ -946,6 +947,16 @@ mod tests {
 		assert_eq!(transport.receive_window, Some(128 << 20));
 		assert_eq!(transport.stream_receive_window, Some(8 << 20));
 		assert_eq!(transport.send_window, Some(32 << 20));
+	}
+
+	/// `quic.probe_rtt_cwnd_gain` reaches the workers as it does the tokio backends: unset
+	/// leaves BBRv3's own 0.5.
+	#[test]
+	fn probe_rtt_cwnd_gain_is_applied() {
+		let mut quic = moq_tokio::quic::Config::default();
+		assert_eq!(transport(&quic.resolve()).expect("default").probe_rtt_cwnd_gain, None);
+		quic.probe_rtt_cwnd_gain = Some(1.0);
+		assert_eq!(transport(&quic.resolve()).expect("gain").probe_rtt_cwnd_gain, Some(1.0));
 	}
 
 	/// `quic.mtu_discovery` reaches the workers as it does the tokio backends: off unless set.

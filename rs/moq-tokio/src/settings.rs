@@ -263,6 +263,9 @@ pub struct Quic {
 	#[usage(env = "MOQ_QUIC_CONGESTION_CONTROL", cli("--quic-congestion-control"))]
 	congestion_control: Option<String>,
 
+	#[usage(env = "MOQ_QUIC_PROBE_RTT_CWND_GAIN", cli("--quic-probe-rtt-cwnd-gain"))]
+	probe_rtt_cwnd_gain: Option<f64>,
+
 	#[usage(env = "MOQ_QUIC_RECEIVE_WINDOW", cli("--quic-receive-window"))]
 	receive_window: Option<u64>,
 

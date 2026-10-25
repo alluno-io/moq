@@ -158,6 +158,10 @@ pub enum Error {
 	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
 	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the quic backend")]
 	GsoUnsupported,
+
+	/// iroh's noq has no ProbeRTT gain knob, so `--quic-probe-rtt-cwnd-gain` cannot be honored.
+	#[error("the iroh backend cannot set the ProbeRTT gain; drop --quic-probe-rtt-cwnd-gain or use the quic backend")]
+	ProbeRttCwndGainUnsupported,
 }
 
 crate::error::from_message! {
@@ -245,7 +249,9 @@ impl Config {
 	/// section (the per-connection knobs are symmetric). It honors the knobs its
 	/// transport-config builder exposes (stream limits, idle timeout, keep-alive,
 	/// MTU discovery, congestion control, flow-control windows), and key logging. It
-	/// cannot disable GSO, so `gso = false` fails with [`Error::GsoUnsupported`].
+	/// cannot disable GSO, so `gso = false` fails with [`Error::GsoUnsupported`], nor
+	/// size BBRv3's ProbeRTT window, so a `probe_rtt_cwnd_gain` fails with
+	/// [`Error::ProbeRttCwndGainUnsupported`].
 	pub async fn bind(self, quic: &crate::quic::Config) -> Result<Option<Endpoint>> {
 		if !self.enabled.unwrap_or(false) {
 			return Ok(None);
@@ -274,6 +280,9 @@ impl Config {
 		}
 		if quic.gso_disabled() {
 			return Err(Error::GsoUnsupported);
+		}
+		if quic.probe_rtt_cwnd_gain.is_some() {
+			return Err(Error::ProbeRttCwndGainUnsupported);
 		}
 
 		// If the secret matches the expected format (hex encoded), use it directly.
@@ -608,6 +617,23 @@ mod tests {
 				"{err}"
 			);
 		}
+	}
+
+	/// iroh's noq has no ProbeRTT gain to set, so a configured one is refused before
+	/// the key file or a socket is touched, not bound as the 0.5 default.
+	#[tokio::test]
+	async fn bind_refuses_a_probe_rtt_gain_before_reading_secret() {
+		let dir = tempfile::tempdir().unwrap();
+		let quic: crate::quic::Config = toml::from_str("probe_rtt_cwnd_gain = 1.0").unwrap();
+		let config = Config {
+			enabled: Some(true),
+			secret: Some(dir.path().to_str().unwrap().to_owned()),
+			..Default::default()
+		};
+		let Err(err) = config.bind(&quic).await else {
+			panic!("binding must refuse a ProbeRTT gain");
+		};
+		assert!(matches!(err, Error::ProbeRttCwndGainUnsupported), "{err}");
 	}
 
 	/// Build a controller from each family's factory and downcast it to the

@@ -130,6 +130,9 @@ pub struct Transport {
 	pub send_window: Option<u64>,
 	/// Which congestion controller to run.
 	pub congestion: Congestion,
+	/// BBRv3's ProbeRTT window gain under [`Congestion::Delay`], or `None` (the
+	/// default) for the controller's 0.5.
+	pub probe_rtt_cwnd_gain: Option<f64>,
 	/// How often to send an ack-eliciting packet on an otherwise idle
 	/// connection, or `None` (the default) to send none and let the idle
 	/// timeout decide.
@@ -159,6 +162,7 @@ impl Default for Transport {
 			stream_receive_window: None,
 			send_window: None,
 			congestion: Congestion::default(),
+			probe_rtt_cwnd_gain: None,
 			keep_alive: None,
 			mtu_discovery: false,
 			#[cfg(feature = "qlog")]

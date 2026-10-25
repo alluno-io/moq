@@ -79,6 +79,7 @@ Transport tuning, applied to accepted and dialed connections alike.
 ```toml
 [quic]
 congestion_control = "delay"         # "delay" (BBR, the default), "loss" (CUBIC), or "none".
+probe_rtt_cwnd_gain = 0.5            # BBR's ProbeRTT window, in BDPs. Default. iroh cannot set it.
 max_streams = 10000                  # Concurrent streams per connection, bidi and uni; 0 is refused. Default.
 idle_timeout = "10s"                 # Drop a connection after this long with nothing on it. Default.
 keep_alive = "3s"                    # Ping interval; "0s" disables it. iroh refuses zero and keeps a separate 5s path heartbeat. Default.
@@ -93,6 +94,10 @@ qlog = "/var/log/moq/qlog"           # Existing directory. Needs the `qlog` buil
 
 `congestion_control = "none"` runs no congestion control and no pacing. It is
 meant for tests and controlled links, where nothing else shares the path.
+
+`probe_rtt_cwnd_gain = 1.0` keeps BBR sending through its periodic RTT probe. At
+the default 0.5, a stream that fills more than half a viewer's path stalls for
+each probe, roughly every 5s.
 
 Set `keylog` only while debugging, since the file decrypts every captured session.
 Tokio and io\_uring open the configured path at initialization. New Unix files are
