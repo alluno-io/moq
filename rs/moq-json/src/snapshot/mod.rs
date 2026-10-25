@@ -279,6 +279,32 @@ mod test {
 		}
 	}
 
+	#[test]
+	fn a_group_a_lite_06_drop_ends_mid_read_waits_for_its_replacement() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", timed())
+			.unwrap();
+		let mut consumer = Consumer::<Value>::new(track.subscribe(None), consumer::Config::default());
+		let waiter = kio::Waiter::noop();
+
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(br#"{"a":1}"#))
+			.unwrap();
+		assert!(matches!(consumer.poll_latest(&waiter), Poll::Ready(Ok(Some(v))) if v.value == json!({ "a": 1 })));
+		assert!(consumer.poll_latest(&waiter).is_pending());
+
+		track.drop_groups(0..1, moq_net::StreamError::NotFound);
+		assert!(consumer.poll_latest(&waiter).is_pending());
+
+		let mut group = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(br#"{"a":2}"#))
+			.unwrap();
+		assert!(matches!(consumer.poll_latest(&waiter), Poll::Ready(Ok(Some(v))) if v.value == json!({ "a": 2 })));
+	}
+
 	/// Nothing replaces a lost group once the track is finished, so the reader ends cleanly on the
 	/// last value it reconstructed instead of reporting the eviction as a failure.
 	#[test]

@@ -86,6 +86,7 @@ impl<T: DeserializeOwned> Consumer<T> {
 							| moq_net::StreamError::TooFarBehind
 							| moq_net::StreamError::Evicted
 							| moq_net::StreamError::GroupTooLarge
+							| moq_net::StreamError::NotFound
 					) =>
 				{
 					// This group is no longer complete, but the next one starts with a checkpoint

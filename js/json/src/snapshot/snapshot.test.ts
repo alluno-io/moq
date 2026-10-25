@@ -638,6 +638,23 @@ test("snapshot consumer propagates a non-gap frame failure", async () => {
 	await expect(consumer.next()).rejects.toMatchObject({ code: StreamCode.Internal });
 });
 
+for (const read of ["next", "latest"] as const) {
+	test(`snapshot consumer ${read}() resyncs past a group a lite-06 drop ends mid-read`, async () => {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer<Value>({ track: track.subscribe() });
+		const dropped = track.appendGroup();
+		dropped.writeFrame({ payload: new TextEncoder().encode('{"n":1}'), timestamp: Time.Timestamp.now() });
+		expect((await consumer[read]())?.value).toEqual({ n: 1 });
+
+		const parked = consumer[read]();
+		track.dropGroups(0, 1, new NetError.Stream(StreamCode.NotFound, { message: "dropped" }));
+		const replacement = track.appendGroup();
+		replacement.writeFrame({ payload: new TextEncoder().encode('{"n":2}'), timestamp: Time.Timestamp.now() });
+
+		expect((await parked)?.value).toEqual({ n: 2 });
+	});
+}
+
 test("an update without a timestamp goes out untimed", async () => {
 	const track = new Track.Producer("test").accept({});
 	const producer = new Producer<Value>({ track, deltas: true });

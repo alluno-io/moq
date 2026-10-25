@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Milli } from "@moq/clock";
-import { Group, Error as NetError, Time, Track } from "@moq/net";
+import { Group, Error as NetError, StreamCode, Time, Track } from "@moq/net";
 import { Consumer, Producer } from "./index.ts";
 
 const bytes = (...values: number[]) => new Uint8Array(values);
@@ -172,6 +172,23 @@ test("latest stays inside the reader's range", async () => {
 	expect((await consumer.latest())?.value).toEqual(bytes(1));
 	producer.finish();
 });
+
+for (const read of ["next", "latest"] as const) {
+	test(`${read}() resyncs past a group a lite-06 drop ends mid-read`, async () => {
+		const track = new Track.Producer("test");
+		const consumer = new Consumer({ track: track.subscribe() });
+		const dropped = track.appendGroup();
+		dropped.writeFrame({ payload: bytes(1), timestamp: Time.Timestamp.now() });
+		expect((await consumer[read]())?.value).toEqual(bytes(1));
+
+		const parked = consumer[read]();
+		track.dropGroups(0, 1, new NetError.Stream(StreamCode.NotFound, { message: "dropped" }));
+		const replacement = track.appendGroup();
+		replacement.writeFrame({ payload: bytes(2), timestamp: Time.Timestamp.now() });
+
+		expect((await parked)?.value).toEqual(bytes(2));
+	});
+}
 
 test("an aborted track surfaces its error instead of spinning", async () => {
 	// Every read after an abort throws the same terminal error, so swallowing it as if it were a

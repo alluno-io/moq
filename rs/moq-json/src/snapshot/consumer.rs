@@ -137,6 +137,7 @@ impl<T: DeserializeOwned> Consumer<T> {
 							| moq_net::StreamError::Evicted
 							| moq_net::StreamError::TooFarBehind
 							| moq_net::StreamError::GroupTooLarge
+							| moq_net::StreamError::NotFound
 					) =>
 				{
 					// A later group starts a fresh snapshot and compression window.

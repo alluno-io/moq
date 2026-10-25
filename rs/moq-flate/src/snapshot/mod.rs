@@ -185,6 +185,32 @@ mod test {
 		}
 	}
 
+	#[test]
+	fn a_group_a_lite_06_drop_ends_mid_read_waits_for_its_replacement() {
+		let track = moq_net::broadcast::Info::new()
+			.produce()
+			.create_track("test", timed())
+			.unwrap();
+		let mut consumer = consume(track.subscribe(None), false);
+		let waiter = kio::Waiter::noop();
+
+		let mut group = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(b"one"))
+			.unwrap();
+		assert!(matches!(consumer.poll_latest(&waiter), Poll::Ready(Ok(Some(v))) if v.value == "one"));
+		assert!(consumer.poll_latest(&waiter).is_pending());
+
+		track.drop_groups(0..1, moq_net::StreamError::NotFound);
+		assert!(consumer.poll_latest(&waiter).is_pending());
+
+		let mut group = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		group
+			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(b"two"))
+			.unwrap();
+		assert!(matches!(consumer.poll_latest(&waiter), Poll::Ready(Ok(Some(v))) if v.value == "two"));
+	}
+
 	/// A stamped payload is written at its capture time, and the returned size is the encoded frame
 	/// on the wire rather than the payload handed in.
 	#[test]

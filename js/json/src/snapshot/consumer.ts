@@ -9,6 +9,7 @@ const GAPS: Moq.StreamCode[] = [
 	Moq.StreamCode.Old,
 	Moq.StreamCode.Evicted,
 	Moq.StreamCode.GroupTooLarge,
+	Moq.StreamCode.NotFound,
 ];
 
 /**

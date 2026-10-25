@@ -393,6 +393,7 @@ test("consumer resumes at a checkpoint after losing a group", async () => {
 		new NetError.Stream(StreamCode.GroupTooLarge),
 		new NetError.Stream(StreamCode.Old),
 		new NetError.Stream(StreamCode.Evicted),
+		new NetError.Stream(StreamCode.NotFound, { message: "dropped" }),
 	]) {
 		const track = new Track.Producer("test");
 		const consumer = new Consumer<Rec>({ track: track.subscribe() });
