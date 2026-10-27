@@ -1013,7 +1013,7 @@ function legacyFrame(media: Micro): Moq.Group.Frame {
 // A live "auto" playback reading real tracks through real container consumers on a manual clock.
 // One 20ms Opus frame per group, flushed in runs of `burst`, so each run's first frame lands that
 // much late. Each tick renders 20ms from the decoder's ring the way the worklet does.
-async function livePlayback(burst: number) {
+async function livePlayback(burst: number, options: { patch?: Record<string, unknown>; buffer?: number } = {}) {
 	const FRAME = 20;
 	const clock = manualAt(0);
 	const insert = spyOn(AudioRingBuffer.prototype, "write");
@@ -1023,6 +1023,7 @@ async function livePlayback(burst: number) {
 		container: { kind: "legacy" },
 		sampleRate: 48_000,
 		numberOfChannels: 2,
+		...options.patch,
 	});
 	const catalog = new Signal<Catalog.Root>({ audio: { renditions: { audio } } });
 	// The broadcast the rendition reads, which a `broadcast` override can move to another path.
@@ -1034,7 +1035,7 @@ async function livePlayback(burst: number) {
 		relativeBroadcast: (effect: Effect) => effect.get(media),
 	} as unknown as Broadcast);
 	const source = new Source({ broadcast, supported: async () => true });
-	const sync = new Sync({ delay: new Signal<Delay>("auto") });
+	const sync = new Sync({ delay: new Signal<Delay>("auto"), buffer: Milli(options.buffer ?? 0) });
 	// Published before the decoder subscribes, since a broadcast with no request handler refuses
 	// an unknown track.
 	let track = producer.createTrack("audio", { timescale: Moq.Time.Timescale.MILLI });
@@ -1113,6 +1114,30 @@ async function livePlayback(burst: number) {
 		},
 	};
 }
+
+describe("Decoder's auto target and the catalog delay", () => {
+	// A publisher's `delay` only rises over the life of a stream, so one late audio write on the host
+	// held every viewer's audio that far behind a picture that never waited for it.
+	it("leaves the cross-track delay out while video presents without waiting", async () => {
+		const playback = await livePlayback(1, { patch: { delay: 1000 } });
+		try {
+			await playback.run(5_000);
+			expect(playback.sync.out.delay.peek()).toBeLessThan(Milli(200));
+		} finally {
+			await playback.close();
+		}
+	});
+
+	it("waits out the cross-track delay once a lookahead holds video to the shared clock", async () => {
+		const playback = await livePlayback(1, { patch: { delay: 1000 }, buffer: 500 });
+		try {
+			await playback.run(5_000);
+			expect(playback.sync.out.delay.peek()).toBeGreaterThanOrEqual(Milli(1000));
+		} finally {
+			await playback.close();
+		}
+	});
+});
 
 describe("Decoder across a rename", () => {
 	// A codec change renames the audio track, and the replacement's consumer reads the same path.

@@ -186,7 +186,7 @@ export class Decoder {
 		const playout = this.#signals.computed((effect) => {
 			const measured = effect.get(this.#measured);
 			if (measured === undefined) return undefined;
-			const delay = effect.get(this.source.out.config)?.delay;
+			const delay = effect.get(this.sync.out.buffered) ? effect.get(this.source.out.config)?.delay : undefined;
 			return target({
 				measured,
 				advertised: effect.get(this.source.out.jitter),
