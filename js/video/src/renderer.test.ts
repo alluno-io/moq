@@ -296,10 +296,9 @@ describe("Renderer", () => {
 			const renderer = create2d(canvas, source);
 			try {
 				await settle();
-				expect(renderer.out.painted.peek()).toBe(0);
-				paint();
 				expect(renderer.out.painted.peek()).toBe(1);
 
+				// A second frame within the same refresh waits for the animation frame.
 				source.set(frame(2_000));
 				await settle();
 				expect(renderer.out.painted.peek()).toBe(1);
@@ -348,11 +347,11 @@ describe("Renderer", () => {
 
 		it("paints and counts nothing while the 2d context is lost, and repaints once it is restored", async () => {
 			const canvas = new FakeCanvas();
+			canvas.lost = true;
 			const source = new Signal<VideoFrame | undefined>(frame(1_000));
 			const renderer = create2d(canvas, source);
 			try {
 				await settle();
-				canvas.lost = true;
 				paint();
 				expect(canvas.draws).toHaveLength(0);
 				expect(renderer.out.painted.peek()).toBe(0);
@@ -363,6 +362,102 @@ describe("Renderer", () => {
 				paint();
 				expect(canvas.draws).toHaveLength(1);
 				expect(renderer.out.painted.peek()).toBe(1);
+			} finally {
+				renderer.close();
+			}
+		});
+	});
+
+	describe("arrival", () => {
+		function create2d(
+			canvas: FakeCanvas,
+			source: Signal<VideoFrame | undefined>,
+			presentation?: Signal<{ rotation: number }>,
+		) {
+			return new Renderer({
+				canvas: canvas as unknown as HTMLCanvasElement,
+				frame: source,
+				presentation,
+				backend: "2d",
+			});
+		}
+
+		it("draws a new frame the moment it arrives, without waiting for an animation frame", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				expect(canvas.draws).toHaveLength(1);
+				paint();
+
+				source.set(frame(2_000));
+				await settle();
+				expect(canvas.draws).toHaveLength(2);
+				expect(renderer.out.frame.peek()?.timestamp).toBe(2_000);
+
+				// The animation frame still runs, without drawing the frame again.
+				expect(paint()).toBe(1);
+				expect(canvas.draws).toHaveLength(2);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("draws one arriving frame per animation frame and leaves the latest of the rest to it", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				source.set(frame(2_000));
+				await settle();
+				source.set(frame(3_000));
+				await settle();
+				expect(canvas.draws).toHaveLength(1);
+				expect(renderer.out.frame.peek()?.timestamp).toBe(1_000);
+
+				paint();
+				expect(canvas.draws).toHaveLength(2);
+				expect(renderer.out.frame.peek()?.timestamp).toBe(3_000);
+				expect(renderer.out.painted.peek()).toBe(2);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("draws nothing more on arrival while animation frames stop, as in a hidden tab", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const renderer = create2d(canvas, source);
+			try {
+				await settle();
+				for (const timestamp of [2_000, 3_000, 4_000, 5_000]) {
+					source.set(frame(timestamp));
+					await settle();
+				}
+				expect(canvas.draws).toHaveLength(1);
+				expect(renderer.out.painted.peek()).toBe(1);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("leaves a repaint of the same frame to the animation frame", async () => {
+			const canvas = new FakeCanvas();
+			const source = new Signal<VideoFrame | undefined>(frame(1_000));
+			const presentation = new Signal({ rotation: 0 });
+			const renderer = create2d(canvas, source, presentation);
+			try {
+				await settle();
+				paint();
+				presentation.set({ rotation: 90 });
+				await settle();
+				expect(canvas.draws).toHaveLength(1);
+
+				paint();
+				expect(canvas.draws).toHaveLength(2);
+				expect(canvas.transforms.at(-1)).toEqual([0, 1, -1, 0, 640, 0]);
 			} finally {
 				renderer.close();
 			}

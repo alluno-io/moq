@@ -69,7 +69,8 @@ export type RendererOutput = {
 type Surface = Gpu | Canvas2D;
 
 /**
- * Draws video frames into a canvas, once per animation frame, through WebGPU or Canvas2D.
+ * Draws video frames into a canvas through WebGPU or Canvas2D: each new frame as it arrives, at
+ * most one per animation frame, and repaints on the next animation frame.
  *
  * The graphics API is chosen once per canvas, before touching it, since a canvas keeps the first
  * kind of context it hands out. A lost GPU device is replaced; with no replacement the renderer
@@ -92,6 +93,8 @@ export class Renderer {
 	#restored = new Signal<number>(0);
 	#displayHdr = new Signal<boolean>(false);
 	#counted?: VideoFrame;
+	// Whether a frame may still be drawn on arrival before the next animation frame.
+	#arrival = true;
 	#signals = new Effect();
 
 	constructor(props?: RendererProps) {
@@ -259,14 +262,12 @@ export class Renderer {
 		effect.get(this.in.display);
 		effect.get(this.#restored);
 
-		// Draw at the display's refresh rate. Always draw, even when paused, to show the last frame.
-		let animate: number | undefined = requestAnimationFrame(() => {
-			animate = undefined;
+		const draw = (): boolean => {
 			const drawn =
 				surface instanceof Gpu
 					? surface.draw(frame, presentation, hdr, view)
 					: surface.draw(frame, presentation, view);
-			if (!drawn) return;
+			if (!drawn) return false;
 			this.#out.hdr.set(surface instanceof Gpu && surface.hdr);
 
 			this.#out.frame.update((current) => {
@@ -277,6 +278,25 @@ export class Renderer {
 				this.#counted = frame;
 				this.#out.painted.update((count) => count + 1);
 			}
+			return true;
+		};
+
+		// A new frame is drawn the moment it arrives instead of on the next animation frame, which
+		// it would otherwise wait half a refresh for on average. At most one per animation frame, so
+		// frames faster than the display wait for it, and a page that stops animating (a hidden tab)
+		// draws once more at most.
+		let drawn = false;
+		if (frame && frame !== this.#counted && this.#arrival) {
+			drawn = draw();
+			if (drawn) this.#arrival = false;
+		}
+
+		// Everything else waits for the next animation frame. Always draw, even when paused, to show
+		// the last frame.
+		let animate: number | undefined = requestAnimationFrame(() => {
+			animate = undefined;
+			this.#arrival = true;
+			if (!drawn) draw();
 		});
 
 		effect.cleanup(() => {

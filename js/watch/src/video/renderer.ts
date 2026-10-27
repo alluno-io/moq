@@ -61,7 +61,7 @@ export class Renderer {
 
 	/** The derived outputs, read-only. */
 	readonly out: Readonlys<{
-		// The most recently rendered frame, updated after each rAF paint.
+		// The most recently rendered frame, updated after each paint.
 		frame: Getter<VideoFrame | undefined>;
 		// The media timestamp of the most recently rendered frame.
 		timestamp: Getter<Milli | undefined>;
