@@ -817,6 +817,71 @@ describe("Renderer", () => {
 			}
 		});
 
+		it("presents HDR on a canvas handed to a worker once it is marked as on screen", async () => {
+			setup({ element: false });
+			const canvas = new FakeCanvas();
+			const renderer = new Renderer({
+				canvas: canvas as unknown as OffscreenCanvas,
+				frame: pqFrame(),
+				presented: true,
+			});
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(canvas.configured.at(-1)).toMatchObject({
+					format: "rgba16float",
+					toneMapping: { mode: "extended" },
+				});
+				expect(renderer.out.hdr.peek()).toBe(true);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("takes the display's HDR from hdrDisplay where there is no media query, and follows it", async () => {
+			setup();
+			stub(globalThis, "matchMedia", undefined);
+			const canvas = new FakeCanvas();
+			const hdrDisplay = new Signal(true);
+			const renderer = new Renderer({
+				canvas: canvas as unknown as HTMLCanvasElement,
+				frame: pqFrame(),
+				hdrDisplay,
+			});
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(tone()).toBe(1);
+				expect(renderer.out.hdr.peek()).toBe(true);
+
+				hdrDisplay.set(false);
+				await settle();
+				expect(paint()).toBe(1);
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
+		it("lets hdrDisplay override the media query", async () => {
+			setup({ display: true });
+			const canvas = new FakeCanvas();
+			const renderer = new Renderer({
+				canvas: canvas as unknown as HTMLCanvasElement,
+				frame: pqFrame(),
+				hdrDisplay: false,
+			});
+			try {
+				await settle();
+				expect(paint()).toBe(1);
+				expect(tone()).toBe(2);
+				expect(renderer.out.hdr.peek()).toBe(false);
+			} finally {
+				renderer.close();
+			}
+		});
+
 		it("measures the import again on a replacement device", async () => {
 			setup();
 			gpu.adapters = [{ device: { calibration: SIGNAL } }, { device: { calibration: [0.1, 0.1] } }];

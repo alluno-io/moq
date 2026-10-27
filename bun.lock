@@ -408,7 +408,7 @@
     },
     "js/video": {
       "name": "@moq/video",
-      "version": "0.1.0-alluno.3",
+      "version": "0.1.0-alluno.4",
       "dependencies": {
         "@moq/signals": "workspace:^",
       },
@@ -425,7 +425,7 @@
     },
     "js/watch": {
       "name": "@moq/watch",
-      "version": "0.6.2-alluno.3",
+      "version": "0.6.2-alluno.4",
       "dependencies": {
         "@moq/clock": "workspace:^",
         "@moq/hang": "workspace:^",

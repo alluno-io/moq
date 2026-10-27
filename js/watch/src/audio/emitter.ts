@@ -1,6 +1,7 @@
 import { Milli, Nano } from "@moq/clock";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Decoder } from "./decoder";
+import type { Host } from "./host";
 
 // How long a volume change ramps for.
 const FADE = Milli(200);
@@ -17,10 +18,13 @@ export type EmitterInput = {
 	paused: Getter<boolean>;
 };
 
+/** What an {@link Emitter} plays: a {@link Decoder}, or the {@link Host} of one decoding in a worker. */
+export type EmitterSource = { readonly out: { readonly root: Getter<AudioNode | undefined> } };
+
 /** Constructor properties for {@link Emitter}. */
 export type EmitterProps = Inputs<EmitterInput> & {
 	/** Decoder supplying PCM. */
-	source: Decoder;
+	source: EmitterSource;
 };
 
 type EmitterOutput = {
@@ -34,7 +38,7 @@ type EmitterOutput = {
 /** A helper that emits audio directly to the speakers. */
 export class Emitter {
 	/** The decoder supplying samples. */
-	readonly source: Decoder;
+	readonly source: EmitterSource;
 
 	/** The wired inputs, read-only. */
 	readonly in: Readonlys<EmitterInput>;

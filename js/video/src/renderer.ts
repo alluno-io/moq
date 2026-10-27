@@ -35,6 +35,14 @@ export type RendererInput = {
 	backend: Getter<Backend>;
 	/** Whether PQ video may be presented in HDR on an HDR display. Defaults to true. */
 	hdr: Getter<boolean>;
+	/**
+	 * Whether the canvas is on screen, which HDR output needs. Undefined takes a canvas element as on
+	 * screen and an OffscreenCanvas as not; a worker drawing into a canvas it was handed with
+	 * `transferControlToOffscreen()` passes true.
+	 */
+	presented: Getter<boolean | undefined>;
+	/** Whether the display shows HDR. Undefined reads the `dynamic-range` media query, which workers lack. */
+	hdrDisplay: Getter<boolean | undefined>;
 };
 
 /** Constructor options for {@link Renderer}. */
@@ -95,6 +103,8 @@ export class Renderer {
 			view: getter(props?.view),
 			backend: getter(props?.backend ?? "auto"),
 			hdr: getter(props?.hdr ?? true),
+			presented: getter(props?.presented),
+			hdrDisplay: getter(props?.hdrDisplay),
 		};
 
 		this.#signals.run(this.#runSurface.bind(this));
@@ -112,6 +122,7 @@ export class Renderer {
 	#runSurface(effect: Effect): void {
 		const canvas = effect.get(this.in.canvas);
 		const backend = effect.get(this.in.backend);
+		const presented = effect.get(this.in.presented);
 
 		this.#out.error.set(undefined);
 		if (!canvas) return;
@@ -159,7 +170,7 @@ export class Renderer {
 			}
 
 			console.debug("[video] rendering with WebGPU");
-			await this.#useGpu(effect, context, device, presentable(canvas));
+			await this.#useGpu(effect, context, device, presented ?? presentable(canvas));
 		});
 	}
 
@@ -242,7 +253,7 @@ export class Renderer {
 		const frame = effect.get(this.in.frame);
 		const presentation = effect.get(this.in.presentation);
 		const view = effect.get(this.in.view);
-		const hdr = effect.get(this.in.hdr) && effect.get(this.#displayHdr);
+		const hdr = effect.get(this.in.hdr) && (effect.get(this.in.hdrDisplay) ?? effect.get(this.#displayHdr));
 
 		// A resize clears the canvas, so paint again afterwards.
 		effect.get(this.in.display);

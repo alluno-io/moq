@@ -38,8 +38,8 @@ export type PlayerInput = {
 	video: {
 		/** Desired video rendition or quality limits. */
 		target: Getter<Video.Target | undefined>;
-		/** Canvas to paint video into. */
-		canvas: Getter<HTMLCanvasElement | undefined>;
+		/** Canvas to paint video into: an element, or an OffscreenCanvas in a worker. */
+		canvas: Getter<Video.Canvas | undefined>;
 		/** Canvas visibility policy for video downloads. */
 		visible: Getter<Video.Visible>;
 		/** Which graphics API paints the canvas. */
@@ -50,6 +50,10 @@ export type PlayerInput = {
 		recover: Getter<number>;
 		/** Present PQ video in HDR on an HDR display when the browser can. */
 		hdr: Getter<boolean>;
+		/** Whether the canvas is on screen; see the video renderer's `presented`. */
+		presented: Getter<boolean | undefined>;
+		/** Whether the display shows HDR; see the video renderer's `hdrDisplay`. */
+		hdrDisplay: Getter<boolean | undefined>;
 	};
 	/** Audio rendition and speaker output. */
 	audio: {
@@ -59,6 +63,8 @@ export type PlayerInput = {
 		volume: Getter<number>;
 		/** Silence audio and stop its download. */
 		muted: Getter<boolean>;
+		/** Where decoded audio plays when this thread cannot own an AudioContext; see {@link Audio.Graph}. */
+		graph: Getter<Audio.Graph | undefined>;
 	};
 	/** Caption track and overlay. */
 	text: {
@@ -122,11 +128,14 @@ export class Player {
 				hardwareAcceleration: getter(props.video?.hardwareAcceleration ?? "no-preference"),
 				recover: getter(props.video?.recover ?? 0),
 				hdr: getter(props.video?.hdr ?? true),
+				presented: getter(props.video?.presented),
+				hdrDisplay: getter(props.video?.hdrDisplay),
 			},
 			audio: {
 				target: getter<Audio.Target | undefined>(props.audio?.target),
 				volume: getter(props.audio?.volume ?? 0.5),
 				muted: getter(props.audio?.muted ?? false),
+				graph: getter(props.audio?.graph),
 			},
 			text: {
 				target: getter<string | undefined>(props.text?.target),
@@ -172,6 +181,7 @@ export class Player {
 			sync: this.sync,
 			enabled: this.#audioEnabled,
 			decrypt: this.in.decrypt,
+			graph: this.in.audio.graph,
 		});
 		this.#signals.cleanup(() => {
 			this.video.close();
@@ -190,6 +200,8 @@ export class Player {
 			visible: this.in.video.visible,
 			backend: this.in.video.backend,
 			hdr: this.in.video.hdr,
+			presented: this.in.video.presented,
+			hdrDisplay: this.in.video.hdrDisplay,
 		});
 		this.#signals.cleanup(() => {
 			this.emitter.close();

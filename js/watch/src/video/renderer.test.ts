@@ -120,4 +120,27 @@ describe("Renderer", () => {
 			renderer.close();
 		}
 	});
+
+	it("counts a canvas outside the document as visible, as a worker's canvas is", async () => {
+		const decoder = {
+			out: {
+				display: new Signal({ width: 640, height: 360 }),
+				frame: new Signal<VideoFrame | undefined>(undefined),
+				interlaced: new Signal(false),
+			},
+			source: { out: { catalog: new Signal<Catalog.Video | undefined>(undefined) } },
+		} as unknown as Decoder;
+		const canvas = { width: 640, height: 360, getContext: () => null } as unknown as OffscreenCanvas;
+		const renderer = new Renderer({ decoder, canvas, backend: "2d", presented: true, hdrDisplay: false });
+
+		try {
+			await settle();
+			expect(renderer.out.visible.peek()).toBe(true);
+			expect(renderer.in.presented.peek()).toBe(true);
+			expect(renderer.in.hdrDisplay.peek()).toBe(false);
+		} finally {
+			renderer.close();
+		}
+		expect(renderer.out.visible.peek()).toBe(false);
+	});
 });

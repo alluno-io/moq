@@ -9,6 +9,7 @@ import type { Broadcast } from "../broadcast";
 import { type Delay, Sync } from "../sync";
 import { Decoder as VideoDecoder } from "../video/decoder";
 import { Source as VideoSource } from "../video/source";
+import type { Graph, GraphShape, Playback } from "./graph";
 import type { Message, State } from "./render";
 import { AudioRingBuffer } from "./ring-buffer";
 import { Source } from "./source";
@@ -61,6 +62,7 @@ let worklets: FakeWorklet[] = [];
 // every quantum read reports the ring's state back, the way `render-worklet.ts` does.
 class FakeWorklet {
 	ring?: AudioRingBuffer;
+	closed = false;
 	#epoch = 0;
 	#playing = true;
 	readonly port = Object.assign(new EventTarget(), {
@@ -83,6 +85,9 @@ class FakeWorklet {
 			} else if (msg.type === "playing" && msg.epoch === this.#epoch) this.#playing = msg.playing;
 		},
 		start() {},
+		close: () => {
+			this.closed = true;
+		},
 	});
 	constructor() {
 		worklets.push(this);
@@ -268,7 +273,7 @@ function feed() {
 	};
 }
 
-async function play(initial: Delay, buffered = false, cmaf = false) {
+async function play(initial: Delay, buffered = false, cmaf = false, graph?: Graph) {
 	// These cases test timeline handover after the optional decoder has loaded.
 	if (cmaf) await import("@moq/hang/cmaf");
 	const { push, buffered: queued } = feed();
@@ -310,7 +315,7 @@ async function play(initial: Delay, buffered = false, cmaf = false) {
 	const sync = new Sync({ delay, buffer: Milli(buffered ? 1000 : 0) });
 	// The decoder's own switch, which a mute or pause turns off.
 	const decoding = new Signal(true);
-	const decoder = new Decoder({ source, sync, enabled: decoding });
+	const decoder = new Decoder({ source, sync, enabled: decoding, graph });
 	await microtasks();
 
 	// Enough frames to get past the legacy decoder's warm-up, so a handover would truncate.
@@ -333,6 +338,7 @@ async function play(initial: Delay, buffered = false, cmaf = false) {
 		enabled,
 		decoding,
 		context: decoder.out.context,
+		root: decoder.out.root,
 		arrivals: () => decoder.arrivals(),
 		error: decoder.out.error,
 		play,
@@ -746,6 +752,121 @@ describe("Decoder across a rendition's absence", () => {
 
 			// Every frame reaches the ring once the worklet loads.
 			expect(playback.inserted()).toEqual(timestamps);
+		} finally {
+			playback.close();
+		}
+	});
+});
+
+// A graph this test owns: each open builds a worklet the way a host does, once `opening` settles,
+// and every playback report is kept.
+function graph() {
+	const opens: { shape: GraphShape; signal: AbortSignal; worklet: FakeWorklet }[] = [];
+	const reports: Playback[] = [];
+	let opening: Promise<void> = Promise.resolve();
+	const remote: Graph = {
+		open: async (shape, signal) => {
+			await opening;
+			if (signal.aborted) return undefined;
+			const worklet = new FakeWorklet();
+			opens.push({ shape, signal, worklet });
+			return { port: worklet.port as unknown as MessagePort };
+		},
+		playback: (playback) => {
+			reports.push(playback);
+		},
+	};
+	return {
+		remote,
+		opens,
+		// The last playback reported.
+		playback: () => reports.at(-1),
+		hold: () => {
+			let open = () => {};
+			opening = new Promise((resolve) => {
+				open = resolve;
+			});
+			return open;
+		},
+	};
+}
+
+describe("Decoder with a graph", () => {
+	it("plays through the graph's worklet without building a context", async () => {
+		const { remote, opens, playback: reported } = graph();
+		const playback = await play(Milli(100), false, false, remote);
+		try {
+			await playback.play(12);
+			expect(contexts).toHaveLength(0);
+			expect(playback.context.peek()).toBeUndefined();
+			expect(playback.root.peek()).toBeUndefined();
+			expect(opens.map(({ shape }) => shape)).toEqual([{ sampleRate: 48_000, channels: 2 }]);
+			const [ring] = playback.rings();
+			expect(ring).toBe(opens[0].worklet);
+			expect(reported()).toBe("play");
+
+			// The owner keeps the context running through the tail and suspends it once drained.
+			expect(ring.read([new Float32Array(128), new Float32Array(128)])).toBe(128);
+			await microtasks();
+			playback.remove();
+			await microtasks();
+			expect(reported()).toBe("play");
+			expect(drain(ring)).toBeGreaterThan(0);
+			await microtasks();
+			expect(reported()).toBe("idle");
+
+			playback.restore();
+			await microtasks();
+			expect(reported()).toBe("play");
+
+			// A mute leaves the context alone, as the decoder does with its own.
+			playback.decoding.set(false);
+			await microtasks();
+			expect(reported()).toBe("hold");
+			expect(opens).toHaveLength(1);
+		} finally {
+			playback.close();
+		}
+	});
+
+	it("decodes the frames that arrive before the graph opens and closes its port on release", async () => {
+		const owner = graph();
+		const open = owner.hold();
+		const playback = await play(Milli(100), false, false, owner.remote);
+		try {
+			const timestamps = await playback.play(6);
+			expect(playback.inserted()).toEqual([]);
+
+			open();
+			await microtasks();
+			expect(playback.inserted()).toEqual(timestamps);
+
+			const [first] = owner.opens;
+			playback.enabled.set(false);
+			await microtasks();
+			expect(first.signal.aborted).toBe(true);
+			expect(first.worklet.closed).toBe(true);
+
+			playback.enabled.set(true);
+			await microtasks();
+			expect(owner.opens).toHaveLength(2);
+			expect(contexts).toHaveLength(0);
+		} finally {
+			playback.close();
+		}
+	});
+
+	it("opens another graph on a new channel count", async () => {
+		const owner = graph();
+		const playback = await play(Milli(100), false, false, owner.remote);
+		try {
+			await playback.play();
+			playback.restore({ numberOfChannels: 1 });
+			await microtasks();
+
+			expect(owner.opens.map(({ shape }) => shape.channels)).toEqual([2, 1]);
+			expect(owner.opens[0].signal.aborted).toBe(true);
+			expect(owner.opens[0].worklet.closed).toBe(true);
 		} finally {
 			playback.close();
 		}

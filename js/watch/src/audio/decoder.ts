@@ -20,6 +20,7 @@ import { type Failure, failureMoved, nextMedia, subscribeMedia } from "../media"
 import type { Sync } from "../sync";
 import { AudioBuffer } from "./buffer";
 import { type DecoderConfig, frameDuration, type PlaybackIdentity, packetDuration, playbackIdentity } from "./config";
+import type { Graph, Playback } from "./graph";
 import { Handover } from "./handover";
 import { AUTO_MAX_DELAY, ringHold, target } from "./latency";
 import { Order } from "./order";
@@ -45,6 +46,12 @@ export type DecoderInput = {
 	 * A change rebuilds the subscription. Undefined for cleartext.
 	 */
 	decrypt: Getter<Container.FrameDecrypt | undefined>;
+
+	/**
+	 * Where decoded audio plays when this decoder cannot own an AudioContext, as in a worker; see
+	 * {@link Graph}. Undefined builds the AudioContext here and exposes it as `context` and `root`.
+	 */
+	graph: Getter<Graph | undefined>;
 };
 
 /** Constructor properties for {@link Decoder}. */
@@ -170,6 +177,7 @@ export class Decoder {
 		this.in = {
 			enabled: getter(props?.enabled ?? true),
 			decrypt: getter(props?.decrypt),
+			graph: getter(props?.graph),
 		};
 
 		this.source = props.source;
@@ -261,6 +269,18 @@ export class Decoder {
 		// Expose the rate the graph actually runs at.
 		effect.set(this.#out.sampleRate, sampleRate);
 
+		// The graph's owner builds the context and the worklet, and hands back the worklet's port.
+		const graph = effect.get(this.in.graph);
+		if (graph) {
+			effect.spawn(async () => {
+				const opened = await graph.open({ sampleRate, channels: channelCount }, effect.abort);
+				if (!opened) return;
+				effect.cleanup(() => opened.port.close());
+				this.#useRing(effect, opened, shape);
+			});
+			return;
+		}
+
 		const context = new AudioContext({
 			latencyHint: "interactive", // We don't use real-time because of the buffer.
 			sampleRate,
@@ -293,66 +313,82 @@ export class Decoder {
 			});
 			effect.cleanup(() => worklet.disconnect());
 
-			const ring = new AudioBuffer(worklet, {
-				channels: channelCount,
-				rate: sampleRate,
-				delay: this.sync.out.delay.peek(),
-				buffered: this.sync.out.buffered.peek(),
-				playing: this.sync.playing,
-			});
-			effect.cleanup(() => ring.close());
-			effect.set(this.#ring, ring);
-
-			// Mirror ring state (timestamp/stalled) onto our public signals.
-			effect.run((inner) => {
-				const ts = Milli.fromMicro(inner.get(ring.timestamp));
-				this.#out.timestamp.set(ts);
-				this.#trimDecodeBuffered(ts);
-			});
-			effect.run((inner) => {
-				this.#out.stalled.set(inner.get(ring.stalled));
-			});
-			// Each ring counts from zero, so add only what this one counted to the cumulative stats.
-			let counted = 0;
-			effect.run((inner) => {
-				const underruns = inner.get(ring.underruns);
-				const added = underruns - counted;
-				counted = underruns;
-				if (added <= 0) return;
-				this.#out.stats.update((stats) => ({
-					bytesReceived: stats?.bytesReceived ?? 0,
-					underruns: (stats?.underruns ?? 0) + added,
-				}));
-			});
-
+			this.#useRing(effect, worklet, shape);
 			effect.set(this.#out.root, worklet);
 		});
 	}
 
+	// Bridge to the render worklet behind `worklet.port` for the rest of the run, mirroring its state
+	// onto the public signals.
+	#useRing(effect: Effect, worklet: { port: MessagePort }, { sampleRate, channels }: Shape): void {
+		const ring = new AudioBuffer(worklet, {
+			channels,
+			rate: sampleRate,
+			delay: this.sync.out.delay.peek(),
+			buffered: this.sync.out.buffered.peek(),
+			playing: this.sync.playing,
+		});
+		effect.cleanup(() => ring.close());
+		effect.set(this.#ring, ring);
+
+		// Mirror ring state (timestamp/stalled) onto our public signals.
+		effect.run((inner) => {
+			const ts = Milli.fromMicro(inner.get(ring.timestamp));
+			this.#out.timestamp.set(ts);
+			this.#trimDecodeBuffered(ts);
+		});
+		effect.run((inner) => {
+			this.#out.stalled.set(inner.get(ring.stalled));
+		});
+		// Each ring counts from zero, so add only what this one counted to the cumulative stats.
+		let counted = 0;
+		effect.run((inner) => {
+			const underruns = inner.get(ring.underruns);
+			const added = underruns - counted;
+			counted = underruns;
+			if (added <= 0) return;
+			this.#out.stats.update((stats) => ({
+				bytesReceived: stats?.bytesReceived ?? 0,
+				underruns: (stats?.underruns ?? 0) + added,
+			}));
+		});
+	}
+
 	#runEnabled(effect: Effect): void {
+		const graph = effect.get(this.in.graph);
 		const context = effect.get(this.#out.context);
 
-		// An idle graph stops the audio thread while it waits, so pages with many tiles pay nothing.
-		// The unlock below resumes it once the rendition returns.
-		if (context && effect.get(this.#idle)) {
-			context.suspend().catch(() => {});
-			return;
-		}
-
-		const enabled = effect.get(this.in.enabled);
-		if (!enabled) return;
-		if (effect.get(this.sync.out.instant)) {
-			this.reset();
+		// A graph's owner applies this to whatever context it holds, so a graph always counts as open.
+		const playback = this.#playback(effect, graph !== undefined || context !== undefined);
+		if (graph) {
+			graph.playback(playback);
 			return;
 		}
 
 		if (!context) return;
-
-		// The context is built at page load (see #runWorklet), before any user gesture, so it
-		// must be started from a real interaction.
-		Util.Gesture.unlock(effect, context);
+		if (playback === "idle") {
+			context.suspend().catch(() => {});
+		} else if (playback === "play") {
+			// The context is built at page load (see #runWorklet), before any user gesture, so it
+			// must be started from a real interaction.
+			Util.Gesture.unlock(effect, context);
+		}
 
 		// NOTE: You should disconnect/reconnect the worklet to save power when disabled.
+	}
+
+	// What playback asks of the context, resetting the ring for instant playback, which plays nothing.
+	#playback(effect: Effect, open: boolean): Playback {
+		// An idle graph stops the audio thread while it waits, so pages with many tiles pay nothing.
+		// Playing again resumes it once the rendition returns.
+		if (open && effect.get(this.#idle)) return "idle";
+
+		if (!effect.get(this.in.enabled)) return "hold";
+		if (effect.get(this.sync.out.instant)) {
+			this.reset();
+			return "hold";
+		}
+		return "play";
 	}
 
 	#runLatency(effect: Effect): void {

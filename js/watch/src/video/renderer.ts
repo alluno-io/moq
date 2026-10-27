@@ -20,7 +20,8 @@ export type Visible = "never" | "always" | (string & {});
 
 /** Signals the renderer reads. */
 export type RendererInput = {
-	canvas: Getter<HTMLCanvasElement | undefined>;
+	// A canvas element, or an OffscreenCanvas in a worker. A canvas outside the document counts as visible.
+	canvas: Getter<Video.Canvas | undefined>;
 
 	// When video is downloaded relative to the canvas position. See {@link Visible}. Defaults to "20%".
 	visible: Getter<Visible>;
@@ -30,6 +31,12 @@ export type RendererInput = {
 
 	// Whether PQ video may be presented in HDR on an HDR display. Defaults to true.
 	hdr: Getter<boolean>;
+
+	// Whether the canvas is on screen. See {@link Video.RendererInput.presented}.
+	presented: Getter<boolean | undefined>;
+
+	// Whether the display shows HDR. See {@link Video.RendererInput.hdrDisplay}.
+	hdrDisplay: Getter<boolean | undefined>;
 };
 
 /** Constructor properties for {@link Renderer}. */
@@ -77,6 +84,8 @@ export class Renderer {
 			visible: getter(props?.visible ?? "20%"),
 			backend: getter(props?.backend ?? "auto"),
 			hdr: getter(props?.hdr ?? true),
+			presented: getter(props?.presented),
+			hdrDisplay: getter(props?.hdrDisplay),
 		};
 
 		this.#video = new Video.Renderer({
@@ -89,6 +98,8 @@ export class Renderer {
 			),
 			backend: this.in.backend,
 			hdr: this.in.hdr,
+			presented: this.in.presented,
+			hdrDisplay: this.in.hdrDisplay,
 		});
 		this.#signals.cleanup(() => this.#video.close());
 
@@ -125,6 +136,13 @@ export class Renderer {
 		const canvas = effect.get(this.in.canvas);
 		if (!canvas) {
 			this.#visible.set(false);
+			return;
+		}
+
+		// Nothing can observe a canvas outside the document, so its owner decides through `visible` alone.
+		if (typeof HTMLCanvasElement === "undefined" || !(canvas instanceof HTMLCanvasElement)) {
+			this.#visible.set(true);
+			effect.cleanup(() => this.#visible.set(false));
 			return;
 		}
 

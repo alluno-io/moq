@@ -256,7 +256,7 @@ export class Backpressure {
 export class AudioBuffer {
 	readonly rate: number;
 	readonly channels: number;
-	#worklet: AudioWorkletNode;
+	#worklet: { port: MessagePort };
 
 	readonly #timestamp = new Signal<Micro>(0 as Micro);
 	/** Current playback timestamp, as the worklet last reported it. */
@@ -280,7 +280,7 @@ export class AudioBuffer {
 	#signals = new Effect();
 
 	constructor(
-		worklet: AudioWorkletNode,
+		worklet: { port: MessagePort },
 		props: {
 			channels: number;
 			rate: number;
