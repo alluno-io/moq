@@ -81,6 +81,9 @@ export type EncoderInput = {
 	// The connection's bandwidth allocator. The encoder reserves its ceiling and
 	// follows the grant instead of the whole-session estimate.
 	bandwidth: Getter<Moq.Bandwidth.Handle | undefined>;
+
+	// Seals each encoded frame for end-to-end encryption. Undefined publishes in the clear.
+	encrypt: Getter<Container.FrameEncrypt | undefined>;
 };
 
 /** Constructor options: the wired inputs plus the live-editable {@link Config} tuning knobs. */
@@ -212,6 +215,7 @@ export class Encoder {
 			broadcast: getter(props?.broadcast),
 			capture: getter(props?.capture),
 			bandwidth: getter(props?.bandwidth),
+			encrypt: getter(props?.encrypt),
 		};
 		this.config = Signal.from(props?.config);
 		this.#target = this.#signals.computed((effect): Target | undefined => {
@@ -370,7 +374,8 @@ export class Encoder {
 		const capture = effect.get(this.in.capture);
 		if (!capture) return;
 
-		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"));
+		const encrypt = effect.get(this.in.encrypt);
+		const producer = new Container.Legacy.Producer(track, new Container.Legacy.Format("video"), encrypt);
 		const demand = track.demand();
 
 		let lastKeyframe: Micro | undefined;

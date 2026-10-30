@@ -5,6 +5,7 @@
  *
  * @module
  */
+import type * as Container from "@moq/hang/container";
 import * as Moq from "@moq/net";
 import { Effect, readonlys, Signal } from "@moq/signals";
 import * as Announce from "./announce";
@@ -174,6 +175,9 @@ export default class MoqPublish extends HTMLElement {
 	// Whether to advertise the broadcast, driven by the `announce` mode.
 	#announcing = new Signal(false);
 
+	// Seals each encoded audio and video frame for end-to-end encryption; set through the `encrypt` property.
+	#encrypt = new Signal<Container.FrameEncrypt | undefined>(undefined);
+
 	/**
 	 * Effects scoped to this element's lifetime, closed on disconnect.
 	 *
@@ -232,6 +236,7 @@ export default class MoqPublish extends HTMLElement {
 			capture: this.#capture,
 			enabled: this.#videoEnabled,
 			bandwidth: this.connection.bandwidth,
+			encrypt: this.#encrypt,
 		});
 		this.signals.cleanup(() => this.video.close());
 
@@ -240,6 +245,7 @@ export default class MoqPublish extends HTMLElement {
 			enabled: this.#audioEnabled,
 			capture: audioCapture,
 			bandwidth: this.connection.bandwidth,
+			encrypt: this.#encrypt,
 		});
 		this.signals.cleanup(() => this.audio.close());
 
@@ -527,6 +533,15 @@ export default class MoqPublish extends HTMLElement {
 
 	set announce(value: AnnounceMode) {
 		this.controls.announce.set(value);
+	}
+
+	/** Seals each encoded audio and video frame for end-to-end encryption; unset publishes in the clear. */
+	get encrypt(): Container.FrameEncrypt | undefined {
+		return this.#encrypt.peek();
+	}
+
+	set encrypt(value: Container.FrameEncrypt | undefined) {
+		this.#encrypt.set(value);
 	}
 }
 

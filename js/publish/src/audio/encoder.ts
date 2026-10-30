@@ -101,6 +101,9 @@ export type EncoderInput = {
 	// The connection's bandwidth allocator. Audio reserves its configured bitrate so
 	// video's share is honest, and ignores the grant (Opus is a fixed rate today).
 	bandwidth: Getter<Moq.Bandwidth.Handle | undefined>;
+
+	// Seals each encoded frame for end-to-end encryption. Undefined publishes in the clear.
+	encrypt: Getter<Container.FrameEncrypt | undefined>;
 };
 
 /** Constructor options: the wired inputs plus the live-editable tuning knobs. */
@@ -248,6 +251,7 @@ export class Encoder {
 			broadcast: getter(props?.broadcast),
 			capture: getter(props?.capture),
 			bandwidth: getter(props?.bandwidth),
+			encrypt: getter(props?.encrypt),
 		};
 		this.volume = Signal.from(props?.volume ?? 1);
 		this.codec = Signal.from<Codec>(props?.codec ?? "opus");
@@ -403,9 +407,10 @@ export class Encoder {
 			const track = effect.get(rendition.track);
 			if (!track) return;
 
+			const encrypt = effect.get(this.in.encrypt);
 			const live = {
 				track,
-				producer: new Container.Legacy.Producer(track, new Container.Legacy.Format("audio")),
+				producer: new Container.Legacy.Producer(track, new Container.Legacy.Format("audio"), encrypt),
 			};
 			this.#live = live;
 			effect.cleanup(() => {

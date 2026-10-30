@@ -45,6 +45,26 @@ export interface Source {
 	copyTo(buffer: Uint8Array): void;
 }
 
+/**
+ * Seals one media frame's payload for end-to-end encryption, given its position on the wire
+ * (track name, group sequence, object index) to bind as AEAD associated data. Runs on the codec
+ * payload before the container framing is added, so the consumer's `FrameDecrypt` sees the same
+ * bytes at the same position. Returning undefined drops the frame instead of publishing it in the
+ * clear, and the frames after it keep the object index the consumer counts. Markers are never
+ * sealed. The mirror of the Rust `moq-mux` `FrameTransform`.
+ */
+export type FrameEncrypt = (
+	payload: Uint8Array,
+	ctx: { track: string; group: number; object: number },
+) => Uint8Array | undefined;
+
+function bytesOf(source: Uint8Array | Source): Uint8Array {
+	if (source instanceof Uint8Array) return source;
+	const bytes = new Uint8Array(source.byteLength);
+	source.copyTo(bytes);
+	return bytes;
+}
+
 /** Encode a frame as a timestamp varint followed by the payload bytes. */
 export function encodeFrame(source: Uint8Array | Source, timestamp: Micro): Uint8Array {
 	const timestampBytes = Moq.Varint.encode(timestamp);
@@ -78,11 +98,15 @@ export class Producer {
 	#interval?: Micro;
 	// A discontinuity's marker is the newest group, so another one would say nothing new.
 	#marked = false;
+	#encrypt?: FrameEncrypt;
+	// Media frames written to the current group, the object index the next one is sealed at.
+	#written = 0;
 
-	/** Wrap a track to publish legacy-container frames into it. */
-	constructor(track: Moq.Track.Producer, format: Format) {
+	/** Wrap a track to publish legacy-container frames into it, sealing each payload with `encrypt` when given. */
+	constructor(track: Moq.Track.Producer, format: Format, encrypt?: FrameEncrypt) {
 		this.#format = format;
 		this.#track = track;
+		this.#encrypt = encrypt;
 	}
 
 	/** Encode and append a frame; a keyframe starts a new group. Throws if the first frame is not a keyframe, a group start goes backwards, or a frame is below the previous group start. */
@@ -97,16 +121,24 @@ export class Producer {
 			this.#close(rewound ? undefined : timestamp);
 			if (rewound) this.#interval = undefined;
 			this.#group = this.#track.appendGroup();
+			this.#written = 0;
 			this.#floor = this.#start;
 			this.#start = timestamp;
 		} else if (!this.#group) {
 			throw new Error("must start with a keyframe");
 		}
 
-		this.#group?.writeFrame({
-			payload: encodeFrame(data, timestamp),
+		const group = this.#group;
+		if (!group) return;
+		const payload = this.#encrypt
+			? this.#encrypt(bytesOf(data), { track: this.#track.name, group: group.sequence, object: this.#written })
+			: data;
+		if (!payload) return;
+		group.writeFrame({
+			payload: encodeFrame(payload, timestamp),
 			timestamp: Time.Timestamp.fromMicros(timestamp),
 		});
+		this.#written++;
 
 		this.#reordered ||= this.#previous !== undefined && timestamp < this.#previous;
 		if (this.#previous !== undefined && timestamp > this.#previous) {

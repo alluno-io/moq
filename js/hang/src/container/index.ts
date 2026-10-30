@@ -9,6 +9,7 @@
 export * as Loc from "@moq/loc";
 export { Consumer, type ConsumerProps, type FrameDecrypt, type Read } from "./consumer";
 export type { Format } from "./format";
+export type { FrameEncrypt } from "./legacy";
 /** The legacy varint container. */
 export * as Legacy from "./legacy";
 export { type TrackInfoOptions, trackInfo } from "./track";
