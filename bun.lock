@@ -166,7 +166,7 @@
     },
     "js/hang": {
       "name": "@moq/hang",
-      "version": "0.5.2-alluno.2",
+      "version": "0.5.2-alluno.3",
       "dependencies": {
         "@kixelated/libavjs-webcodecs-polyfill": "^0.5.6",
         "@moq/clock": "workspace:^",
@@ -311,7 +311,7 @@
     },
     "js/publish": {
       "name": "@moq/publish",
-      "version": "0.5.2-alluno.7",
+      "version": "0.5.2-alluno.8",
       "dependencies": {
         "@moq/clock": "workspace:^",
         "@moq/hang": "workspace:^",
