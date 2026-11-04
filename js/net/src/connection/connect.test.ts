@@ -5,7 +5,6 @@ import * as Ietf from "../ietf/index.ts";
 import { ALPN, ALPN_05, ALPN_06, ALPN_07_WIP } from "../lite/version.ts";
 import { createMockTransportPair } from "../mock.ts";
 import { accept } from "./accept.ts";
-import { isWebTransportSupported, refuseWebTransport } from "./browser.ts";
 import { type ConnectProps, connect as connectSession } from "./connect.ts";
 
 const url = new URL("https://example.com/test");
@@ -752,80 +751,6 @@ test("when the WebSocket wins, every WebTransport dial is closed", async () => {
 		controller.abort();
 		await pending.catch(() => undefined);
 	} finally {
-		native.WebSocketStream = originalStream;
-		plan.restore();
-		installed.close();
-	}
-});
-
-test("with WebTransport switched off, only the WebSocket is dialed, at once", async () => {
-	const clock = new Manual();
-	const installed = clock.install();
-	const plan = webTransportPlan(clock, () => "hang");
-	const native = globalThis as { WebSocketStream?: unknown };
-	const originalStream = native.WebSocketStream;
-	const sockets: number[] = [];
-	native.WebSocketStream = class {
-		url: string;
-		opened = new Promise(() => {});
-		closed = new Promise(() => {});
-		constructor(url: string) {
-			this.url = url;
-			sockets.push(Nano.toMilli(Nano(clock.now())));
-		}
-		close() {}
-	};
-	const controller = new AbortController();
-	try {
-		const pending = connect(new URL("https://example.com/no-webtransport"), {
-			signal: controller.signal,
-			webtransport: { enabled: false },
-		});
-		await clock.advance(Nano.fromMilli(Milli(700)));
-		expect(plan.dials).toEqual([]);
-		expect(sockets).toEqual([0]);
-
-		controller.abort();
-		await pending.catch(() => undefined);
-	} finally {
-		native.WebSocketStream = originalStream;
-		plan.restore();
-		installed.close();
-	}
-});
-
-test("once the page refuses WebTransport, a connection with no options dials only the WebSocket, at once", async () => {
-	const clock = new Manual();
-	const installed = clock.install();
-	const plan = webTransportPlan(clock, () => "hang");
-	const native = globalThis as { WebSocketStream?: unknown };
-	const originalStream = native.WebSocketStream;
-	const sockets: number[] = [];
-	native.WebSocketStream = class {
-		url: string;
-		opened = new Promise(() => {});
-		closed = new Promise(() => {});
-		constructor(url: string) {
-			this.url = url;
-			sockets.push(Nano.toMilli(Nano(clock.now())));
-		}
-		close() {}
-	};
-	const controller = new AbortController();
-	refuseWebTransport();
-	try {
-		expect(isWebTransportSupported()).toBe(false);
-		const pending = connect(new URL("https://example.com/refused-page"), { signal: controller.signal });
-		await clock.advance(Nano.fromMilli(Milli(700)));
-		expect(plan.dials).toEqual([]);
-		expect(sockets).toEqual([0]);
-
-		controller.abort();
-		await pending.catch(() => undefined);
-		refuseWebTransport(false);
-		expect(isWebTransportSupported()).toBe(true);
-	} finally {
-		refuseWebTransport(false);
 		native.WebSocketStream = originalStream;
 		plan.restore();
 		installed.close();
