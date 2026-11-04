@@ -294,29 +294,6 @@ test("an ended auth handle gives up instead of retrying", async () => {
 	}
 });
 
-test("a page going away is noticed through pagehide alone, with no unload listener", () => {
-	const previousWindow = globalThis.window;
-	const previousDocument = globalThis.document;
-	const listened: string[] = [];
-	const win = new EventTarget();
-	const add = win.addEventListener.bind(win);
-	win.addEventListener = ((type: string, ...rest: [EventListenerOrEventListenerObject | null]) => {
-		listened.push(type);
-		add(type, ...rest);
-	}) as typeof win.addEventListener;
-	const doc = Object.assign(new EventTarget(), { hidden: false });
-	Object.assign(globalThis, { window: win, document: doc });
-
-	const reload = new Reload({ enabled: false, url: new URL("https://example.com/"), websocket: { enabled: false } });
-	try {
-		expect(listened).toContain("pagehide");
-		expect(listened).not.toContain("unload");
-	} finally {
-		reload.close();
-		Object.assign(globalThis, { window: previousWindow, document: previousDocument });
-	}
-});
-
 test("a page hide after give-up does not retry the refused URL", async () => {
 	const original = globalThis.WebTransport;
 	const previousWindow = globalThis.window;

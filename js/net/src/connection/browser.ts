@@ -22,15 +22,8 @@ export function isWebTransportUserAgentSupported(userAgent: string): boolean {
 	return browser.firefox === undefined || Number(browser.firefox) >= 153;
 }
 
-let refused = false;
-
-export function refuseWebTransport(refuse = true): void {
-	refused = refuse;
-}
-
 /** Returns whether this runtime can connect with WebTransport. */
 export function isWebTransportSupported(): boolean {
-	if (refused) return false;
 	if (typeof globalThis.WebTransport === "undefined") return false;
 	if (typeof navigator === "undefined") return true;
 	return isWebTransportUserAgentSupported(navigator.userAgent);
