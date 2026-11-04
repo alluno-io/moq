@@ -14,7 +14,7 @@ import * as Path from "../path.ts";
 import { Follow } from "../util/observed.ts";
 import { after } from "../util/timer.ts";
 import { type AcceptProps as AcceptPropsType, accept } from "./accept.ts";
-import { isWebTransportSupported } from "./browser.ts";
+import { isWebTransportSupported, refuseWebTransport } from "./browser.ts";
 import {
 	type CertificateHash as CertificateHashType,
 	type ConnectProps as ConnectPropsType,
@@ -141,6 +141,8 @@ export class Connection {
 
 	/** Whether this runtime can connect with WebTransport. */
 	static readonly isWebTransportSupported = isWebTransportSupported;
+
+	static readonly refuseWebTransport = refuseWebTransport;
 
 	/** Relay URL to connect to; updating it reconnects to that URL. */
 	url: Signal<URL | undefined>;
