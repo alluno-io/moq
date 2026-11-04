@@ -85,6 +85,7 @@ export interface WebTransportProps extends Omit<WebTransportOptions, "serverCert
 	 * have the certificate but not its precomputed fingerprint.
 	 */
 	serverCertificate?: string | BufferSource;
+	enabled?: boolean;
 }
 
 type SetupVersion = Lite.Version | Ietf.Version;
@@ -359,9 +360,10 @@ async function connectInner(raw: URL, props: Omit<ConnectProps, "url">, abort: P
 	const { promise: raced, resolve: done } = Promise.withResolvers<void>();
 	const cancel = Promise.race([raced, abort]);
 
-	const webtransport = isWebTransportSupported()
-		? hedgeWebTransport(url, cancel, offered.alpns, props.webtransport)
-		: undefined;
+	const webtransport =
+		props.webtransport?.enabled !== false && isWebTransportSupported()
+			? hedgeWebTransport(url, cancel, offered.alpns, props.webtransport)
+			: undefined;
 
 	// Give QUIC a head start to connect before trying WebSocket, unless WebSocket has won in the past.
 	// NOTE that QUIC should be faster because it involves 1/2 fewer RTTs.
@@ -704,7 +706,12 @@ async function connectWebTransport(
 	let finalUrl = url;
 
 	// Our custom pinning fields are normalized separately; the rest are DOM options.
-	const { serverCertificate: _cert, serverCertificateHashes: _hashes, ...webtransport } = options ?? {};
+	const {
+		serverCertificate: _cert,
+		serverCertificateHashes: _hashes,
+		enabled: _enabled,
+		...webtransport
+	} = options ?? {};
 
 	const finalOptions: WebTransportOptions = {
 		allowPooling: false,
