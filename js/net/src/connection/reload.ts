@@ -305,7 +305,6 @@ export class Reload {
 		if (typeof win !== "undefined" && typeof doc !== "undefined") {
 			this.#signals.event(win, "pagehide", () => this.#suspended.set(true));
 			this.#signals.event(win, "pageshow", () => this.#suspended.set(false));
-			this.#signals.event(win, "unload", () => this.#suspended.set(true));
 			this.#signals.event(doc, "visibilitychange", () => {
 				if (!doc.hidden) this.#suspended.set(false);
 			});
